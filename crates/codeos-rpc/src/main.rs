@@ -6,7 +6,9 @@
 //! - `CODEOS_DECISIONS` — directory della memoria storica Markdown (default: effimera).
 //! - `CODEOS_REPO`      — root del repository git da cui il Guardian legge la storia
 //!   (abilita Campo di Astensione + Fossili di Decisione nel referto; default: nessuna).
-//! - `RUST_LOG`         — filtro dei log (es. `info`, `codeos_rpc=debug`).
+//! - `RUST_LOG`         — filtro dei log (es. `info`, `codeos_rpc=debug`). Se NON
+//!   impostata, il default mostra `info` per CodeOS e silenzia il rumore di rete
+//!   (tonic/h2/hyper a `warn`), così il server è osservabile out-of-the-box.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -17,9 +19,13 @@ use codeos_storage::{GraphStorage, SqliteStorage};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // RUST_LOG ha la precedenza; senza, un default sensato: `info` per CodeOS,
+    // `warn` per le librerie di rete chiacchierone. `from_default_env` da solo
+    // degraderebbe a "solo ERROR" ⇒ log vuoto e server muto (gap osservato).
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info,h2=warn,hyper=warn,tonic=warn,tower=warn")
+    });
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let addr: SocketAddr = std::env::var("CODEOS_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:50051".to_string())
