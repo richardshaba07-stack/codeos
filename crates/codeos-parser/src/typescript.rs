@@ -89,7 +89,6 @@ impl LanguageParser for TypeScriptParser {
 
         let scope = Scope {
             local_id: module_id,
-            kind: EntityKind::Module,
         };
         walk.walk_children(root, &scope);
 
@@ -105,7 +104,6 @@ impl LanguageParser for TypeScriptParser {
 #[derive(Clone)]
 struct Scope {
     local_id: String,
-    kind: EntityKind,
 }
 
 struct FileWalk<'src> {
@@ -214,10 +212,7 @@ impl<'src> FileWalk<'src> {
         };
         let id = self.push_entity(node, EntityKind::Class, name, scope);
         self.push_heritage_relations(node, &id);
-        let child_scope = Scope {
-            local_id: id,
-            kind: EntityKind::Class,
-        };
+        let child_scope = Scope { local_id: id };
         self.walk_children(node, &child_scope);
     }
 
@@ -228,10 +223,7 @@ impl<'src> FileWalk<'src> {
         };
         let id = self.push_entity(node, EntityKind::Interface, name, scope);
         self.push_heritage_relations(node, &id);
-        let child_scope = Scope {
-            local_id: id,
-            kind: EntityKind::Interface,
-        };
+        let child_scope = Scope { local_id: id };
         self.walk_children(node, &child_scope);
     }
 
@@ -248,10 +240,7 @@ impl<'src> FileWalk<'src> {
             return;
         };
         let id = self.push_entity(node, EntityKind::Function, name, scope);
-        let child_scope = Scope {
-            local_id: id,
-            kind: EntityKind::Function,
-        };
+        let child_scope = Scope { local_id: id };
         self.walk_children(node, &child_scope);
     }
 
@@ -261,10 +250,7 @@ impl<'src> FileWalk<'src> {
             return;
         };
         let id = self.push_entity(node, EntityKind::Method, name, scope);
-        let child_scope = Scope {
-            local_id: id,
-            kind: EntityKind::Method,
-        };
+        let child_scope = Scope { local_id: id };
         self.walk_children(node, &child_scope);
     }
 
@@ -282,22 +268,16 @@ impl<'src> FileWalk<'src> {
             return;
         };
         let id = self.push_entity(node, EntityKind::Function, name, scope);
-        let child_scope = Scope {
-            local_id: id,
-            kind: EntityKind::Function,
-        };
+        let child_scope = Scope { local_id: id };
         self.walk_children(node, &child_scope);
     }
 
     fn push_entity(&mut self, node: Node, kind: EntityKind, name: String, scope: &Scope) -> String {
         let id = self.fresh_id();
-        let parent_local_id = if scope.kind == EntityKind::Module
-            || matches!(kind, EntityKind::Method | EntityKind::Function)
-        {
-            Some(scope.local_id.clone())
-        } else {
-            Some(scope.local_id.clone())
-        };
+        // Ogni entità creata qui appartiene allo scope che la contiene: il parent è
+        // sempre il `local_id` dello scope corrente. Il Module radice è l'unica
+        // entità con `parent_local_id: None`, e nasce a parte (non passa di qui).
+        let parent_local_id = Some(scope.local_id.clone());
         let mut metadata = HashMap::new();
         metadata.insert("language".to_string(), self.language.clone());
         self.entities.push(ParsedEntity {
