@@ -286,6 +286,49 @@ impl GraphStorage for SqliteStorage {
 
         rows.into_iter().map(raw_to_relation).collect()
     }
+
+    async fn graph_quality(&self) -> anyhow::Result<codeos_types::bus::GraphQualityInfo> {
+        let guard = self.conn.lock().expect("mutex SQLite avvelenato");
+        // Un solo lock per uno snapshot coerente: cinque `COUNT(*)` non
+        // materializzano mai entità o relazioni in memoria. Nessun `.await` qui
+        // dentro, quindi il guard può vivere fino a fine funzione senza rischi.
+        let count = |sql: &str| -> anyhow::Result<u64> {
+            let n: i64 = guard
+                .query_row(sql, [], |row| row.get(0))
+                .context("conteggio per la qualità del grafo fallito")?;
+            Ok(n as u64)
+        };
+
+        let total_entities = count("SELECT COUNT(*) FROM entities")?;
+        let external_entities =
+            count("SELECT COUNT(*) FROM entities WHERE kind = 'ExternalDependency'")?;
+        let total_relations = count("SELECT COUNT(*) FROM relations")?;
+        let unresolved_relations =
+            count("SELECT COUNT(*) FROM relations WHERE kind = 'Unresolved'")?;
+        // I metadata sono JSON **compatto** (serde_json, niente spazi): la coppia
+        // chiave/valore compare come sotto-stringa esatta a prescindere dall'ordine
+        // delle chiavi nella mappa.
+        let low_confidence_relations = count(
+            r#"SELECT COUNT(*) FROM relations WHERE metadata LIKE '%"resolution_confidence":"low"%'"#,
+        )?;
+
+        // Le tre classi partizionano il totale: resolved = tutto ciò che non è né
+        // unresolved né a bassa confidenza. `saturating_sub` è una cintura di
+        // sicurezza: per costruzione le classi sono disgiunte, ma non vogliamo mai
+        // un underflow se un dato anomalo finisse in due bucket.
+        let resolved_relations = total_relations
+            .saturating_sub(unresolved_relations)
+            .saturating_sub(low_confidence_relations);
+
+        Ok(codeos_types::bus::GraphQualityInfo {
+            total_entities,
+            external_entities,
+            total_relations,
+            resolved_relations,
+            unresolved_relations,
+            low_confidence_relations,
+        })
+    }
 }
 
 impl SqliteStorage {
@@ -688,5 +731,47 @@ mod tests {
         assert!(chain.contains("più recente"), "errore inatteso: {chain}");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn graph_quality_partitions_relations_by_confidence() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        let caller = entity("pkg::a::caller", EntityKind::Function, "pkg/a.rs");
+        let callee = entity("pkg::a::callee", EntityKind::Function, "pkg/a.rs");
+        let ext = entity("external::tokio", EntityKind::ExternalDependency, "<external>");
+
+        let rel = |kind, source: EntityId, target: EntityId, conf: &str| Relation {
+            id: EntityId::new(),
+            kind,
+            source_id: source,
+            target_id: target,
+            metadata: HashMap::from([("resolution_confidence".to_string(), conf.to_string())]),
+        };
+
+        storage
+            .apply_delta(GraphDelta {
+                added_entities: vec![caller.clone(), callee.clone(), ext.clone()],
+                added_relations: vec![
+                    // Risolta (media) e import esterno (alta): entrambe "resolved".
+                    rel(RelationKind::Calls, caller.id, callee.id, "medium"),
+                    rel(RelationKind::Imports, caller.id, ext.id, "high"),
+                    // Irrisolta: target nullo, confidenza "none".
+                    rel(RelationKind::Unresolved, caller.id, EntityId::nil(), "none"),
+                    // Bassa confidenza: rete di sicurezza per euristiche future.
+                    rel(RelationKind::Calls, callee.id, caller.id, "low"),
+                ],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let q = storage.graph_quality().await.unwrap();
+        assert_eq!(q.total_entities, 3);
+        assert_eq!(q.external_entities, 1);
+        assert_eq!(q.total_relations, 4);
+        assert_eq!(q.unresolved_relations, 1);
+        assert_eq!(q.low_confidence_relations, 1);
+        // resolved = total - unresolved - low = 4 - 1 - 1.
+        assert_eq!(q.resolved_relations, 2);
     }
 }

@@ -134,10 +134,24 @@ message ArchitecturalGap {
   string severity = 4;
 }
 
+// La qualità del grafo: quanto fidarsi del referto (roadmap P2-7). I contatori
+// distinguono le relazioni saldamente risolte dai riferimenti lasciati
+// Unresolved e dagli archi a bassa confidenza, e isolano le entità esterne.
+message GraphQuality {
+  uint64 total_entities = 1;
+  uint64 external_entities = 2;
+  uint64 total_relations = 3;
+  uint64 resolved_relations = 4;
+  uint64 unresolved_relations = 5;
+  uint64 low_confidence_relations = 6;
+}
+
 message GetArchitectureReportResponse {
   repeated LayeringInvariant invariants = 1;
   repeated DecisionFossil fossils = 2;
   repeated ArchitecturalGap gaps = 3;
+  // La misura di affidabilità del referto qui sopra.
+  GraphQuality quality = 4;
 }
 
 // ---------------------------------------------------------------------------

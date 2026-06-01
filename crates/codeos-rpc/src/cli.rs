@@ -39,13 +39,22 @@ async fn main() -> anyhow::Result<()> {
             println!("🎉 Indicizzazione completata con successo!");
         }
         "report" => {
+            let opts = parse_report_options(&args[2..]);
             let mut client = connect_server().await?;
-            println!("⚡ Richiesta referto architetturale in corso...");
-            
+            // In modalità JSON l'output deve essere puro (parsabile da CI/AI): niente
+            // chiacchiere su stdout.
+            if !opts.json {
+                println!("⚡ Richiesta referto architetturale in corso...");
+            }
+
             let req = proto::GetArchitectureReportRequest {};
             let response = client.get_architecture_report(req).await?.into_inner();
-            
-            render_terminal_report(response);
+
+            if opts.json {
+                println!("{}", serde_json::to_string_pretty(&report_to_json(&response))?);
+            } else {
+                render_terminal_report(response, &opts);
+            }
         }
         "query" => {
             if args.len() < 3 {
@@ -200,22 +209,180 @@ fn print_usage() {
     println!();
     println!("Comandi:");
     println!("  index <path>      Indicizza il progetto all'interno del percorso fornito");
-    println!("  report            Mostra il referto architetturale completo dello spazio negativo");
+    println!("  report [opzioni]  Mostra il referto architetturale dello spazio negativo (compatto di default)");
     println!("  query \"<text>\"    Interroga il grafo semantico per generare il contesto minimo per l'LLM");
     println!("  doctor            Diagnostica la configurazione (server, porta, indirizzo) prima dell'uso");
     println!("  help              Mostra questo aiuto");
+    println!();
+    println!("Opzioni di `report`:");
+    println!("  --verbose, -v     Mostra tutto: anche gli invarianti a bassa confidenza e i fossili per esteso");
+    println!("  --only high-risk  Mostra solo gli esiti ad alto rischio");
+    println!("  --json            Stampa il referto come JSON (per CI e agent AI), senza decorazioni");
     println!();
     println!("Variabili d'ambiente:");
     println!("  CODEOS_ADDR       Indirizzo del server gRPC (default: 127.0.0.1:50051)");
 }
 
-fn render_terminal_report(report: proto::GetArchitectureReportResponse) {
+/// Opzioni del comando `report`, derivate dai flag CLI.
+struct ReportOptions {
+    /// Mostra tutto: anche gli invarianti a bassa confidenza (info) e i fossili per
+    /// esteso. Senza, il referto è **compatto** (solo warning/high_risk, liste cap).
+    verbose: bool,
+    /// Stampa il referto come JSON puro invece del rendering da terminale.
+    json: bool,
+    /// Mostra solo gli esiti ad alto rischio.
+    only_high_risk: bool,
+}
+
+/// Quanti invarianti/lacune mostrare al massimo nel referto **compatto**: oltre
+/// questa soglia compare un riepilogo «… e altri N». In `--verbose` nessun cap.
+const COMPACT_INVARIANTS: usize = 6;
+const COMPACT_GAPS: usize = 4;
+
+/// Interpreta i flag che seguono `report`. Tollerante: un flag sconosciuto è
+/// ignorato (forward-compat), così aggiungere opzioni non rompe gli script.
+fn parse_report_options(args: &[String]) -> ReportOptions {
+    let mut opts = ReportOptions {
+        verbose: false,
+        json: false,
+        only_high_risk: false,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--verbose" | "-v" => opts.verbose = true,
+            "--json" => opts.json = true,
+            // Accetta sia "--only high-risk" (due token) sia "--only=high-risk".
+            "--only" => {
+                if let Some(val) = args.get(i + 1) {
+                    opts.only_high_risk |= is_high_risk_token(val);
+                    i += 1;
+                }
+            }
+            _ if arg.starts_with("--only=") => {
+                opts.only_high_risk |= is_high_risk_token(&arg["--only=".len()..]);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    opts
+}
+
+/// Riconosce l'unico filtro di severità supportato oggi (`high-risk`), tollerando
+/// le grafie con trattino/underscore.
+fn is_high_risk_token(s: &str) -> bool {
+    matches!(s, "high-risk" | "high_risk" | "highrisk")
+}
+
+/// Decide se una severità ("info"/"warning"/"high_risk") va mostrata, date le opzioni.
+/// Compatto di default nasconde gli `info` (probabile rumore); `--verbose` mostra
+/// tutto; `--only high-risk` tiene solo l'alto rischio.
+fn severity_passes(severity: &str, opts: &ReportOptions) -> bool {
+    if opts.only_high_risk {
+        return severity == "high_risk";
+    }
+    if opts.verbose {
+        return true;
+    }
+    severity == "high_risk" || severity == "warning"
+}
+
+/// Serializza il referto in un `serde_json::Value` per il flag `--json`: una forma
+/// stabile e piatta, pensata per CI e agent AI (nessuna decorazione, solo dati).
+fn report_to_json(report: &proto::GetArchitectureReportResponse) -> serde_json::Value {
+    use serde_json::json;
+    json!({
+        "invariants": report.invariants.iter().map(|i| json!({
+            "upstream": i.upstream,
+            "downstream": i.downstream,
+            "support": i.support,
+            "confidence": i.confidence,
+            "calibrated": i.calibrated,
+            "severity": i.severity,
+            "origin": i.origin,
+        })).collect::<Vec<_>>(),
+        "fossils": report.fossils.iter().map(|f| json!({
+            "upstream": f.upstream,
+            "downstream": f.downstream,
+            "born_at": f.born_at,
+            "born_at_unix": f.born_at_unix,
+            "intent": f.intent,
+            "born_structure": f.born_structure,
+        })).collect::<Vec<_>>(),
+        "gaps": report.gaps.iter().map(|g| json!({
+            "upstream": g.upstream,
+            "downstream": g.downstream,
+            "foundation_support": g.foundation_support,
+            "severity": g.severity,
+        })).collect::<Vec<_>>(),
+        "quality": report.quality.as_ref().map(|q| json!({
+            "total_entities": q.total_entities,
+            "external_entities": q.external_entities,
+            "total_relations": q.total_relations,
+            "resolved_relations": q.resolved_relations,
+            "unresolved_relations": q.unresolved_relations,
+            "low_confidence_relations": q.low_confidence_relations,
+        })),
+    })
+}
+
+/// La sezione **Qualità del grafo** (roadmap P2-7): dichiara esplicitamente quanto
+/// fidarsi del referto. `info_invariants` è il numero di invarianti a confidenza
+/// bassa (severità "info"), che insieme agli archi a bassa confidenza formano la
+/// stima dei "possibili falsi positivi".
+fn render_graph_quality(quality: &Option<proto::GraphQuality>, info_invariants: u64) {
+    println!("\n🔬 QUALITÀ DEL GRAFO (quanto fidarsi di questo referto)");
+    println!("------------------------------------------------------");
+    let Some(q) = quality else {
+        println!("  (Il server non ha riportato metriche di qualità.)");
+        return;
+    };
+    let pct = if q.total_relations > 0 {
+        (q.resolved_relations as f64 / q.total_relations as f64 * 100.0).round() as u64
+    } else {
+        100
+    };
+    println!(
+        "  • Entità totali:           {} (di cui {} esterne tracciate)",
+        q.total_entities, q.external_entities
+    );
+    println!(
+        "  • Relazioni risolte:       {} / {} ({}%)",
+        q.resolved_relations, q.total_relations, pct
+    );
+    println!(
+        "  • Relazioni non risolte:   {} (riferimenti non agganciati: un arco mancante è meglio di uno che mente)",
+        q.unresolved_relations
+    );
+    if q.low_confidence_relations > 0 {
+        println!(
+            "  • Archi a bassa confidenza: {} (esclusi dal mining)",
+            q.low_confidence_relations
+        );
+    }
+    let false_positives = q.low_confidence_relations + info_invariants;
+    if false_positives > 0 {
+        println!(
+            "  • Possibili falsi positivi: {} (archi a bassa confidenza + invarianti < 50%)",
+            false_positives
+        );
+    } else {
+        println!("  • Possibili falsi positivi: ✅ nessuno evidente");
+    }
+}
+
+fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &ReportOptions) {
     println!("\n=======================================================");
     println!("       🏛️  REFERTO ARCHITETTURALE DI CODEOS  ");
-    println!("=======================================================\n");
+    println!("=======================================================");
+    if !opts.verbose && !opts.only_high_risk {
+        println!("(compatto — `--verbose` per tutto, `--json` per CI/AI, `--only high-risk` per i soli rischi)");
+    }
 
     // --- SINTESI AD ALTO LIVELLO ---
-    println!("📋 SINTESI DIREZIONALE");
+    println!("\n📋 SINTESI DIREZIONALE");
     println!("----------------------");
 
     // Calcolo Fondazioni Principali
@@ -255,14 +422,6 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse) {
         println!("  • Rischi rilevati:       ⚠️  Rilevate {} lacune architetturali (accoppiamenti bidirezionali).", report.gaps.len());
     }
 
-    // Calcolo Falsi Positivi
-    let low_conf = report.invariants.iter().filter(|inv| inv.confidence < 0.5).count();
-    if low_conf > 0 {
-        println!("  • Falsi positivi:        🔍 {} invarianti hanno confidenza bassa (< 50%).", low_conf);
-    } else {
-        println!("  • Falsi positivi:        ✅ Tutti gli invarianti hanno confidenza elevata.");
-    }
-
     // Azioni consigliate
     println!("\n🎯 AZIONI CONSIGLIATE");
     println!("---------------------");
@@ -284,24 +443,54 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse) {
         println!("  {}. {}", idx + 1, action);
     }
 
+    // --- QUALITÀ DEL GRAFO (P2-7): quanto fidarsi del referto qui sopra ---
+    let info_invariants = report
+        .invariants
+        .iter()
+        .filter(|inv| inv.severity == "info")
+        .count() as u64;
+    render_graph_quality(&report.quality, info_invariants);
+
     // --- INVARIANTI DI LAYERING ---
     println!("\n🧱 INVARIANTI DI LAYERING (Asse Struttura & Tempo)");
     println!("--------------------------------------------------");
-    if report.invariants.is_empty() {
-        println!("  (Nessun invariante di layering scoperto)");
+    // Filtra per severità (compatto = niente "info") e ordina i più gravi in cima.
+    let mut invariants: Vec<&proto::LayeringInvariant> = report
+        .invariants
+        .iter()
+        .filter(|inv| severity_passes(&inv.severity, opts))
+        .collect();
+    invariants.sort_by_key(|inv| std::cmp::Reverse(severity_rank(&inv.severity)));
+    if invariants.is_empty() {
+        if report.invariants.is_empty() {
+            println!("  (Nessun invariante di layering scoperto)");
+        } else {
+            println!("  (Nessuno oltre la soglia di rilevanza; usa --verbose per vederli tutti)");
+        }
     } else {
-        // Mostra prima gli invarianti ad alta priorità: i confini da difendere
-        // emergono in cima, i probabili falsi positivi (info) scendono in fondo.
-        let mut invariants: Vec<&proto::LayeringInvariant> = report.invariants.iter().collect();
-        invariants.sort_by_key(|inv| std::cmp::Reverse(severity_rank(&inv.severity)));
-        for inv in invariants {
+        let cap = if opts.verbose {
+            invariants.len()
+        } else {
+            COMPACT_INVARIANTS.min(invariants.len())
+        };
+        for inv in &invariants[..cap] {
             let conf_pct = (inv.confidence * 100.0).round();
-            let source = if inv.calibrated { "tempo / git log" } else { "strutturale / statico" };
-            let origin = origin_label(&inv.origin);
-            println!(
-                "  • {} '{}' NON deve dipendere da '{}'\n    [Origine: {} | Supporto: {} archi | Confidenza: {}% | Calibrato: {}]",
-                severity_badge(&inv.severity), inv.upstream, inv.downstream, origin, inv.support, conf_pct, source
-            );
+            if opts.verbose {
+                let source = if inv.calibrated { "tempo / git log" } else { "strutturale / statico" };
+                println!(
+                    "  • {} '{}' NON deve dipendere da '{}'\n    [Origine: {} | Supporto: {} archi | Confidenza: {}% | Calibrato: {}]",
+                    severity_badge(&inv.severity), inv.upstream, inv.downstream, origin_label(&inv.origin), inv.support, conf_pct, source
+                );
+            } else {
+                println!(
+                    "  {} '{}' NON deve dipendere da '{}'  [sup {} · conf {}% · {}]",
+                    severity_badge(&inv.severity), inv.upstream, inv.downstream, inv.support, conf_pct, origin_label(&inv.origin)
+                );
+            }
+        }
+        let hidden = invariants.len() - cap;
+        if hidden > 0 {
+            println!("  … e altri {hidden} (usa --verbose per l'elenco completo)");
         }
     }
 
@@ -310,7 +499,7 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse) {
     println!("--------------------------------------");
     if report.fossils.is_empty() {
         println!("  (Nessun fossile estratto dalla storia git)");
-    } else {
+    } else if opts.verbose {
         for f in &report.fossils {
             let hash = if f.born_at.len() >= 12 { &f.born_at[..12] } else { &f.born_at };
             println!("  • Confine '{}' → '{}'", f.downstream, f.upstream);
@@ -319,28 +508,57 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse) {
                 println!("    File co-modificati: {}", f.born_structure.join(", "));
             }
         }
+    } else {
+        // Compatto: il dettaglio è verboso (2-3 righe a fossile). Qui un solo
+        // esempio + il conteggio; la storia completa è dietro --verbose.
+        let f = &report.fossils[0];
+        let hash = if f.born_at.len() >= 12 { &f.born_at[..12] } else { &f.born_at };
+        println!(
+            "  • {} confini datati; es. '{}' → '{}' nato in [{}] «{}»",
+            report.fossils.len(), f.downstream, f.upstream, hash, f.intent
+        );
+        println!("    (usa --verbose per la storia completa di ogni confine)");
     }
 
     // --- LACUNE DEL SECONDO ORDINE ---
     println!("\n🕳️  LACUNE DEL SECONDO ORDINE (Asse Meta)");
     println!("------------------------------------------");
-    if report.gaps.is_empty() {
-        println!("  ✅ Ogni fondazione è pienamente rispettata senza eccezioni.");
+    let mut gaps: Vec<&proto::ArchitecturalGap> = report
+        .gaps
+        .iter()
+        .filter(|g| severity_passes(&g.severity, opts))
+        .collect();
+    gaps.sort_by_key(|g| std::cmp::Reverse(severity_rank(&g.severity)));
+    if gaps.is_empty() {
+        if report.gaps.is_empty() {
+            println!("  ✅ Ogni fondazione è pienamente rispettata senza eccezioni.");
+        } else {
+            println!("  (Nessuna oltre la soglia di rilevanza; usa --verbose per vederle tutte)");
+        }
     } else {
-        let mut gaps: Vec<&proto::ArchitecturalGap> = report.gaps.iter().collect();
-        gaps.sort_by_key(|g| std::cmp::Reverse(severity_rank(&g.severity)));
-        for gap in gaps {
+        let cap = if opts.verbose {
+            gaps.len()
+        } else {
+            COMPACT_GAPS.min(gaps.len())
+        };
+        for gap in &gaps[..cap] {
             println!(
                 "  • {} La fondazione '{}' è violata dall'eccezione '{}'",
                 severity_badge(&gap.severity), gap.upstream, gap.downstream
             );
             // Il "perché" della lacuna (roadmap 13): non è un buco arbitrario, è
             // un'eccezione a una convenzione che il resto del codice rispetta.
-            println!(
-                "    Perché: '{up}' è una fondazione rispettata a senso unico da {n} altri layer, \
-                 ma '{down}' dipende da '{up}' E '{up}' dipende da '{down}' (accoppiamento bidirezionale).",
-                up = gap.upstream, down = gap.downstream, n = gap.foundation_support
-            );
+            if opts.verbose {
+                println!(
+                    "    Perché: '{up}' è una fondazione rispettata a senso unico da {n} altri layer, \
+                     ma '{down}' dipende da '{up}' E '{up}' dipende da '{down}' (accoppiamento bidirezionale).",
+                    up = gap.upstream, down = gap.downstream, n = gap.foundation_support
+                );
+            }
+        }
+        let hidden = gaps.len() - cap;
+        if hidden > 0 {
+            println!("  … e altre {hidden} (usa --verbose per l'elenco completo)");
         }
     }
     println!("\n=======================================================\n");

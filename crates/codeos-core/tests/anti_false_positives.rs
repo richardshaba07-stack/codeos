@@ -216,6 +216,21 @@ async fn indexing_a_realistic_project_produces_no_false_positives() {
         .expect("nessuna risposta dal guardian")
         .expect("referto fallito");
 
+    // --- 8b. P2-7: la qualità del grafo è coerente col progetto indicizzato -------
+    // tokio è tracciato come entità esterna (P0-2), quindi il conteggio esterni è ≥1.
+    let q = &report.quality;
+    assert!(
+        q.external_entities >= 1,
+        "tokio deve comparire fra le entità esterne tracciate: {q:?}"
+    );
+    assert!(q.total_entities > q.external_entities, "ci sono anche entità reali");
+    // Le tre classi di fiducia partizionano esattamente le relazioni totali.
+    assert_eq!(
+        q.total_relations,
+        q.resolved_relations + q.unresolved_relations + q.low_confidence_relations,
+        "resolved + unresolved + low deve dare il totale: {q:?}"
+    );
+
     for inv in &report.invariants {
         assert!(
             !inv.upstream.contains("external") && !inv.downstream.contains("external"),

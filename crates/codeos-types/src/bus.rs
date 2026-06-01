@@ -128,6 +128,42 @@ pub struct ArchitectureReport {
     /// Le lacune del secondo ordine: gli invarianti mancanti dove la convenzione
     /// architetturale direbbe che dovrebbero esserci (asse meta).
     pub gaps: Vec<ArchitecturalGapInfo>,
+    /// La **qualità del grafo** da cui il referto è derivato: quanto fidarsi del
+    /// dato di partenza (roadmap P2-7). Non è un asse dello spazio negativo, è la
+    /// sua misura di affidabilità.
+    pub quality: GraphQualityInfo,
+}
+
+/// La **qualità del grafo**: la misura di quanta fiducia merita il referto.
+///
+/// Filosofia (roadmap P0, «un arco mancante è preferibile a un arco che mente»):
+/// un referto è onesto solo se dichiara *esplicitamente* la solidità dei dati su
+/// cui si fonda. Questi contatori — derivati dal grafo persistito al momento del
+/// referto — distinguono le relazioni saldamente agganciate dai riferimenti
+/// lasciati `Unresolved` di proposito e dagli archi a bassa confidenza, e isolano
+/// le entità esterne (tracciate ma escluse dal mining, P0-2).
+///
+/// `total = resolved + unresolved + low_confidence` partiziona le relazioni: ogni
+/// arco cade in esattamente una delle tre classi di fiducia.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphQualityInfo {
+    /// Entità totali nel grafo (incluse quelle esterne).
+    pub total_entities: u64,
+    /// Entità `ExternalDependency`: tracciate per query/impatto ma fuori dal mining
+    /// architetturale (P0-2). Le isoliamo perché non sono codice del progetto.
+    pub external_entities: u64,
+    /// Relazioni totali nel grafo.
+    pub total_relations: u64,
+    /// Relazioni agganciate a un target reale con confidenza alta o media: la spina
+    /// dorsale fidata del grafo (`total - unresolved - low_confidence`).
+    pub resolved_relations: u64,
+    /// Relazioni `Unresolved` (target nullo): un riferimento visto ma deliberatamente
+    /// non agganciato a un omonimo incerto. Un arco mancante, non un arco che mente.
+    pub unresolved_relations: u64,
+    /// Relazioni agganciate ma a **bassa** confidenza (`resolution_confidence=low`):
+    /// escluse dal mining (P0-1b). Oggi tipicamente zero — è una rete di sicurezza
+    /// per le future euristiche fuzzy/cross-package.
+    pub low_confidence_relations: u64,
 }
 
 /// Livello di gravità di un esito architetturale (invariante, lacuna o violazione).

@@ -63,4 +63,9 @@ pub trait GraphStorage: Send + Sync {
         &self,
         filter: RelationFilter,
     ) -> anyhow::Result<Vec<codeos_types::Relation>>;
+
+    /// La **qualità del grafo**: contatori aggregati che dicono quanto fidarsi del
+    /// dato (roadmap P2-7). È una pura lettura: alcune `SELECT COUNT(*)` sul grafo
+    /// persistito, senza materializzare entità o relazioni in memoria.
+    async fn graph_quality(&self) -> anyhow::Result<codeos_types::bus::GraphQualityInfo>;
 }

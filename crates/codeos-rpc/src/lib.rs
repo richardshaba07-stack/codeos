@@ -25,8 +25,8 @@ use std::pin::Pin;
 
 use codeos_core::DispatcherHandle;
 use codeos_types::bus::{
-    ArchitecturalGapInfo, CodeOsEvent, Command, DecisionFossilInfo, LayeringInvariantInfo,
-    NewDecision, QueryRequest,
+    ArchitecturalGapInfo, CodeOsEvent, Command, DecisionFossilInfo, GraphQualityInfo,
+    LayeringInvariantInfo, NewDecision, QueryRequest,
 };
 use codeos_types::{Entity, EntityId, EntityKind, Relation, RelationKind, SourceLocation};
 use tokio::sync::{broadcast, mpsc};
@@ -282,6 +282,7 @@ impl CodeOs for CodeOsService {
                 .into_iter()
                 .map(architectural_gap_to_proto)
                 .collect(),
+            quality: Some(graph_quality_to_proto(report.quality)),
         }))
     }
 
@@ -390,6 +391,17 @@ fn architectural_gap_to_proto(info: ArchitecturalGapInfo) -> proto::Architectura
         downstream: info.downstream,
         foundation_support: info.foundation_support,
         severity: info.severity.as_str().to_string(),
+    }
+}
+
+fn graph_quality_to_proto(info: GraphQualityInfo) -> proto::GraphQuality {
+    proto::GraphQuality {
+        total_entities: info.total_entities,
+        external_entities: info.external_entities,
+        total_relations: info.total_relations,
+        resolved_relations: info.resolved_relations,
+        unresolved_relations: info.unresolved_relations,
+        low_confidence_relations: info.low_confidence_relations,
     }
 }
 
@@ -615,6 +627,14 @@ mod tests {
         assert!(response.invariants.is_empty());
         assert!(response.fossils.is_empty());
         assert!(response.gaps.is_empty());
+
+        // La qualità del grafo (P2-7) viaggia sempre sul filo, anche a vuoto: tutti
+        // i contatori a zero, ma il messaggio è presente (wiring end-to-end ok).
+        let quality = response.quality.expect("la qualità del grafo deve essere presente");
+        assert_eq!(quality.total_entities, 0);
+        assert_eq!(quality.total_relations, 0);
+        assert_eq!(quality.resolved_relations, 0);
+        assert_eq!(quality.unresolved_relations, 0);
     }
 
     #[tokio::test]

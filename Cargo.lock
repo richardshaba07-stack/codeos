@@ -358,6 +358,7 @@ dependencies = [
  "codeos-types",
  "prost",
  "protoc-bin-vendored",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",

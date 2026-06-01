@@ -165,6 +165,8 @@ impl GuardianActor {
         let rules = self.guardian.mine_rules_calibrated().await?;
         let fossils = self.guardian.fossils().await?;
         let gaps = self.guardian.missing_invariants().await?;
+        // Qualità del grafo (P2-7): quanto fidarsi del referto appena costruito.
+        let quality = self.guardian.graph_quality().await?;
 
         let invariants = rules
             .into_iter()
@@ -208,6 +210,7 @@ impl GuardianActor {
             invariants,
             fossils,
             gaps,
+            quality,
         })
     }
 

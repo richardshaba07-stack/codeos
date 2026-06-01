@@ -147,6 +147,13 @@ impl Guardian {
         self.history.is_some()
     }
 
+    /// La **qualità del grafo** sottostante (roadmap P2-7): i contatori che dicono
+    /// quanto fidarsi del referto (relazioni risolte vs irrisolte vs a bassa
+    /// confidenza, entità esterne). Pura lettura: delega allo storage.
+    pub async fn graph_quality(&self) -> anyhow::Result<codeos_types::bus::GraphQualityInfo> {
+        self.storage.graph_quality().await
+    }
+
     /// Scopre le regole di layering dall'**intero grafo persistito**.
     pub async fn mine_rules(&self) -> anyhow::Result<Vec<LayeringRule>> {
         let relations = self
