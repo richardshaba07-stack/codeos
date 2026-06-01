@@ -46,6 +46,34 @@ CREATE INDEX IF NOT EXISTS idx_relations_source ON relations(source_id);
 CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_id);
 "#;
 
+/// Migrazioni dello schema, in ordine di applicazione. La versione di schema è
+/// l'indice **1-based**: applicare `MIGRATIONS[0]` porta il DB da v0 a v1,
+/// `MIGRATIONS[1]` da v1 a v2, e così via. Il contatore vive in
+/// `PRAGMA user_version` (un intero a 32 bit nell'header del file SQLite,
+/// gratuito e transazionale): non serve una tabella dedicata.
+///
+/// Invariante di compatibilità: una migrazione già rilasciata NON si modifica
+/// né si riordina (un DB in campo l'ha già applicata e non la rieseguirà); le
+/// evoluzioni si aggiungono **in coda**. Ogni passo è idempotente
+/// (`... IF NOT EXISTS`), così un DB creato prima del versioning (quando lo
+/// schema non era tracciato, `user_version = 0`) riesegue la v1 senza danni e
+/// prosegue da lì.
+const MIGRATIONS: &[&str] = &[
+    // v1 — schema base del grafo: tabelle `entities`/`relations` e indici primari.
+    SCHEMA,
+    // v2 — indici compositi (chiave esterna + tipo): accelerano i filtri
+    // combinati del QueryEngine nella BFS (`target_id + kind` per i test che
+    // coprono un'entità, `source_id + kind` per contare gli `Unresolved`), che
+    // con i soli indici a colonna singola degradavano a scansione del residuo.
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_relations_source_kind ON relations(source_id, kind);
+    CREATE INDEX IF NOT EXISTS idx_relations_target_kind ON relations(target_id, kind);
+    "#,
+];
+
+/// Versione di schema attesa dal codice corrente (= numero di migrazioni note).
+const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
+
 /// Lo storage del grafo su SQLite.
 pub struct SqliteStorage {
     conn: Mutex<Connection>,
@@ -65,13 +93,53 @@ impl SqliteStorage {
         Self::from_connection(conn)
     }
 
-    fn from_connection(conn: Connection) -> anyhow::Result<Self> {
-        conn.execute_batch(SCHEMA)
-            .context("creazione dello schema del grafo fallita")?;
+    fn from_connection(mut conn: Connection) -> anyhow::Result<Self> {
+        run_migrations(&mut conn).context("migrazione dello schema del grafo fallita")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
+}
+
+/// Porta il database alla [`SCHEMA_VERSION`] corrente applicando, in ordine, le
+/// migrazioni ancora mancanti.
+///
+/// Legge `PRAGMA user_version`, esegue ogni passo da `current` a
+/// `SCHEMA_VERSION` e avanza il contatore **dentro la stessa transazione** del
+/// DDL: schema e versione progrediscono atomicamente, quindi un crash a metà
+/// non lascia mai il DB in uno stato intermedio incoerente. Un DB più recente
+/// del codice è un errore esplicito (non degradiamo dati che non sappiamo
+/// leggere) invece di un panico o di una corruzione silenziosa.
+fn run_migrations(conn: &mut Connection) -> anyhow::Result<()> {
+    let current: u32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .context("lettura di user_version fallita")?;
+
+    if current > SCHEMA_VERSION {
+        return Err(anyhow!(
+            "schema del database (v{current}) più recente della versione supportata \
+             (v{SCHEMA_VERSION}): aggiorna CodeOS per aprire questo database"
+        ));
+    }
+
+    for version in current..SCHEMA_VERSION {
+        let sql = MIGRATIONS[version as usize];
+        let next = version + 1;
+        let tx = conn
+            .transaction()
+            .with_context(|| format!("apertura transazione per la migrazione v{next}"))?;
+        tx.execute_batch(sql)
+            .with_context(|| format!("migrazione dello schema a v{next} fallita"))?;
+        // `PRAGMA user_version` non accetta parametri bind: `pragma_update`
+        // formatta in modo sicuro l'intero. È transazionale (scrive l'header del
+        // DB), quindi resta accoppiato al DDL appena eseguito.
+        tx.pragma_update(None, "user_version", next)
+            .with_context(|| format!("aggiornamento di user_version a v{next} fallito"))?;
+        tx.commit()
+            .with_context(|| format!("commit della migrazione v{next} fallito"))?;
+        tracing::info!(from = version, to = next, "migrazione dello schema applicata");
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -384,6 +452,47 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// Path temporaneo univoco per i test che hanno bisogno di un DB su file
+    /// (per riaprire la stessa connessione o pre-impostarne `user_version`).
+    ///
+    /// Il timestamp da solo NON basta: su macOS la risoluzione dell'orologio è
+    /// abbastanza grossolana che due test in parallelo possono leggere lo stesso
+    /// valore e collidere sul path. Un contatore atomico per-processo garantisce
+    /// l'unicità interna; il timestamp distingue tra processi/run diversi.
+    fn temp_db_path() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("codeos_storage_{nanos}_{seq}.db"))
+    }
+
+    /// `PRAGMA user_version` corrente (i sottomoduli vedono i campi privati del
+    /// modulo padre, quindi possiamo leggere direttamente la connessione).
+    fn schema_version(storage: &SqliteStorage) -> u32 {
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap()
+    }
+
+    fn has_index(storage: &SqliteStorage, name: &str) -> bool {
+        let guard = storage.conn.lock().unwrap();
+        let count: i64 = guard
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        count > 0
+    }
+
     fn entity(qname: &str, kind: EntityKind, file: &str) -> Entity {
         Entity {
             id: EntityId::new(),
@@ -518,5 +627,66 @@ mod tests {
         let in_auth = storage.get_entities_by_file("app/auth.py").await.unwrap();
         assert_eq!(in_auth.len(), 1);
         assert_eq!(in_auth[0].qualified_name, "app::auth::login");
+    }
+
+    #[tokio::test]
+    async fn fresh_db_is_at_latest_schema_version_with_composite_indexes() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        // Un DB nuovo viene portato fino all'ultima versione nota.
+        assert_eq!(schema_version(&storage), SCHEMA_VERSION);
+        // E gli indici della v2 esistono davvero (la migrazione è girata).
+        assert!(has_index(&storage, "idx_relations_source_kind"));
+        assert!(has_index(&storage, "idx_relations_target_kind"));
+    }
+
+    #[tokio::test]
+    async fn reopening_a_file_db_reruns_no_migration_and_keeps_data() {
+        let path = temp_db_path();
+        {
+            let storage = SqliteStorage::open(&path).unwrap();
+            storage
+                .apply_delta(GraphDelta {
+                    added_entities: vec![entity("pkg::keep", EntityKind::Module, "pkg/keep.py")],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(schema_version(&storage), SCHEMA_VERSION);
+        } // il drop chiude la connessione, il file resta sul disco
+
+        // Riapertura: `current == target` ⇒ il loop di migrazione è vuoto
+        // (nessun passo rieseguito) e i dati sopravvivono.
+        let reopened = SqliteStorage::open(&path).unwrap();
+        assert_eq!(schema_version(&reopened), SCHEMA_VERSION);
+        assert!(reopened
+            .get_entity_by_qname("pkg::keep")
+            .await
+            .unwrap()
+            .is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_database_from_a_newer_schema() {
+        let path = temp_db_path();
+        {
+            // Simula un DB scritto da una versione futura di CodeOS.
+            let raw = Connection::open(&path).unwrap();
+            raw.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+
+        // `.err()` scarta il valore Ok (SqliteStorage non è Debug, quindi
+        // `unwrap_err` non si può usare).
+        let err = SqliteStorage::open(&path)
+            .err()
+            .expect("aprire un DB di schema più recente deve fallire");
+        // `{:#}` srotola l'intera catena anyhow (il messaggio vive sotto il
+        // context "migrazione dello schema del grafo fallita").
+        let chain = format!("{err:#}");
+        assert!(chain.contains("più recente"), "errore inatteso: {chain}");
+
+        let _ = std::fs::remove_file(&path);
     }
 }
