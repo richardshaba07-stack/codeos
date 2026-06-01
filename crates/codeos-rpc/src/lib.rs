@@ -433,6 +433,7 @@ fn entity_kind_name(kind: EntityKind) -> &'static str {
         EntityKind::Variable => "Variable",
         EntityKind::Parameter => "Parameter",
         EntityKind::Test => "Test",
+        EntityKind::ExternalDependency => "ExternalDependency",
     }
 }
 

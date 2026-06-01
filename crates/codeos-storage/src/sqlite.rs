@@ -327,6 +327,7 @@ fn entity_kind_to_str(kind: EntityKind) -> &'static str {
         EntityKind::Variable => "Variable",
         EntityKind::Parameter => "Parameter",
         EntityKind::Test => "Test",
+        EntityKind::ExternalDependency => "ExternalDependency",
     }
 }
 
@@ -342,6 +343,7 @@ fn entity_kind_from_str(s: &str) -> anyhow::Result<EntityKind> {
         "Variable" => EntityKind::Variable,
         "Parameter" => EntityKind::Parameter,
         "Test" => EntityKind::Test,
+        "ExternalDependency" => EntityKind::ExternalDependency,
         other => return Err(anyhow!("EntityKind sconosciuto nel DB: '{other}'")),
     })
 }

@@ -115,6 +115,13 @@ impl GraphResolver {
             });
         }
 
+        // Cache delle entità sintetiche per dipendenze esterne create in questo
+        // batch (`external::tokio` → id), così più relazioni verso lo stesso
+        // crate/pacchetto riusano lo stesso nodo. La persistenza fra batch è
+        // garantita da `get_entity_by_qname` (le entità `<external>` non hanno un
+        // file reale, quindi `collect_removals` non le rimuove mai).
+        let mut external_cache: HashMap<String, EntityId> = HashMap::new();
+
         // Passo 3 — Name resolution: ora che l'indice del batch è completo,
         // risolvi ogni relazione del parser in un arco con EntityId.
         for ctx in &file_ctxs {
@@ -148,21 +155,61 @@ impl GraphResolver {
                         metadata: HashMap::new(),
                     },
                     None => {
-                        // Passo 3.4 — Fallback Unresolved: NON è un errore. Il nome
-                        // originale e il tipo di relazione mancato finiscono nei
-                        // metadata, così l'UI e il Memory Engine possono mostrarli.
-                        let mut metadata = HashMap::new();
-                        metadata.insert(
-                            "unresolved_target".to_string(),
-                            parsed.target_qualified_name.clone(),
-                        );
-                        metadata.insert("original_kind".to_string(), format!("{:?}", parsed.kind));
-                        Relation {
-                            id: EntityId::new(),
-                            kind: RelationKind::Unresolved,
-                            source_id: *source_id,
-                            target_id: EntityId::nil(),
-                            metadata,
+                        // Passo 3.4 — Prima del fallback Unresolved, prova a
+                        // riconoscere una dipendenza esterna (std/tokio/serde,
+                        // react, @scope/pkg…). Se il target è un pacchetto fuori
+                        // dal progetto, lo aggancio a un'entità sintetica stabile
+                        // invece di buttarlo in un Unresolved con target nullo.
+                        match external_dependency_root(
+                            &parsed.target_qualified_name,
+                            &ctx.language,
+                            &ctx.namespace,
+                            parsed.kind == RelationKind::Imports,
+                        ) {
+                            Some(root) => {
+                                let target_id = external_entity_id(
+                                    &root,
+                                    &ctx.language,
+                                    &mut external_cache,
+                                    &mut delta,
+                                    storage,
+                                )
+                                .await?;
+                                let mut metadata = HashMap::new();
+                                metadata.insert(
+                                    "external_target".to_string(),
+                                    parsed.target_qualified_name.clone(),
+                                );
+                                Relation {
+                                    id: EntityId::new(),
+                                    kind: parsed.kind,
+                                    source_id: *source_id,
+                                    target_id,
+                                    metadata,
+                                }
+                            }
+                            None => {
+                                // Fallback Unresolved: NON è un errore. Il nome
+                                // originale e il tipo di relazione mancato finiscono
+                                // nei metadata, così l'UI e il Memory Engine possono
+                                // mostrarli.
+                                let mut metadata = HashMap::new();
+                                metadata.insert(
+                                    "unresolved_target".to_string(),
+                                    parsed.target_qualified_name.clone(),
+                                );
+                                metadata.insert(
+                                    "original_kind".to_string(),
+                                    format!("{:?}", parsed.kind),
+                                );
+                                Relation {
+                                    id: EntityId::new(),
+                                    kind: RelationKind::Unresolved,
+                                    source_id: *source_id,
+                                    target_id: EntityId::nil(),
+                                    metadata,
+                                }
+                            }
                         }
                     }
                 };
@@ -361,7 +408,7 @@ async fn resolve_target(
 
 fn target_candidates(target: &str, module_prefix: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let normalized = target.replace('.', "::").replace('/', "::");
+    let normalized = target.replace(['.', '/'], "::");
     if normalized != target {
         out.push(normalized);
     }
@@ -392,7 +439,7 @@ fn target_candidates(target: &str, module_prefix: &str) -> Vec<String> {
                 if rest
                     .split("::")
                     .next()
-                    .is_some_and(|seg| starts_lowercase(seg))
+                    .is_some_and(starts_lowercase)
                 {
                     out.push(format!("crates::{dir}::src::{rest}").replace('.', "::"));
                 }
@@ -546,6 +593,141 @@ fn last_segment(target: &str) -> Option<&str> {
     target.rsplit(['.', ':']).find(|s| !s.is_empty())
 }
 
+/// Restituisce l'`EntityId` dell'entità sintetica per la dipendenza esterna
+/// `root` (es. `tokio`), creandola se non esiste ancora — né nel batch corrente
+/// (via `cache`) né nel DB (via `get_entity_by_qname`). Le entità esterne hanno
+/// `file_path` `<external>` e non vengono mai rimosse dalla re-indicizzazione.
+async fn external_entity_id(
+    root: &str,
+    language: &str,
+    cache: &mut HashMap<String, EntityId>,
+    delta: &mut GraphDelta,
+    storage: &dyn GraphStorage,
+) -> anyhow::Result<EntityId> {
+    let qname = format!("external::{root}");
+    if let Some(id) = cache.get(&qname) {
+        return Ok(*id);
+    }
+    if let Some(existing) = storage.get_entity_by_qname(&qname).await? {
+        cache.insert(qname, existing.id);
+        return Ok(existing.id);
+    }
+
+    let id = EntityId::new();
+    let mut metadata = HashMap::new();
+    metadata.insert("language".to_string(), language.to_string());
+    metadata.insert("external".to_string(), "true".to_string());
+    metadata.insert("dependency_root".to_string(), root.to_string());
+    delta.added_entities.push(Entity {
+        id,
+        kind: codeos_types::EntityKind::ExternalDependency,
+        qualified_name: qname.clone(),
+        location: codeos_types::SourceLocation {
+            file_path: "<external>".to_string(),
+            start_line: 0,
+            start_column: 0,
+            end_line: 0,
+            end_column: 0,
+        },
+        metadata,
+    });
+    cache.insert(qname, id);
+    Ok(id)
+}
+
+/// Decide se `target` è una dipendenza esterna e, in tal caso, ne restituisce la
+/// "radice" (il crate/pacchetto da usare come entità sintetica).
+///
+/// Conservativo per costruzione: in dubbio preferisce `None` (⇒ `Unresolved`)
+/// piuttosto che etichettare come esterno un target interno non ancora risolto o
+/// una call locale mancata. La discriminazione è per-linguaggio.
+fn external_dependency_root(
+    target: &str,
+    language: &str,
+    namespace: &HashMap<String, String>,
+    is_import: bool,
+) -> Option<String> {
+    match language {
+        "rust" => external_root_rust(target, is_import),
+        "python" => external_root_python(target, namespace, is_import),
+        // Per il web trattiamo come esterni solo gli import di pacchetti (bare
+        // specifier); le call non risolte restano Unresolved.
+        "typescript" | "javascript" if is_import => external_root_web(target),
+        _ => None,
+    }
+}
+
+/// Rust: `tokio::sync::mpsc` → `tokio`. Esclude le keyword di path relative al
+/// progetto (`crate`/`self`/`super`/`Self`) e i crate interni (`codeos_*`).
+fn external_root_rust(target: &str, is_import: bool) -> Option<String> {
+    let root = first_segment(target)?;
+    if matches!(root, "crate" | "self" | "super" | "Self") {
+        return None;
+    }
+    if is_internal_crate_name(root) {
+        return None;
+    }
+    // I crate esterni iniziano in minuscolo (convenzione Rust). Un identificatore
+    // CamelCase senza path è un tipo locale non risolto, non una dipendenza.
+    if !starts_lowercase(root) {
+        return None;
+    }
+    // Serve un path (`tokio::...`) o un import esplicito: una bareword minuscola
+    // proveniente da una call (`foo()`) è quasi sempre una funzione locale
+    // mancata, non un crate esterno.
+    if target.contains("::") || is_import {
+        Some(root.to_string())
+    } else {
+        None
+    }
+}
+
+/// Python: per un import (`import os`, `from requests import get`) la radice è il
+/// primo segmento. Per una call/uso è esterna solo se il primo segmento è un nome
+/// importato nel file (`os.getcwd()` con `import os`). Gli import relativi
+/// (`.mod`) sono interni al progetto.
+fn external_root_python(
+    target: &str,
+    namespace: &HashMap<String, String>,
+    is_import: bool,
+) -> Option<String> {
+    if target.starts_with('.') {
+        return None;
+    }
+    let root = first_segment(target)?;
+    if is_import {
+        return Some(root.to_string());
+    }
+    if namespace.contains_key(root) {
+        Some(root.to_string())
+    } else {
+        None
+    }
+}
+
+/// Web (TS/JS): un bare specifier (`react`, `@scope/pkg/sub`) è un pacchetto
+/// esterno; un import relativo/assoluto (`./x`, `/abs`) è un modulo interno.
+fn external_root_web(target: &str) -> Option<String> {
+    if target.starts_with('.') || target.starts_with('/') {
+        return None;
+    }
+    npm_package_root(target)
+}
+
+/// `@scope/pkg/sub` → `@scope/pkg`; `pkg/sub` → `pkg`.
+fn npm_package_root(spec: &str) -> Option<String> {
+    let spec = spec.trim();
+    if let Some(scoped) = spec.strip_prefix('@') {
+        let mut parts = scoped.split('/');
+        let scope = parts.next().filter(|s| !s.is_empty())?;
+        let pkg = parts.next().filter(|s| !s.is_empty())?;
+        Some(format!("@{scope}/{pkg}"))
+    } else {
+        let root = spec.split('/').next().filter(|s| !s.is_empty())?;
+        Some(root.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,26 +865,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_import_becomes_unresolved_not_an_error() {
+    async fn external_import_resolves_to_synthetic_external_entity() {
+        // `import os` + `os.getcwd()`: l'import e la call risolvono entrambi a un
+        // unico nodo sintetico `external::os`, niente Unresolved con target nullo.
         let src = "import os\n\ndef f():\n    os.getcwd()\n";
         let parsed = parse("m.py", src).await;
         let storage = SqliteStorage::in_memory().unwrap();
         let resolver = GraphResolver::new(None);
 
         let delta = resolver.resolve(&[parsed], &storage).await.unwrap();
-        let unresolved: Vec<&Relation> = delta
-            .added_relations
-            .iter()
-            .filter(|r| r.kind == RelationKind::Unresolved)
-            .collect();
+
+        let ext = find(&delta, "external::os");
+        assert_eq!(ext.kind, EntityKind::ExternalDependency);
+        assert_eq!(ext.metadata.get("external").map(String::as_str), Some("true"));
+
+        // L'import `os` è un arco Imports verso il nodo esterno (target non nullo).
         assert!(
-            !unresolved.is_empty(),
-            "ci aspettavamo almeno una relazione Unresolved (os.getcwd)"
+            delta.added_relations.iter().any(|r| {
+                r.kind == RelationKind::Imports && r.target_id == ext.id && !r.target_id.is_nil()
+            }),
+            "l'import di os deve agganciarsi a external::os"
         );
-        // L'Unresolved porta il nome originale nei metadata e un target nullo.
-        assert!(unresolved
+        // Nessuna relazione Unresolved residua: tutto ha trovato un target.
+        assert!(
+            !delta
+                .added_relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Unresolved),
+            "import e call esterni non devono più produrre Unresolved"
+        );
+        // L'unico nodo esterno è condiviso (cache): non si duplica per la call.
+        let externals = delta
+            .added_entities
             .iter()
-            .all(|r| r.target_id.is_nil() && r.metadata.contains_key("unresolved_target")));
+            .filter(|e| e.kind == EntityKind::ExternalDependency)
+            .count();
+        assert_eq!(externals, 1);
+    }
+
+    #[tokio::test]
+    async fn external_rust_crate_becomes_synthetic_dependency() {
+        // `use tokio::sync::mpsc;` da un crate interno → external::tokio.
+        let parsed = parse_rust(
+            "/repo/crates/codeos-core/src/lib.rs",
+            "use tokio::sync::mpsc;\npub fn route() {}\n",
+        )
+        .await;
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        let delta = resolver.resolve(&[parsed], &storage).await.unwrap();
+
+        let ext = find(&delta, "external::tokio");
+        assert_eq!(ext.kind, EntityKind::ExternalDependency);
+        let source = find(&delta, "crates::codeos-core::src::lib");
+        assert!(
+            delta.added_relations.iter().any(|r| {
+                r.kind == RelationKind::Imports && r.source_id == source.id && r.target_id == ext.id
+            }),
+            "l'import di tokio deve collegare il modulo a external::tokio"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_crate_and_local_calls_are_not_externalized() {
+        // Un import di crate interno non risolto e una call locale mancante NON
+        // devono diventare dipendenze esterne: restano Unresolved (conservativo).
+        let parsed = parse_rust(
+            "/repo/crates/codeos-core/src/lib.rs",
+            "use codeos_types::Foo;\npub fn route() {\n    missing_local();\n}\n",
+        )
+        .await;
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        let delta = resolver.resolve(&[parsed], &storage).await.unwrap();
+
+        assert!(
+            !delta
+                .added_entities
+                .iter()
+                .any(|e| e.qualified_name.starts_with("external::codeos")),
+            "i crate interni non devono diventare dipendenze esterne"
+        );
+        assert!(
+            !delta
+                .added_entities
+                .iter()
+                .any(|e| e.qualified_name == "external::missing_local"),
+            "una call locale mancata non è una dipendenza esterna"
+        );
     }
 
     #[tokio::test]

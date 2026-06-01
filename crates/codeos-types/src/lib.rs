@@ -67,6 +67,14 @@ pub enum EntityKind {
     Variable,
     Parameter,
     Test,
+    /// Dipendenza esterna sintetica (es. `std`, `tokio`, `react`, `@scope/pkg`).
+    ///
+    /// Non corrisponde a un'entità reale nel codice indicizzato: è un nodo
+    /// creato dal `GraphResolver` quando un import/uso punta a una libreria fuori
+    /// dal progetto, così le relazioni esterne risolvono a un target stabile
+    /// invece di diventare `Unresolved` con `target_id` nullo. Abilita query del
+    /// tipo "cosa dipende da tokio?".
+    ExternalDependency,
 }
 
 /// Posizione di un'entità (o di una relazione) nel codice sorgente.
