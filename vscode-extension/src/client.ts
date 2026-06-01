@@ -81,6 +81,8 @@ export interface LayeringInvariant {
   calibrated: boolean;
   /** Provenienza: "discovered" (dedotta dal grafo) | "declared" (config a mano). */
   origin?: string;
+  /** Gravità: "info" | "warning" | "high_risk" (derivata dalla confidenza). */
+  severity?: string;
 }
 
 /** La nascita storica di un confine (Fossile di Decisione, asse intento). */
@@ -98,6 +100,8 @@ export interface ArchitecturalGap {
   upstream: string;
   downstream: string;
   foundationSupport: number;
+  /** Gravità: "info" | "warning" | "high_risk" (derivata dal supporto della fondazione). */
+  severity?: string;
 }
 
 /** Il referto architetturale completo: lo spazio negativo lungo i quattro assi. */

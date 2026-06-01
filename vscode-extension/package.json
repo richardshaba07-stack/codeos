@@ -36,10 +36,53 @@
         "title": "CodeOS: Referto architetturale (spazio negativo)"
       },
       {
+        "command": "codeos.refreshSidebar",
+        "title": "CodeOS: Aggiorna la sidebar",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "codeos.revealLocation",
+        "title": "CodeOS: Vai alla posizione"
+      },
+      {
         "command": "codeos.toggleWatch",
         "title": "CodeOS: Avvia/ferma il watch degli eventi"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codeos",
+          "title": "CodeOS",
+          "icon": "resources/codeos.svg"
+        }
+      ]
+    },
+    "views": {
+      "codeos": [
+        {
+          "id": "codeos.architecture",
+          "name": "Spazio negativo",
+          "icon": "resources/codeos.svg",
+          "contextualTitle": "CodeOS — Spazio negativo"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "codeos.refreshSidebar",
+          "when": "view == codeos.architecture",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "codeos.revealLocation",
+          "when": "false"
+        }
+      ]
+    },
     "configuration": {
       "title": "CodeOS",
       "properties": {

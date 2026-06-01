@@ -7,13 +7,24 @@
 
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { ArchitectureReport, CodeOsClient, CodeOsEvent, ViolationEvent } from './client';
+import {
+  ArchitectureReport,
+  CodeOsClient,
+  CodeOsEvent,
+  SourceLocation,
+  ViolationEvent,
+} from './client';
+import { ArchitectureTreeProvider } from './sidebar';
 
 let client: CodeOsClient | undefined;
 let stopWatchFn: (() => void) | undefined;
 let output: vscode.OutputChannel;
 let statusBar: vscode.StatusBarItem;
 let diagnostics: vscode.DiagnosticCollection;
+/** Vista ad albero nella Activity Bar: lo spazio negativo + le violazioni live. */
+let sidebar: ArchitectureTreeProvider;
+/** Timer di debounce per l'aggiornamento della sidebar dopo i `graphUpdated`. */
+let sidebarRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 /** Diagnostiche di violazione accumulate per file (fsPath → lista). */
 const violationsByFile = new Map<string, vscode.Diagnostic[]>();
 
@@ -24,6 +35,10 @@ export function activate(context: vscode.ExtensionContext): void {
   statusBar.command = 'codeos.toggleWatch';
   setDisconnected();
   statusBar.show();
+  sidebar = new ArchitectureTreeProvider();
+  context.subscriptions.push(
+    vscode.window.registerTreeDataProvider('codeos.architecture', sidebar),
+  );
   context.subscriptions.push(output, statusBar, diagnostics, {
     dispose: () => deactivate(),
   });
@@ -34,6 +49,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('codeos.query', () => runQuery(context)),
     vscode.commands.registerCommand('codeos.architectureReport', () =>
       architectureReport(context),
+    ),
+    vscode.commands.registerCommand('codeos.refreshSidebar', () => refreshSidebar(context)),
+    vscode.commands.registerCommand('codeos.revealLocation', (loc: SourceLocation) =>
+      revealLocation(loc),
     ),
     vscode.commands.registerCommand('codeos.toggleWatch', () => toggleWatch(context)),
   );
@@ -48,6 +67,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
   stopWatch();
+  if (sidebarRefreshTimer) {
+    clearTimeout(sidebarRefreshTimer);
+    sidebarRefreshTimer = undefined;
+  }
   client?.close();
   client = undefined;
 }
@@ -83,6 +106,8 @@ async function indexProject(context: vscode.ExtensionContext): Promise<void> {
   });
   log(`IndexProject completato: ${root}`);
   vscode.window.showInformationMessage('CodeOS: progetto indicizzato.');
+  // Il grafo è appena cambiato: aggiorna lo spazio negativo nella sidebar.
+  void refreshSidebar(context);
 }
 
 async function indexFile(context: vscode.ExtensionContext): Promise<void> {
@@ -137,6 +162,7 @@ async function architectureReport(context: vscode.ExtensionContext): Promise<voi
     return;
   }
 
+  sidebar.setReport(report);
   const doc = await vscode.workspace.openTextDocument({
     content: renderReport(report),
     language: 'markdown',
@@ -231,6 +257,65 @@ function toggleWatch(context: vscode.ExtensionContext): void {
 }
 
 // ---------------------------------------------------------------------------
+// Sidebar (vista ad albero dello spazio negativo)
+// ---------------------------------------------------------------------------
+
+/** Comando del pulsante ↻: rilegge il referto e lo riversa nella sidebar. */
+async function refreshSidebar(context: vscode.ExtensionContext): Promise<void> {
+  let report: ArchitectureReport;
+  try {
+    report = await withProgress('Aggiorno lo spazio negativo...', () =>
+      getClient(context).getArchitectureReport(),
+    );
+  } catch (err) {
+    reportError('Aggiornamento sidebar fallito', err);
+    return;
+  }
+  sidebar.setReport(report);
+  log(
+    `Sidebar aggiornata: ${report.invariants.length} invarianti, ` +
+      `${report.fossils.length} fossili, ${report.gaps.length} lacune`,
+  );
+}
+
+/** Coalizza una raffica di `graphUpdated` in un solo refresh, poco dopo l'ultimo. */
+function scheduleSidebarRefresh(): void {
+  if (sidebarRefreshTimer) {
+    clearTimeout(sidebarRefreshTimer);
+  }
+  sidebarRefreshTimer = setTimeout(() => {
+    sidebarRefreshTimer = undefined;
+    void refreshSidebarSilently();
+  }, 1500);
+}
+
+/** Refresh senza progress né toast (riusa il client già aperto dal watch). */
+async function refreshSidebarSilently(): Promise<void> {
+  if (!client) {
+    return;
+  }
+  try {
+    const report = await client.getArchitectureReport();
+    sidebar.setReport(report);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log(`Aggiornamento sidebar (silenzioso) fallito: ${message}`);
+  }
+}
+
+/** Comando `codeos.revealLocation`: apre il file e salta alla posizione cliccata. */
+async function revealLocation(loc: SourceLocation): Promise<void> {
+  if (!loc?.filePath) {
+    return;
+  }
+  const range = locationRange(loc);
+  const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(loc.filePath));
+  const editor = await vscode.window.showTextDocument(doc);
+  editor.selection = new vscode.Selection(range.start, range.end);
+  editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+}
+
+// ---------------------------------------------------------------------------
 // Stream eventi (il sistema immunitario, live)
 // ---------------------------------------------------------------------------
 
@@ -249,6 +334,7 @@ function startWatch(context: vscode.ExtensionContext): void {
   // Sessione nuova: lo stream consegna solo eventi futuri, quindi le vecchie
   // diagnostiche non verrebbero ripubblicate. Le azzeriamo per non lasciare stale.
   clearDiagnostics();
+  sidebar.clearViolations();
   setConnected();
   log('WatchEvents: stream aperto.');
   stopWatchFn = active.watchEvents({
@@ -285,6 +371,10 @@ function handleEvent(event: CodeOsEvent): void {
           `(-${event.removedEntities} / -${event.removedRelations})`,
       );
       statusBar.text = '$(pulse) CodeOS';
+      // Il grafo è cambiato: lo spazio negativo potrebbe essere diverso. Aggiorna
+      // la sidebar, ma con debounce: durante un'indicizzazione gli eventi arrivano
+      // a raffica e ricalcolare il referto a ogni colpo sarebbe sprecone.
+      scheduleSidebarRefresh();
       break;
     case 'violation': {
       const v = event.violation;
@@ -292,6 +382,7 @@ function handleEvent(event: CodeOsEvent): void {
       log(`> ${msg} [rule=${v.ruleId} src=${v.sourceId} -> dst=${v.targetId}]`);
       statusBar.text = '$(alert) CodeOS';
       statusBar.tooltip = msg;
+      sidebar.addViolation(v);
       addViolationDiagnostic(v);
       vscode.window
         .showWarningMessage(msg, 'Mostra problema', 'Mostra log')
@@ -311,14 +402,18 @@ function handleEvent(event: CodeOsEvent): void {
 // Diagnostiche: il sistema immunitario nel pannello "Problemi"
 // ---------------------------------------------------------------------------
 
-/** Converte la posizione (riga 1-based, colonna 0-based) in un `Range` VS Code (0-based). */
-function violationRange(v: ViolationEvent): vscode.Range {
-  const loc = v.location;
+/** Converte una posizione (riga 1-based, colonna 0-based) in un `Range` VS Code (0-based). */
+function locationRange(loc?: SourceLocation): vscode.Range {
   const startLine = Math.max(0, (loc?.startLine ?? 1) - 1);
   const startCol = Math.max(0, loc?.startColumn ?? 0);
   const endLine = Math.max(startLine, (loc?.endLine ?? loc?.startLine ?? 1) - 1);
   const endCol = Math.max(0, loc?.endColumn ?? 0);
   return new vscode.Range(startLine, startCol, endLine, endCol);
+}
+
+/** Range della posizione associata a una violazione. */
+function violationRange(v: ViolationEvent): vscode.Range {
+  return locationRange(v.location);
 }
 
 /** Mappa la severità di CodeOS sul livello di diagnostica di VS Code. */
