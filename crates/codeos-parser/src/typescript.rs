@@ -514,4 +514,101 @@ export function connectClient() {
         assert!(calls.contains(&"connectClient"), "calls = {calls:?}");
         assert!(calls.contains(&"CodeOsClient"), "calls = {calls:?}");
     }
+
+    // Roadmap 8 — JavaScript. La grammatica TypeScript di Tree-sitter è un
+    // superset di JS: lo stesso parser indicizza i `.js`/`.jsx`, marcandoli però
+    // come `language: "javascript"` (per il name resolution per-linguaggio del
+    // GraphResolver) e usando la grammatica TSX per il JSX.
+    #[tokio::test]
+    async fn parses_javascript_file_tagged_as_javascript() {
+        let src = r#"import { readFile } from 'node:fs/promises';
+
+class Cache {
+  get(key) {
+    return lookup(key);
+  }
+}
+
+function lookup(key) {
+  return key;
+}
+"#;
+        let result = TypeScriptParser::new()
+            .parse_file(Path::new("app/cache.js"), src)
+            .await;
+
+        // Tutte le entità sono marcate come JavaScript, non TypeScript.
+        assert!(
+            result
+                .entities
+                .iter()
+                .all(|e| e.metadata.get("language").map(String::as_str) == Some("javascript")),
+            "le entità di un .js devono avere language=javascript: {:?}",
+            result
+                .entities
+                .iter()
+                .map(|e| (e.name.clone(), e.metadata.get("language").cloned()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(find(&result, "Cache").kind, EntityKind::Class);
+        assert_eq!(find(&result, "lookup").kind, EntityKind::Function);
+        let method = find(&result, "get");
+        assert_eq!(method.kind, EntityKind::Method);
+
+        let imports: Vec<&str> = result
+            .relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::Imports)
+            .map(|r| r.target_qualified_name.as_str())
+            .collect();
+        assert!(
+            imports.contains(&"node:fs/promises"),
+            "imports = {imports:?}"
+        );
+        let calls: Vec<&str> = result
+            .relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .map(|r| r.target_qualified_name.as_str())
+            .collect();
+        assert!(calls.contains(&"lookup"), "calls = {calls:?}");
+    }
+
+    #[tokio::test]
+    async fn parses_jsx_with_tsx_grammar_without_fatal_error() {
+        // Sintassi JSX (`.jsx`): deve usare la grammatica TSX e produrre simboli,
+        // non un errore fatale di caricamento grammatica.
+        let src = r#"import React from 'react';
+
+export function Badge(props) {
+  return <span className="badge">{props.label}</span>;
+}
+"#;
+        // Nome file diverso dal componente, per non confondere il modulo
+        // (derivato dallo stem) con la funzione `Badge`.
+        let result = TypeScriptParser::new()
+            .parse_file(Path::new("ui/badge_view.jsx"), src)
+            .await;
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .all(|e| !e.message.contains("grammatica")),
+            "il JSX non deve fallire il caricamento grammatica: {:?}",
+            result.errors
+        );
+        assert_eq!(find(&result, "Badge").kind, EntityKind::Function);
+        assert_eq!(
+            find(&result, "Badge").metadata.get("language").map(String::as_str),
+            Some("javascript")
+        );
+        let imports: Vec<&str> = result
+            .relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::Imports)
+            .map(|r| r.target_qualified_name.as_str())
+            .collect();
+        assert!(imports.contains(&"react"), "imports = {imports:?}");
+    }
 }
