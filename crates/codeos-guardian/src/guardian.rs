@@ -58,6 +58,10 @@ pub struct Guardian {
     /// Configurazione dello *spazio negativo del secondo ordine*
     /// ([`missing_invariants`](Guardian::missing_invariants)).
     meta_config: MetaConfig,
+    /// Regole di layering **dichiarate a mano** dall'umano (`.codeos/config.yaml`).
+    /// Si fondono con quelle scoperte: valgono per decreto (confidenza 1.0) anche
+    /// dove il grafo non ha evidenza strutturale. Vuoto = nessuna config.
+    declared: Vec<LayeringRule>,
 }
 
 impl Guardian {
@@ -69,6 +73,7 @@ impl Guardian {
             history: None,
             config: LayerConfig::default(),
             meta_config: MetaConfig::default(),
+            declared: Vec::new(),
         }
     }
 
@@ -80,6 +85,7 @@ impl Guardian {
             history: None,
             config,
             meta_config: MetaConfig::default(),
+            declared: Vec::new(),
         }
     }
 
@@ -92,7 +98,37 @@ impl Guardian {
             history: None,
             config: LayerConfig::default(),
             meta_config: MetaConfig::default(),
+            declared: Vec::new(),
         }
+    }
+
+    /// Aggancia le regole di layering **dichiarate** dall'umano (tipicamente caricate
+    /// da `.codeos/config.yaml` via [`crate::load_declared_rules`]). Chainable su
+    /// qualsiasi costruttore. Le regole dichiarate si fondono con quelle scoperte e
+    /// vengono fatte rispettare anche senza supporto strutturale nel grafo.
+    pub fn with_declared_rules(mut self, declared: Vec<LayeringRule>) -> Self {
+        self.declared = declared;
+        self
+    }
+
+    /// Fonde le regole **dichiarate** con quelle passate (scoperte), senza duplicare
+    /// una coppia `(upstream, downstream)` già presente: se l'umano dichiara un
+    /// confine che il grafo ha già dissotterrato, vince la versione scoperta (porta
+    /// supporto ed evidenza). Le dichiarate aggiungono solo i confini *mancanti*.
+    fn merge_declared(&self, mut rules: Vec<LayeringRule>) -> Vec<LayeringRule> {
+        if self.declared.is_empty() {
+            return rules;
+        }
+        let existing: HashSet<(LayerKey, LayerKey)> = rules
+            .iter()
+            .map(|r| (r.upstream.clone(), r.downstream.clone()))
+            .collect();
+        for rule in &self.declared {
+            if !existing.contains(&(rule.upstream.clone(), rule.downstream.clone())) {
+                rules.push(rule.clone());
+            }
+        }
+        rules
     }
 
     /// Aggancia una sorgente di storia git (il Paleontologo). Abilita la
@@ -118,7 +154,8 @@ impl Guardian {
             .query_relations(RelationFilter::default())
             .await?;
         let layer_map = self.build_layer_map(&relations).await?;
-        Ok(mine_layering_rules(&relations, &layer_map, &self.config))
+        let mined = mine_layering_rules(&relations, &layer_map, &self.config);
+        Ok(self.merge_declared(mined))
     }
 
     /// Come [`mine_rules`](Self::mine_rules), ma **calibra** la confidenza di ogni
@@ -154,6 +191,11 @@ impl Guardian {
         let file_layers = self.build_file_layers(&relations).await?;
 
         for rule in &mut rules {
+            // Le regole dichiarate valgono per decreto: niente calibrazione sul
+            // tempo, la confidenza resta 1.0 voluta dall'umano.
+            if rule.origin == codeos_types::bus::RuleOrigin::Declared {
+                continue;
+            }
             let occ = occasions(&rule.upstream.0, &rule.downstream.0, &file_layers, &commits);
             if occ == 0 {
                 continue; // nessuna evidenza temporale: tieni la confidenza strutturale.
@@ -387,7 +429,8 @@ impl Guardian {
         endpoints.extend_from_slice(candidates);
         let layer_map = self.build_layer_map(&endpoints).await?;
 
-        let rules = mine_layering_rules(&established, &layer_map, &self.config);
+        let mined = mine_layering_rules(&established, &layer_map, &self.config);
+        let rules = self.merge_declared(mined);
         let mut violations = violations_for(candidates, &layer_map, &rules);
 
         // Arricchisci ogni violazione con la posizione dell'entità SORGENTE: è lì
@@ -813,6 +856,81 @@ mod tests {
             })
             .count();
         assert_eq!(active, 2, "due promozioni nella storia");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regole DICHIARATE: il decreto umano che vale anche senza evidenza nel grafo.
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn declared_rule_is_enforced_without_any_structural_support() {
+        use crate::declared::declared_layering_rules;
+
+        // Grafo con DUE soli archi api → core: sotto la soglia di min_support (3),
+        // quindi NESSUN invariante verrebbe scoperto dallo spazio negativo.
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let api: Vec<Entity> = (0..2)
+            .map(|i| entity(&format!("app::api::h_{i}::run")))
+            .collect();
+        let core: Vec<Entity> = (0..2)
+            .map(|i| entity(&format!("app::core::s_{i}::do_it")))
+            .collect();
+        let good: Vec<Relation> = (0..2)
+            .map(|i| relation(RelationKind::Calls, api[i].id, core[i].id))
+            .collect();
+        storage
+            .apply_delta(GraphDelta {
+                added_entities: api.iter().chain(core.iter()).cloned().collect(),
+                added_relations: good,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Senza config: niente regole (supporto insufficiente).
+        let plain = Guardian::new(storage.clone());
+        assert!(plain.mine_rules().await.unwrap().is_empty());
+
+        // Con la regola DICHIARATA "app::api non deve dipendere da app::core".
+        let declared = declared_layering_rules(
+            "architecture:\n  rules:\n    - type: layer_dependency\n      from: [\"app::api\"]\n      to: [\"app::core\"]\n",
+        );
+        let guardian = Guardian::new(storage).with_declared_rules(declared);
+
+        // Ora la regola esiste (per decreto) e compare nel mining, etichettata.
+        let rules = guardian.mine_rules().await.unwrap();
+        assert_eq!(rules.len(), 1, "regole = {rules:?}");
+        assert_eq!(rules[0].origin, codeos_types::bus::RuleOrigin::Declared);
+        assert_eq!(rules[0].upstream, LayerKey("app::api".to_string()));
+        assert_eq!(rules[0].downstream, LayerKey("app::core".to_string()));
+
+        // E viene fatta rispettare: un arco api → core inverte la freccia dichiarata.
+        let bad = relation(RelationKind::Calls, api[0].id, core[0].id);
+        let violations = guardian.check(std::slice::from_ref(&bad)).await.unwrap();
+        assert_eq!(violations.len(), 1, "violazioni = {violations:?}");
+        assert_eq!(violations[0].relation_id, bad.id);
+    }
+
+    #[tokio::test]
+    async fn discovered_rule_wins_over_a_duplicate_declaration() {
+        use crate::declared::declared_layering_rules;
+
+        // Il grafo scopre app::api → app::core (support 3). La stessa coppia è anche
+        // dichiarata: non deve duplicarsi, e deve restare la versione SCOPERTA (che
+        // porta supporto ed evidenza).
+        // Lo spazio negativo scopre upstream=app::core, downstream=app::api
+        // ("core non deve dipendere da api"). Dichiariamo lo STESSO confine:
+        // from=app::core, to=app::api.
+        let (storage, _api, _core) = seeded_two_layer_graph().await;
+        let declared = declared_layering_rules(
+            "architecture:\n  rules:\n    - type: layer_dependency\n      from: [\"app::core\"]\n      to: [\"app::api\"]\n",
+        );
+        let guardian = Guardian::new(storage).with_declared_rules(declared);
+
+        let rules = guardian.mine_rules().await.unwrap();
+        assert_eq!(rules.len(), 1, "nessun duplicato: {rules:?}");
+        assert_eq!(rules[0].origin, codeos_types::bus::RuleOrigin::Discovered);
+        assert_eq!(rules[0].support, 3);
     }
 
     #[tokio::test]

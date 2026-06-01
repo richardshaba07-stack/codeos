@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use codeos_types::bus::{ArchitectureViolation, Severity};
+use codeos_types::bus::{ArchitectureViolation, RuleOrigin, Severity};
 use codeos_types::{EntityId, Relation, RelationKind};
 
 /// Quante componenti iniziali del `qualified_name` definiscono il "layer".
@@ -88,6 +88,9 @@ pub struct LayeringRule {
     /// `1 - 1/(support+1)`. Più archi nella direzione osservata, più ci fidiamo.
     /// Da rimpiazzare con una confidenza calibrata quando avremo il ground truth.
     pub confidence: f32,
+    /// Se la regola è stata dissotterrata dal grafo o dichiarata a mano nella
+    /// config. Una regola dichiarata vale per decreto e non si calibra sul tempo.
+    pub origin: RuleOrigin,
 }
 
 /// Solo le relazioni che esprimono una **dipendenza direzionale** definiscono
@@ -184,6 +187,7 @@ pub fn mine_layering_rules(
                 downstream: a.clone(),
                 support: ab,
                 confidence: confidence_for(ab),
+                origin: RuleOrigin::Discovered,
             });
         } else if ba >= config.min_support && ab == 0 {
             rules.push(LayeringRule {
@@ -192,6 +196,7 @@ pub fn mine_layering_rules(
                 downstream: b.clone(),
                 support: ba,
                 confidence: confidence_for(ba),
+                origin: RuleOrigin::Discovered,
             });
         }
     }

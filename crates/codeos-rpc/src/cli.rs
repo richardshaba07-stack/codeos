@@ -297,9 +297,10 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse) {
         for inv in invariants {
             let conf_pct = (inv.confidence * 100.0).round();
             let source = if inv.calibrated { "tempo / git log" } else { "strutturale / statico" };
+            let origin = origin_label(&inv.origin);
             println!(
-                "  • {} '{}' NON deve dipendere da '{}'\n    [Supporto: {} archi | Confidenza: {}% | Calibrato: {}]",
-                severity_badge(&inv.severity), inv.upstream, inv.downstream, inv.support, conf_pct, source
+                "  • {} '{}' NON deve dipendere da '{}'\n    [Origine: {} | Supporto: {} archi | Confidenza: {}% | Calibrato: {}]",
+                severity_badge(&inv.severity), inv.upstream, inv.downstream, origin, inv.support, conf_pct, source
             );
         }
     }
@@ -353,6 +354,17 @@ fn severity_badge(severity: &str) -> &'static str {
         "warning" => "🟡",
         "info" => "⚪️",
         _ => "•",
+    }
+}
+
+/// Etichetta leggibile per la provenienza di una regola ("discovered"/"declared").
+/// Una regola dichiarata è una volontà esplicita dell'umano; una scoperta è dedotta
+/// dallo spazio negativo del grafo.
+fn origin_label(origin: &str) -> &'static str {
+    match origin {
+        "declared" => "📜 dichiarato",
+        "discovered" => "🔍 scoperto",
+        _ => "🔍 scoperto",
     }
 }
 

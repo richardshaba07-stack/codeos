@@ -61,9 +61,18 @@ impl GuardianActor {
         decisions: Arc<dyn DecisionStore>,
         repo_root: PathBuf,
     ) -> Self {
+        // Regole dichiarate a mano: `<repo>/.codeos/config.yaml` (opzionale). Le
+        // carichiamo prima di consumare `repo_root` nel GitLog.
+        let declared = crate::declared::load_declared_rules(
+            &repo_root.join(".codeos").join("config.yaml"),
+        );
+        if !declared.is_empty() {
+            tracing::info!(count = declared.len(), "regole di layering dichiarate caricate da config");
+        }
         Self {
             guardian: Guardian::with_memory(storage, decisions)
-                .with_commit_history(Arc::new(GitLog::new(repo_root))),
+                .with_commit_history(Arc::new(GitLog::new(repo_root)))
+                .with_declared_rules(declared),
             events,
         }
     }
@@ -168,6 +177,7 @@ impl GuardianActor {
                     confidence,
                     calibrated,
                     severity: Severity::for_invariant(confidence),
+                    origin: rule.origin,
                 }
             })
             .collect();

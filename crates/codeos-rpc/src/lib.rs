@@ -369,6 +369,7 @@ fn layering_invariant_to_proto(info: LayeringInvariantInfo) -> proto::LayeringIn
         confidence: info.confidence,
         calibrated: info.calibrated,
         severity: info.severity.as_str().to_string(),
+        origin: info.origin.as_str().to_string(),
     }
 }
 

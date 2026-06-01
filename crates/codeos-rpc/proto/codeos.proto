@@ -110,6 +110,9 @@ message LayeringInvariant {
   bool calibrated = 5;
   // Priorità di difesa derivata dalla confidenza: "info" | "warning" | "high_risk".
   string severity = 6;
+  // Provenienza della regola: "discovered" (dedotta dal grafo) | "declared"
+  // (imposta a mano in .codeos/config.yaml).
+  string origin = 7;
 }
 
 // La nascita storica di un confine (Fossile di Decisione).

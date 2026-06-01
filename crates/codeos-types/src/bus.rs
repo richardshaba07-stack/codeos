@@ -205,6 +205,48 @@ impl Severity {
     }
 }
 
+/// Provenienza di una regola di layering: dissotterrata dallo spazio negativo del
+/// grafo, oppure dichiarata a mano da un umano in `.codeos/config.yaml`.
+///
+/// Distinguere le due è essenziale (item 16 della roadmap): una regola *scoperta*
+/// è un'ipotesi che i dati sostengono e che il tempo calibra; una regola
+/// *dichiarata* è una volontà esplicita — non si discute, non si calibra, vale per
+/// decreto (confidenza 1.0) anche dove il grafo non ha ancora evidenza strutturale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuleOrigin {
+    /// Dedotta automaticamente dal Guardian leggendo l'asimmetria del grafo.
+    #[default]
+    Discovered,
+    /// Imposta esplicitamente dall'umano in `.codeos/config.yaml`.
+    Declared,
+}
+
+impl RuleOrigin {
+    /// Etichetta stabile, machine-readable, per il trasporto (proto/JSON).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleOrigin::Discovered => "discovered",
+            RuleOrigin::Declared => "declared",
+        }
+    }
+
+    /// Ricostruisce la provenienza dalla sua etichetta. Sconosciuto → `Discovered`.
+    pub fn from_str_lenient(s: &str) -> Self {
+        match s {
+            "declared" => RuleOrigin::Declared,
+            _ => RuleOrigin::Discovered,
+        }
+    }
+
+    /// Etichetta leggibile in italiano, per il referto da terminale.
+    pub fn label(self) -> &'static str {
+        match self {
+            RuleOrigin::Discovered => "scoperto",
+            RuleOrigin::Declared => "dichiarato",
+        }
+    }
+}
+
 /// Un invariante di layering scoperto: `downstream` dipende da `upstream` a senso
 /// unico, mai l'inverso. Forma piatta per il trasporto.
 #[derive(Debug, Clone, PartialEq)]
@@ -224,6 +266,8 @@ pub struct LayeringInvariantInfo {
     pub calibrated: bool,
     /// Quanto è prioritario difendere questo confine (derivata dalla confidenza).
     pub severity: Severity,
+    /// Se l'invariante è stato scoperto dai dati o dichiarato a mano nella config.
+    pub origin: RuleOrigin,
 }
 
 /// La nascita storica di un confine architetturale (Fossile di Decisione).

@@ -16,11 +16,13 @@
 //!   `ArchitectureViolationDetected`.
 
 mod actor;
+mod declared;
 mod guardian;
 mod invariant;
 mod meta;
 
 pub use actor::GuardianActor;
+pub use declared::{declared_layering_rules, load_declared_rules, DeclaredRule};
 pub use guardian::Guardian;
 pub use invariant::{
     boundary_entities, layer_of, mine_layering_rules, violations_for, LayerConfig, LayerKey,

@@ -79,6 +79,8 @@ export interface LayeringInvariant {
   /** Confidenza in [0,1]. Dal Campo di Astensione se `calibrated`, altrimenti strutturale. */
   confidence: number;
   calibrated: boolean;
+  /** Provenienza: "discovered" (dedotta dal grafo) | "declared" (config a mano). */
+  origin?: string;
 }
 
 /** La nascita storica di un confine (Fossile di Decisione, asse intento). */
