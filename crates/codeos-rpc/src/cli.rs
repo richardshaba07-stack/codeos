@@ -2,7 +2,9 @@
 //!
 //! Legge `CODEOS_ADDR` per l'indirizzo del server (default: `127.0.0.1:50051`).
 
+use std::net::ToSocketAddrs;
 use std::path::Path;
+use std::time::Duration;
 use codeos_rpc::proto;
 use proto::code_os_client::CodeOsClient;
 
@@ -66,6 +68,9 @@ async fn main() -> anyhow::Result<()> {
             println!("==================================\n");
             println!("ℹ️  Trovate {} entità e {} relazioni rilevanti.", response.entities.len(), response.relations.len());
         }
+        "doctor" => {
+            run_doctor().await;
+        }
         "help" | "--help" | "-h" => {
             print_usage();
         }
@@ -94,6 +99,99 @@ async fn connect_server() -> anyhow::Result<CodeOsClient<tonic::transport::Chann
         ))
 }
 
+/// `codeos doctor` — controlla, senza modificare nulla, che l'ambiente sia pronto:
+/// indirizzo configurato, porta raggiungibile, server gRPC vivo e in grado di
+/// produrre un referto. Stampa diagnosi azionabili e termina con exit code 1 se
+/// qualcosa è rotto, così è usabile anche in script/CI.
+async fn run_doctor() {
+    println!("🩺 CodeOS doctor — diagnosi dell'ambiente\n");
+    let mut problems = 0u32;
+
+    // 1) Indirizzo del server.
+    let raw_addr =
+        std::env::var("CODEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:50051".to_string());
+    let source = if std::env::var("CODEOS_ADDR").is_ok() {
+        "CODEOS_ADDR"
+    } else {
+        "default"
+    };
+    println!("  [✓] Indirizzo server: {raw_addr} ({source})");
+
+    // 2) Risoluzione + raggiungibilità TCP della porta.
+    let host_port = raw_addr
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string();
+    let reachable = match host_port.to_socket_addrs() {
+        Ok(mut addrs) => addrs.next().map(|sock| {
+            std::net::TcpStream::connect_timeout(&sock, Duration::from_millis(800)).is_ok()
+        }),
+        Err(_) => None,
+    };
+    match reachable {
+        Some(true) => println!("  [✓] Porta raggiungibile: connessione TCP a {host_port} ok"),
+        Some(false) => {
+            problems += 1;
+            println!("  [✗] Porta NON raggiungibile: nessuno in ascolto su {host_port}");
+            println!("      → Avvia il server: CODEOS_REPO=<tuo-progetto> ./codeos-server");
+        }
+        None => {
+            problems += 1;
+            println!("  [✗] Indirizzo non valido: impossibile risolvere '{host_port}'");
+            println!("      → Controlla CODEOS_ADDR (formato host:porta, es. 127.0.0.1:50051)");
+        }
+    }
+
+    // 3) Liveness gRPC reale: il server risponde a una RPC vera?
+    if reachable == Some(true) {
+        match connect_server().await {
+            Ok(mut client) => {
+                let req = proto::GetArchitectureReportRequest {};
+                match client.get_architecture_report(req).await {
+                    Ok(resp) => {
+                        let r = resp.into_inner();
+                        println!("  [✓] Server gRPC vivo: referto ottenuto");
+                        println!(
+                            "      → {} invarianti, {} fossili, {} lacune nel grafo corrente",
+                            r.invariants.len(),
+                            r.fossils.len(),
+                            r.gaps.len()
+                        );
+                        let calibrated = r.invariants.iter().any(|i| i.calibrated);
+                        if r.invariants.is_empty() {
+                            println!(
+                                "  [!] Grafo vuoto: esegui `codeos index <path>` per popolarlo"
+                            );
+                        } else if !calibrated {
+                            println!(
+                                "  [!] Confidenza non calibrata: avvia il server con CODEOS_REPO\n      puntato al repo git per attivare Campo di Astensione + Fossili"
+                            );
+                        }
+                    }
+                    Err(status) => {
+                        problems += 1;
+                        println!("  [✗] Il server risponde ma la RPC fallisce: {status}");
+                    }
+                }
+            }
+            Err(e) => {
+                problems += 1;
+                println!("  [✗] Handshake gRPC fallito: {e}");
+            }
+        }
+    } else {
+        println!("  [-] Liveness gRPC saltata (porta non raggiungibile)");
+    }
+
+    println!();
+    if problems == 0 {
+        println!("✅ Tutto a posto: CodeOS è pronto all'uso.");
+    } else {
+        println!("⚠️  {problems} problema/i rilevato/i. Risolvi i punti [✗] qui sopra.");
+        std::process::exit(1);
+    }
+}
+
 fn print_usage() {
     println!("🏛️  CodeOS — Architectural Intelligence Layer CLI");
     println!();
@@ -104,6 +202,7 @@ fn print_usage() {
     println!("  index <path>      Indicizza il progetto all'interno del percorso fornito");
     println!("  report            Mostra il referto architetturale completo dello spazio negativo");
     println!("  query \"<text>\"    Interroga il grafo semantico per generare il contesto minimo per l'LLM");
+    println!("  doctor            Diagnostica la configurazione (server, porta, indirizzo) prima dell'uso");
     println!("  help              Mostra questo aiuto");
     println!();
     println!("Variabili d'ambiente:");
@@ -125,7 +224,7 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse) {
         *upstream_counts.entry(&inv.upstream).or_insert(0) += 1;
     }
     let mut upstreams: Vec<(&String, i32)> = upstream_counts.into_iter().collect();
-    upstreams.sort_by(|a, b| b.1.cmp(&a.1));
+    upstreams.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
     if upstreams.is_empty() {
         println!("  • Fondazioni: Nessun modulo identificato come fondazione solida.");
@@ -140,7 +239,7 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse) {
         *downstream_counts.entry(&inv.downstream).or_insert(0) += 1;
     }
     let mut downstreams: Vec<(&String, i32)> = downstream_counts.into_iter().collect();
-    downstreams.sort_by(|a, b| b.1.cmp(&a.1));
+    downstreams.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
     if downstreams.is_empty() {
         println!("  • Dipendenze: Nessun modulo identificato ad alta dipendenza.");

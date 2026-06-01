@@ -1,0 +1,60 @@
+{
+  // Task di build per CodeOS. Premi ⇧⌘B (o "Esegui task di build") per
+  // costruire server Rust + estensione VS Code in un colpo solo.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "codeos: build server (release)",
+      "type": "shell",
+      "command": "cargo build --release -p codeos-rpc --bin codeos-server --bin codeos",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": { "PATH": "${env:HOME}/.cargo/bin:${env:PATH}" }
+      },
+      "problemMatcher": ["$rustc"],
+      "group": "build"
+    },
+    {
+      "label": "codeos: build extension",
+      "type": "npm",
+      "script": "compile",
+      "path": "vscode-extension",
+      "problemMatcher": ["$tsc"],
+      "group": "build"
+    },
+    {
+      "label": "codeos: watch extension",
+      "type": "npm",
+      "script": "watch",
+      "path": "vscode-extension",
+      "isBackground": true,
+      "problemMatcher": ["$tsc-watch"],
+      "group": "build"
+    },
+    {
+      "label": "codeos: build all",
+      "dependsOn": [
+        "codeos: build server (release)",
+        "codeos: build extension"
+      ],
+      "dependsOrder": "parallel",
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "codeos: run server",
+      "type": "shell",
+      "command": "./target/release/codeos-server",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "CODEOS_ADDR": "127.0.0.1:50051",
+          "CODEOS_REPO": "${workspaceFolder}",
+          "RUST_LOG": "info"
+        }
+      },
+      "isBackground": true,
+      "problemMatcher": [],
+      "dependsOn": ["codeos: build server (release)"]
+    }
+  ]
+}
