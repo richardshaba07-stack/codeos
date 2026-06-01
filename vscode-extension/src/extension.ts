@@ -321,6 +321,19 @@ function violationRange(v: ViolationEvent): vscode.Range {
   return new vscode.Range(startLine, startCol, endLine, endCol);
 }
 
+/** Mappa la severità di CodeOS sul livello di diagnostica di VS Code. */
+function diagnosticSeverity(severity?: string): vscode.DiagnosticSeverity {
+  switch (severity) {
+    case 'high_risk':
+      return vscode.DiagnosticSeverity.Error;
+    case 'info':
+      return vscode.DiagnosticSeverity.Information;
+    case 'warning':
+    default:
+      return vscode.DiagnosticSeverity.Warning;
+  }
+}
+
 function addViolationDiagnostic(v: ViolationEvent): void {
   const filePath = v.location?.filePath;
   if (!filePath) {
@@ -329,7 +342,7 @@ function addViolationDiagnostic(v: ViolationEvent): void {
   const diagnostic = new vscode.Diagnostic(
     violationRange(v),
     v.message,
-    vscode.DiagnosticSeverity.Warning,
+    diagnosticSeverity(v.severity),
   );
   diagnostic.source = 'CodeOS';
   diagnostic.code = 'layering-violation';

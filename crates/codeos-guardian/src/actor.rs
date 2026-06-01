@@ -18,7 +18,7 @@ use codeos_paleo::GitLog;
 use codeos_storage::GraphStorage;
 use codeos_types::bus::{
     ArchitecturalGapInfo, ArchitectureReport, CodeOsEvent, Command, DecisionFossilInfo,
-    LayeringInvariantInfo,
+    LayeringInvariantInfo, Severity,
 };
 use codeos_types::GraphDelta;
 use tokio::sync::{broadcast, mpsc};
@@ -159,12 +159,16 @@ impl GuardianActor {
 
         let invariants = rules
             .into_iter()
-            .map(|rule| LayeringInvariantInfo {
-                upstream: rule.upstream.0,
-                downstream: rule.downstream.0,
-                support: rule.support,
-                confidence: rule.confidence as f64,
-                calibrated,
+            .map(|rule| {
+                let confidence = rule.confidence as f64;
+                LayeringInvariantInfo {
+                    upstream: rule.upstream.0,
+                    downstream: rule.downstream.0,
+                    support: rule.support,
+                    confidence,
+                    calibrated,
+                    severity: Severity::for_invariant(confidence),
+                }
             })
             .collect();
 
@@ -186,6 +190,7 @@ impl GuardianActor {
                 upstream: g.upstream.0,
                 downstream: g.downstream.0,
                 foundation_support: g.foundation_support,
+                severity: Severity::for_gap(g.foundation_support),
             })
             .collect();
 

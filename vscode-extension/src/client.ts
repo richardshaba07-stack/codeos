@@ -46,6 +46,8 @@ export interface ViolationEvent {
   message: string;
   /** Dove vive la dipendenza proibita (entità sorgente). Assente se non nota. */
   location?: SourceLocation;
+  /** Gravità: "info" | "warning" | "high_risk" (una violazione attiva è high_risk). */
+  severity?: string;
 }
 
 export type CodeOsEvent =

@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use codeos_types::bus::ArchitectureViolation;
+use codeos_types::bus::{ArchitectureViolation, Severity};
 use codeos_types::{EntityId, Relation, RelationKind};
 
 /// Quante componenti iniziali del `qualified_name` definiscono il "layer".
@@ -258,6 +258,7 @@ pub fn violations_for(
                 // entità): la riempie [`crate::guardian::Guardian::check`], che ha
                 // accesso allo storage. Qui resta `None`.
                 location: None,
+                severity: Severity::for_violation(),
                 message: format!(
                     "Violazione di layering: '{s}' → '{t}'. Nel grafo '{downstream}' dipende da \
                      '{upstream}' ({support} archi, confidenza {confidence:.2}), mai il contrario: \

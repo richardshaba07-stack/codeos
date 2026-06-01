@@ -290,12 +290,16 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse) {
     if report.invariants.is_empty() {
         println!("  (Nessun invariante di layering scoperto)");
     } else {
-        for inv in &report.invariants {
+        // Mostra prima gli invarianti ad alta priorità: i confini da difendere
+        // emergono in cima, i probabili falsi positivi (info) scendono in fondo.
+        let mut invariants: Vec<&proto::LayeringInvariant> = report.invariants.iter().collect();
+        invariants.sort_by_key(|inv| std::cmp::Reverse(severity_rank(&inv.severity)));
+        for inv in invariants {
             let conf_pct = (inv.confidence * 100.0).round();
             let source = if inv.calibrated { "tempo / git log" } else { "strutturale / statico" };
             println!(
-                "  • '{}' NON deve dipendere da '{}'\n    [Supporto: {} archi | Confidenza: {}% | Calibrato: {}]",
-                inv.upstream, inv.downstream, inv.support, conf_pct, source
+                "  • {} '{}' NON deve dipendere da '{}'\n    [Supporto: {} archi | Confidenza: {}% | Calibrato: {}]",
+                severity_badge(&inv.severity), inv.upstream, inv.downstream, inv.support, conf_pct, source
             );
         }
     }
@@ -322,12 +326,42 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse) {
     if report.gaps.is_empty() {
         println!("  ✅ Ogni fondazione è pienamente rispettata senza eccezioni.");
     } else {
-        for gap in &report.gaps {
+        let mut gaps: Vec<&proto::ArchitecturalGap> = report.gaps.iter().collect();
+        gaps.sort_by_key(|g| std::cmp::Reverse(severity_rank(&g.severity)));
+        for gap in gaps {
             println!(
-                "  • La fondazione '{}' è violata dall'eccezione '{}'\n    (Attenzione: {} altri layer rispettano questa fondazione)",
-                gap.upstream, gap.downstream, gap.foundation_support
+                "  • {} La fondazione '{}' è violata dall'eccezione '{}'",
+                severity_badge(&gap.severity), gap.upstream, gap.downstream
+            );
+            // Il "perché" della lacuna (roadmap 13): non è un buco arbitrario, è
+            // un'eccezione a una convenzione che il resto del codice rispetta.
+            println!(
+                "    Perché: '{up}' è una fondazione rispettata a senso unico da {n} altri layer, \
+                 ma '{down}' dipende da '{up}' E '{up}' dipende da '{down}' (accoppiamento bidirezionale).",
+                up = gap.upstream, down = gap.downstream, n = gap.foundation_support
             );
         }
     }
     println!("\n=======================================================\n");
+}
+
+/// Badge leggibile per una severità trasportata come stringa ("info"/"warning"/
+/// "high_risk"). Sconosciuto → neutro.
+fn severity_badge(severity: &str) -> &'static str {
+    match severity {
+        "high_risk" => "🔴",
+        "warning" => "🟡",
+        "info" => "⚪️",
+        _ => "•",
+    }
+}
+
+/// Ordine di priorità per l'ordinamento (più alto = mostrato prima).
+fn severity_rank(severity: &str) -> u8 {
+    match severity {
+        "high_risk" => 3,
+        "warning" => 2,
+        "info" => 1,
+        _ => 0,
+    }
 }

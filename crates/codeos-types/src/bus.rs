@@ -130,6 +130,81 @@ pub struct ArchitectureReport {
     pub gaps: Vec<ArchitecturalGapInfo>,
 }
 
+/// Livello di gravità di un esito architetturale (invariante, lacuna o violazione).
+///
+/// È l'unica fonte di verità per classificare la priorità: i costruttori
+/// `for_invariant`/`for_gap`/`for_violation` mappano i segnali grezzi (confidenza,
+/// supporto) su tre livelli, così Guardian, CLI e plugin VS Code concordano sempre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Severity {
+    /// Bassa priorità: probabile falso positivo o regola debole.
+    #[default]
+    Info,
+    /// Da tenere d'occhio: confine plausibile ma non ancora battle-tested.
+    Warning,
+    /// Alto rischio: confine forte da difendere, o anomalia conclamata.
+    HighRisk,
+}
+
+impl Severity {
+    /// Severità di un invariante di layering scoperto, dalla sua confidenza in
+    /// `[0,1]`. Sotto 0.5 = quasi sicuramente rumore (probabile falso positivo);
+    /// `>= 0.85` = confine provato, difenderlo è prioritario.
+    pub fn for_invariant(confidence: f64) -> Self {
+        if confidence >= 0.85 {
+            Severity::HighRisk
+        } else if confidence >= 0.5 {
+            Severity::Warning
+        } else {
+            Severity::Info
+        }
+    }
+
+    /// Severità di una lacuna del secondo ordine, da quanti *altri* layer
+    /// rispettano la fondazione violata: più coro c'è, più l'eccezione è anomala.
+    pub fn for_gap(foundation_support: u32) -> Self {
+        if foundation_support >= 3 {
+            Severity::HighRisk
+        } else {
+            Severity::Warning
+        }
+    }
+
+    /// Una violazione *attiva* di un confine già persistito è sempre il segnale
+    /// più serio: qualcuno ha appena invertito una freccia stabilita.
+    pub fn for_violation() -> Self {
+        Severity::HighRisk
+    }
+
+    /// Etichetta stabile, machine-readable, per il filo e i log.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Info => "info",
+            Severity::Warning => "warning",
+            Severity::HighRisk => "high_risk",
+        }
+    }
+
+    /// Ricostruisce la severità dalla sua etichetta (per i confini di trasporto).
+    /// Sconosciuto o vuoto → `Info` (degrada con grazia).
+    pub fn from_str_lenient(s: &str) -> Self {
+        match s {
+            "high_risk" => Severity::HighRisk,
+            "warning" => Severity::Warning,
+            _ => Severity::Info,
+        }
+    }
+
+    /// Etichetta leggibile con badge, per il referto da terminale.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Severity::Info => "⚪️ INFO",
+            Severity::Warning => "🟡 WARNING",
+            Severity::HighRisk => "🔴 ALTO RISCHIO",
+        }
+    }
+}
+
 /// Un invariante di layering scoperto: `downstream` dipende da `upstream` a senso
 /// unico, mai l'inverso. Forma piatta per il trasporto.
 #[derive(Debug, Clone, PartialEq)]
@@ -147,6 +222,8 @@ pub struct LayeringInvariantInfo {
     /// `true` se la confidenza è stata ricalibrata sulla storia git (Campo di
     /// Astensione), `false` se è la sola stima strutturale.
     pub calibrated: bool,
+    /// Quanto è prioritario difendere questo confine (derivata dalla confidenza).
+    pub severity: Severity,
 }
 
 /// La nascita storica di un confine architetturale (Fossile di Decisione).
@@ -174,6 +251,8 @@ pub struct ArchitecturalGapInfo {
     pub downstream: String,
     /// Quanti *altri* layer rispettano `upstream` come fondazione a senso unico.
     pub foundation_support: u32,
+    /// Gravità dell'anomalia (derivata da `foundation_support`).
+    pub severity: Severity,
 }
 
 /// Violazione di una regola architetturale rilevata dal Guardian.
@@ -189,4 +268,6 @@ pub struct ArchitectureViolation {
     /// a un editor di piazzare la diagnostica sulla riga giusta. `None` se la
     /// posizione non è ricostruibile (entità non trovata nello storage).
     pub location: Option<SourceLocation>,
+    /// Gravità della violazione. Una violazione attiva è sempre alto rischio.
+    pub severity: Severity,
 }

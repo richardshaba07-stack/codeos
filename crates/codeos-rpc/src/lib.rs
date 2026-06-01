@@ -368,6 +368,7 @@ fn layering_invariant_to_proto(info: LayeringInvariantInfo) -> proto::LayeringIn
         support: info.support,
         confidence: info.confidence,
         calibrated: info.calibrated,
+        severity: info.severity.as_str().to_string(),
     }
 }
 
@@ -387,6 +388,7 @@ fn architectural_gap_to_proto(info: ArchitecturalGapInfo) -> proto::Architectura
         upstream: info.upstream,
         downstream: info.downstream,
         foundation_support: info.foundation_support,
+        severity: info.severity.as_str().to_string(),
     }
 }
 
@@ -410,6 +412,7 @@ fn event_to_proto(event: CodeOsEvent) -> proto::EventMessage {
                 target_id: violation.target_id.to_string(),
                 message: violation.message,
                 location: violation.location.map(location_to_proto),
+                severity: violation.severity.as_str().to_string(),
             })
         }
     };
@@ -641,6 +644,7 @@ mod tests {
                 end_line: 42,
                 end_column: 30,
             }),
+            severity: codeos_types::bus::Severity::for_violation(),
         };
 
         // C'è una piccola corsa fra l'apertura dello stream e l'attivazione della
@@ -675,6 +679,7 @@ mod tests {
                 assert_eq!(loc.file_path, "app/core/service.py");
                 assert_eq!(loc.start_line, 42);
                 assert_eq!(loc.start_column, 4);
+                assert_eq!(v.severity, "high_risk", "una violazione attiva è alto rischio");
             }
             other => panic!("atteso un evento Violation, ricevuto {other:?}"),
         }

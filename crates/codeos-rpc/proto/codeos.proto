@@ -108,6 +108,8 @@ message LayeringInvariant {
   // (lower bound di Wilson sul tasso di astensione), altrimenti è strutturale.
   double confidence = 4;
   bool calibrated = 5;
+  // Priorità di difesa derivata dalla confidenza: "info" | "warning" | "high_risk".
+  string severity = 6;
 }
 
 // La nascita storica di un confine (Fossile di Decisione).
@@ -125,6 +127,8 @@ message ArchitecturalGap {
   string upstream = 1;
   string downstream = 2;
   uint32 foundation_support = 3;
+  // Gravità dell'anomalia: "info" | "warning" | "high_risk".
+  string severity = 4;
 }
 
 message GetArchitectureReportResponse {
@@ -161,6 +165,8 @@ message ArchitectureViolationEvent {
   // non ricostruibile. Permette al client (plugin VS Code) di piazzare una
   // diagnostica sulla riga esatta.
   SourceLocation location = 6;
+  // Gravità della violazione: "info" | "warning" | "high_risk" (sempre high_risk).
+  string severity = 7;
 }
 
 message EventMessage {
