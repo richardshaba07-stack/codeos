@@ -1,0 +1,18 @@
+[package]
+name = "codeos-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "QueryEngine / ContextBuilder: il sottografo minimo rilevante per una query."
+
+[dependencies]
+codeos-types = { workspace = true }
+codeos-storage = { workspace = true }
+codeos-memory = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+codeos-parser = { workspace = true }
+codeos-graph = { workspace = true }

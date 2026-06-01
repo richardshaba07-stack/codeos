@@ -1,0 +1,17 @@
+[package]
+name = "codeos-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Trait LanguageParser, PythonParser (Tree-sitter) e ParserActor."
+
+[dependencies]
+codeos-types = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

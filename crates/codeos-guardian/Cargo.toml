@@ -1,0 +1,15 @@
+[package]
+name = "codeos-guardian"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Il sistema immunitario: scopre invarianti architetturali dal grafo e rileva le violazioni."
+
+[dependencies]
+codeos-types = { workspace = true }
+codeos-storage = { workspace = true }
+codeos-memory = { workspace = true }
+codeos-paleo = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

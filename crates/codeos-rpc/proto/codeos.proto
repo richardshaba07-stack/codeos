@@ -1,0 +1,185 @@
+syntax = "proto3";
+
+// La facciata di trasporto di CodeOS. Ogni RPC è un sottile ponte verso un
+// `Command` del Dispatcher di `codeos-core`: il server non contiene business
+// logic, traduce soltanto messaggi gRPC ↔ tipi del bus.
+package codeos.v1;
+
+// ---------------------------------------------------------------------------
+// Tipi base del grafo (riflettono `codeos_types::{Entity, Relation, ...}`).
+//
+// `id`/`source_id`/`target_id` sono UUID serializzati come stringa: il filo
+// gRPC non conosce `EntityId`. `kind` è il nome della variante dell'enum
+// (es. "Class", "Calls"): stabile, leggibile e indipendente dall'ordinale.
+// ---------------------------------------------------------------------------
+
+message SourceLocation {
+  string file_path = 1;
+  uint32 start_line = 2;
+  uint32 start_column = 3;
+  uint32 end_line = 4;
+  uint32 end_column = 5;
+}
+
+message Entity {
+  string id = 1;
+  string kind = 2;
+  string qualified_name = 3;
+  SourceLocation location = 4;
+  map<string, string> metadata = 5;
+}
+
+message Relation {
+  string id = 1;
+  string kind = 2;
+  string source_id = 3;
+  string target_id = 4;
+  map<string, string> metadata = 5;
+}
+
+// ---------------------------------------------------------------------------
+// QueryGraph — "cosa cambia se tocco X?" / costruzione del contesto per l'LLM.
+// ---------------------------------------------------------------------------
+
+message QueryGraphRequest {
+  // Query in linguaggio naturale (es. "voglio aggiungere il login OAuth").
+  string natural_language = 1;
+}
+
+message QueryGraphResponse {
+  // Prompt strutturato pronto da passare a un LLM.
+  string formatted_context = 1;
+  repeated Entity entities = 2;
+  repeated Relation relations = 3;
+}
+
+// ---------------------------------------------------------------------------
+// RecordDecision — "perché è scritto così?": registra una decisione storica.
+// ---------------------------------------------------------------------------
+
+message RecordDecisionRequest {
+  string author = 1;
+  string title = 2;
+  string context = 3;
+  string rationale = 4;
+  repeated string related_entity_ids = 5;   // UUID stringa
+  repeated string related_decision_ids = 6;  // UUID stringa
+  repeated string tags = 7;
+}
+
+message RecordDecisionResponse {
+  string decision_id = 1;  // UUID stringa
+}
+
+// ---------------------------------------------------------------------------
+// IndexProject / IndexFiles — alimentano il grafo.
+// ---------------------------------------------------------------------------
+
+message IndexProjectRequest {
+  string project_root = 1;
+}
+
+message IndexProjectResponse {}
+
+message IndexFilesRequest {
+  repeated string files = 1;
+}
+
+message IndexFilesResponse {
+  // Gli `EntityId` radice creati/aggiornati (UUID stringa).
+  repeated string entity_ids = 1;
+}
+
+// ---------------------------------------------------------------------------
+// GetArchitectureReport — il referto dello *spazio negativo*. Espone, in lettura
+// pura, gli invarianti impliciti che il Guardian scopre lungo i quattro assi:
+// struttura (layering), tempo (Campo di Astensione), intento (Fossili di
+// Decisione) e meta (lacune del secondo ordine). Nessuna mutazione del grafo.
+// ---------------------------------------------------------------------------
+
+message GetArchitectureReportRequest {}
+
+// Un invariante di layering: `downstream` dipende da `upstream` a senso unico.
+message LayeringInvariant {
+  string upstream = 1;
+  string downstream = 2;
+  uint32 support = 3;
+  // Confidenza in [0,1]. Se `calibrated` è true viene dal Campo di Astensione
+  // (lower bound di Wilson sul tasso di astensione), altrimenti è strutturale.
+  double confidence = 4;
+  bool calibrated = 5;
+}
+
+// La nascita storica di un confine (Fossile di Decisione).
+message DecisionFossil {
+  string upstream = 1;
+  string downstream = 2;
+  string born_at = 3;        // hash del commit di nascita
+  int64 born_at_unix = 4;    // timestamp Unix del commit
+  string intent = 5;         // il subject del commit: l'intento dichiarato
+  repeated string born_structure = 6;  // i file dei due layer toccati alla nascita
+}
+
+// Una lacuna del secondo ordine: l'invariante che MANCA dove dovrebbe esserci.
+message ArchitecturalGap {
+  string upstream = 1;
+  string downstream = 2;
+  uint32 foundation_support = 3;
+}
+
+message GetArchitectureReportResponse {
+  repeated LayeringInvariant invariants = 1;
+  repeated DecisionFossil fossils = 2;
+  repeated ArchitecturalGap gaps = 3;
+}
+
+// ---------------------------------------------------------------------------
+// WatchEvents — stream live del sistema. Il plugin VS Code vi si aggancia per
+// reagire in tempo reale: in particolare alle violazioni del sistema immunitario.
+// ---------------------------------------------------------------------------
+
+message WatchEventsRequest {}
+
+message FilesIndexedEvent {
+  repeated string file_paths = 1;
+}
+
+message GraphUpdatedEvent {
+  uint32 added_entities = 1;
+  uint32 removed_entities = 2;
+  uint32 added_relations = 3;
+  uint32 removed_relations = 4;
+}
+
+message ArchitectureViolationEvent {
+  string rule_id = 1;
+  string relation_id = 2;
+  string source_id = 3;
+  string target_id = 4;
+  string message = 5;
+  // Posizione dell'entità sorgente: dove vive la dipendenza proibita. Assente se
+  // non ricostruibile. Permette al client (plugin VS Code) di piazzare una
+  // diagnostica sulla riga esatta.
+  SourceLocation location = 6;
+}
+
+message EventMessage {
+  oneof event {
+    FilesIndexedEvent files_indexed = 1;
+    GraphUpdatedEvent graph_updated = 2;
+    ArchitectureViolationEvent violation = 3;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Il servizio.
+// ---------------------------------------------------------------------------
+
+service CodeOs {
+  rpc QueryGraph(QueryGraphRequest) returns (QueryGraphResponse);
+  rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
+  rpc IndexProject(IndexProjectRequest) returns (IndexProjectResponse);
+  rpc IndexFiles(IndexFilesRequest) returns (IndexFilesResponse);
+  rpc GetArchitectureReport(GetArchitectureReportRequest) returns (GetArchitectureReportResponse);
+  rpc WatchEvents(WatchEventsRequest) returns (stream EventMessage);
+}

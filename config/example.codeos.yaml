@@ -1,0 +1,26 @@
+# Configurazione di esempio di CodeOS.
+# Copiare in `.codeos/config.yaml` nella root del progetto da analizzare.
+#
+# I `layer` assegnano un'etichetta architetturale ai file in base al loro path:
+# il Parser, quando indicizza un file, scrive `metadata["layer"]` su tutte le
+# entità di quel file. Le `rules` vietano certe dipendenze tra layer; il Guardian
+# le verifica sulle relazioni man mano che il grafo cresce.
+
+architecture:
+  layers:
+    - name: ui
+      path_patterns: ["src/ui/**", "src/components/**"]
+    - name: business_logic
+      path_patterns: ["src/services/**", "src/domain/**"]
+    - name: data
+      path_patterns: ["src/repositories/**", "src/db/**"]
+
+  rules:
+    - name: "UI can't access Data"
+      type: layer_dependency
+      from: ["ui"]
+      to: ["data"]
+    - name: "Business logic can't access UI"
+      type: layer_dependency
+      from: ["business_logic"]
+      to: ["ui"]

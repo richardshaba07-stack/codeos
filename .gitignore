@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# macOS
+.DS_Store
+
+# Configurazione locale dell'editor / agente
+/.claude/
+
+# Dati locali di CodeOS generati a runtime (grafo SQLite, memoria decisionale, ecc.)
+/.codeos/

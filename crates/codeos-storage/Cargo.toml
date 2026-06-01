@@ -1,0 +1,18 @@
+[package]
+name = "codeos-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Trait GraphStorage e implementazione SQLite del grafo."
+
+[dependencies]
+codeos-types = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

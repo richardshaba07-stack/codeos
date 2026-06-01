@@ -1,0 +1,5 @@
+node_modules/
+out/
+# Sincronizzato a build-time da scripts/sync-proto.js: unica fonte di verità è crates/codeos-rpc/proto.
+proto/
+*.vsix

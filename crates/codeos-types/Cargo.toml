@@ -1,0 +1,12 @@
+[package]
+name = "codeos-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vocabolario condiviso di CodeOS: Entity, Relation, EntityId, bus comandi/eventi."
+
+[dependencies]
+uuid = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
