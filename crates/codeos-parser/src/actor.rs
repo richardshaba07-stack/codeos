@@ -144,18 +144,35 @@ impl ParserActor {
     }
 }
 
+/// Directory che non contengono mai codice sorgente *di prodotto*: VCS, cache,
+/// ambienti virtuali e — soprattutto — output di build/generati. Indicizzarle
+/// inquina il grafo con artefatti (es. `vscode-extension/out/extension.js`) che
+/// creerebbero layer fantasma e falsi invarianti. Lista conservativa: solo nomi
+/// che per convenzione consolidata sono rigenerabili, mai sorgente scritto a mano.
 fn is_ignored_dir(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|n| n.to_str()),
         Some(
-            ".git"
+            // Version control e config di CodeOS.
+            ".git" | ".codeos"
+            // Build output / artefatti (Rust, Node, generici).
                 | "target"
+                | "out"
+                | "dist"
+                | "build"
+                | "coverage"
+            // Cache di tool e bundler.
+                | ".next"
+                | ".turbo"
+                | ".cache"
+                | ".mypy_cache"
+                | ".pytest_cache"
+            // Dipendenze installate (mai sorgente del progetto).
                 | "node_modules"
+                | "vendor"
                 | "__pycache__"
                 | ".venv"
                 | "venv"
-                | ".codeos"
-                | ".mypy_cache"
         )
     )
 }
@@ -242,6 +259,50 @@ mod tests {
         assert!(endings.contains(&"lib.rs"), "files = {files:?}");
         assert!(endings.contains(&"panel.ts"), "files = {files:?}");
         assert!(!endings.contains(&"README.md"), "files = {files:?}");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn index_project_skips_build_output_and_dependencies() {
+        // Regressione P0-3: un `.ts`/`.js` dentro out/, dist/ o node_modules NON
+        // deve finire nel grafo (sono artefatti rigenerabili, non sorgente).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codeos_parser_ignored_{nanos}"));
+        let src = root.join("src");
+        let out = root.join("out");
+        let dist = root.join("dist");
+        let deps = root.join("node_modules").join("left-pad");
+        for dir in [&src, &out, &dist, &deps] {
+            tokio::fs::create_dir_all(dir).await.unwrap();
+        }
+        tokio::fs::write(src.join("real.ts"), "export const x = 1;\n")
+            .await
+            .unwrap();
+        tokio::fs::write(out.join("real.js"), "exports.x = 1;\n")
+            .await
+            .unwrap();
+        tokio::fs::write(dist.join("bundle.js"), "module.exports={};\n")
+            .await
+            .unwrap();
+        tokio::fs::write(deps.join("index.js"), "module.exports=1;\n")
+            .await
+            .unwrap();
+
+        let actor = ParserActor::new(broadcast::channel(16).0);
+        let files = actor.collect_source_files(&root.to_string_lossy());
+        let endings: Vec<&str> = files.iter().filter_map(|f| f.rsplit('/').next()).collect();
+
+        assert!(endings.contains(&"real.ts"), "il sorgente vero manca: {files:?}");
+        assert!(
+            !files.iter().any(|f| f.contains("/out/")
+                || f.contains("/dist/")
+                || f.contains("/node_modules/")),
+            "build output o dipendenze non devono essere indicizzati: {files:?}"
+        );
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
