@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 
 use codeos_types::bus::{ArchitectureViolation, RuleOrigin, Severity};
-use codeos_types::{EntityId, Relation, RelationKind};
+use codeos_types::{Entity, EntityId, Relation, RelationKind};
 
 /// Quante componenti iniziali del `qualified_name` definiscono il "layer".
 ///
@@ -65,6 +65,19 @@ pub fn layer_of(qualified_name: &str, depth: usize) -> LayerKey {
     let parts: Vec<&str> = qualified_name.split("::").collect();
     let take = depth.clamp(1, parts.len().max(1));
     LayerKey(parts[..take.min(parts.len())].join("::"))
+}
+
+/// Il layer di un'**entità**, preferendo il confine **reale** del pacchetto quando
+/// noto. Se il parser ha timbrato `metadata["package"]` (P1-c, letto dal manifest
+/// del workspace), quello È il layer: robusto ai monorepo con annidamento non
+/// uniforme, dove [`layer_of`] su path a profondità fissa accorperebbe pacchetti
+/// distinti. Senza il metadato si ricade sull'euristica di profondità — nessuna
+/// regressione sui grafi privi di manifest.
+pub fn layer_of_entity(entity: &Entity, depth: usize) -> LayerKey {
+    match entity.metadata.get("package") {
+        Some(pkg) if !pkg.is_empty() => LayerKey(pkg.clone()),
+        _ => layer_of(&entity.qualified_name, depth),
+    }
 }
 
 /// Un invariante di layering scoperto dal grafo.
@@ -128,6 +141,19 @@ fn relation_confidence_is_low(rel: &Relation) -> bool {
         .unwrap_or(false)
 }
 
+/// Una relazione **nata in un file di test** non descrive l'architettura di
+/// produzione: un test importa e chiama liberamente attraverso i layer (è il suo
+/// mestiere). La escludiamo dal mining a monte, esattamente come una relazione a
+/// bassa confidenza. Il resolver timbra `source_kind` = `test`/`prod` sul file
+/// SORGENTE dell'arco. Relazioni senza il metadato (storiche o strutturali) =
+/// **non-test**: nessuna regressione sullo spazio negativo già appreso.
+fn relation_source_is_test(rel: &Relation) -> bool {
+    rel.metadata
+        .get("source_kind")
+        .map(|s| s == "test")
+        .unwrap_or(false)
+}
+
 /// La coppia (layer sorgente, layer destinazione) di una relazione, se entrambi
 /// gli estremi sono noti, la relazione è una dipendenza, attraversa due layer
 /// diversi ed è risolta con confidenza sufficiente. Altrimenti `None` (non
@@ -136,7 +162,11 @@ fn cross_layer<'a>(
     rel: &Relation,
     entity_layer: &'a HashMap<EntityId, LayerKey>,
 ) -> Option<(&'a LayerKey, &'a LayerKey)> {
-    if !is_dependency_kind(rel.kind) || rel.target_id.is_nil() || relation_confidence_is_low(rel) {
+    if !is_dependency_kind(rel.kind)
+        || rel.target_id.is_nil()
+        || relation_confidence_is_low(rel)
+        || relation_source_is_test(rel)
+    {
         return None;
     }
     let (Some(s), Some(t)) = (
@@ -347,6 +377,52 @@ mod tests {
         assert_eq!(layer_of("app::api", 0), LayerKey("app".to_string()));
     }
 
+    fn entity_with(qname: &str, package: Option<&str>) -> Entity {
+        let mut metadata = HashMap::new();
+        if let Some(p) = package {
+            metadata.insert("package".to_string(), p.to_string());
+        }
+        Entity {
+            id: EntityId::new(),
+            kind: codeos_types::EntityKind::Module,
+            qualified_name: qname.to_string(),
+            location: codeos_types::SourceLocation {
+                file_path: "f".to_string(),
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+            metadata,
+        }
+    }
+
+    #[test]
+    fn layer_of_entity_prefers_the_real_package_boundary() {
+        // Monorepo con annidamento non uniforme: a profondità 2 due pacchetti
+        // distinti collasserebbero entrambi nel layer "packages::group".
+        let deep = entity_with("packages::group::alpha::src::lib::f", Some("alpha"));
+        assert_eq!(
+            layer_of_entity(&deep, DEFAULT_LAYER_DEPTH),
+            LayerKey("alpha".to_string()),
+            "il package del manifest vince sull'euristica di profondità"
+        );
+
+        // Senza metadato `package` si ricade sull'euristica: nessuna regressione.
+        let no_pkg = entity_with("packages::group::beta::src::lib::f", None);
+        assert_eq!(
+            layer_of_entity(&no_pkg, DEFAULT_LAYER_DEPTH),
+            LayerKey("packages::group".to_string())
+        );
+
+        // Un `package` vuoto è trattato come assente (degrada all'euristica).
+        let empty_pkg = entity_with("a::b::c", Some(""));
+        assert_eq!(
+            layer_of_entity(&empty_pkg, DEFAULT_LAYER_DEPTH),
+            LayerKey("a::b".to_string())
+        );
+    }
+
     #[test]
     fn mines_a_one_way_dependency_as_a_rule() {
         let mut map = HashMap::new();
@@ -508,5 +584,61 @@ mod tests {
         // Unresolved (target nullo) viene ignorato senza panico.
         let unresolved = rel(RelationKind::Unresolved, core[0], EntityId::nil());
         assert!(violations_for(&[unresolved], &map, &rules).is_empty());
+    }
+
+    /// Come `rel`, ma marcato come nato in un file di test (`source_kind=test`).
+    fn rel_test(kind: RelationKind, source: EntityId, target: EntityId) -> Relation {
+        let mut r = rel(kind, source, target);
+        r.metadata
+            .insert("source_kind".to_string(), "test".to_string());
+        r
+    }
+
+    #[test]
+    fn test_sourced_edges_do_not_form_rules() {
+        let mut map = HashMap::new();
+        let api = layered(3, "app::api", &mut map);
+        let core = layered(3, "app::core", &mut map);
+
+        // Tre archi api → core, ma TUTTI nati in file di test: un test attraversa i
+        // layer per mestiere, non descrive l'architettura di produzione. Nessuna
+        // regola deve emergere dal loro spazio negativo.
+        let from_tests = vec![
+            rel_test(RelationKind::Calls, api[0], core[0]),
+            rel_test(RelationKind::Calls, api[1], core[1]),
+            rel_test(RelationKind::Imports, api[2], core[2]),
+        ];
+        assert!(
+            mine_layering_rules(&from_tests, &map, &LayerConfig::default()).is_empty(),
+            "gli archi dei test non devono fondare invarianti di layering"
+        );
+    }
+
+    #[test]
+    fn a_reverse_edge_from_a_test_does_not_break_the_invariant() {
+        let mut map = HashMap::new();
+        let api = layered(3, "app::api", &mut map);
+        let core = layered(3, "app::core", &mut map);
+
+        // Tre archi di produzione api → core fondano l'invariante "core non dipende
+        // da api".
+        let mut relations = vec![
+            rel(RelationKind::Calls, api[0], core[0]),
+            rel(RelationKind::Calls, api[1], core[1]),
+            rel(RelationKind::Imports, api[2], core[2]),
+        ];
+        // Un test che chiama "all'insù" (core ← test) NON deve smontare l'invariante:
+        // è marcato source_kind=test e va ignorato dal mining. Senza l'esclusione,
+        // questo singolo arco inverso azzererebbe la regola.
+        relations.push(rel_test(RelationKind::Calls, core[0], api[0]));
+
+        let rules = mine_layering_rules(&relations, &map, &LayerConfig::default());
+        assert_eq!(
+            rules.len(),
+            1,
+            "il solo arco inverso è di test: l'invariante di produzione regge ({rules:?})"
+        );
+        assert_eq!(rules[0].upstream, LayerKey("app::core".to_string()));
+        assert_eq!(rules[0].downstream, LayerKey("app::api".to_string()));
     }
 }

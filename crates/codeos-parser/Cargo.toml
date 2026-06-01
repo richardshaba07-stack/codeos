@@ -17,6 +17,9 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+# Solo per leggere il campo `name` di un package.json: il JSON scritto a mano non
+# si parsa a vista in modo affidabile (vedi src/workspace.rs).
+serde_json = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

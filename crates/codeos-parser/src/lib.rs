@@ -21,6 +21,7 @@ mod python;
 mod rust_lang;
 mod traits;
 mod typescript;
+mod workspace;
 
 pub use actor::ParserActor;
 pub use go::GoParser;

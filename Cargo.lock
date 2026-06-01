@@ -323,6 +323,7 @@ dependencies = [
  "async-trait",
  "codeos-types",
  "criterion",
+ "serde_json",
  "tokio",
  "tracing",
  "tree-sitter",

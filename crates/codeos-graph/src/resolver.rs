@@ -38,6 +38,11 @@ impl GraphResolver {
         let mut new_by_qname: HashMap<String, EntityId> = HashMap::new();
         let mut new_by_name: HashMap<String, Vec<(EntityId, String)>> = HashMap::new();
         let mut new_by_id_lang: HashMap<EntityId, String> = HashMap::new();
+        // Mappa id→source_kind ("test"/"prod"): nel Passo 3 la consultiamo per
+        // timbrare ogni arco di dipendenza con la natura del file SORGENTE, così il
+        // Guardian può escludere dal mining gli archi nati nei test (vedi
+        // `cross_layer`).
+        let mut new_by_id_source_kind: HashMap<EntityId, String> = HashMap::new();
 
         // Contesto per-file da rielaborare nel Passo 3 (dopo aver indicizzato
         // TUTTE le entità del batch).
@@ -45,6 +50,10 @@ impl GraphResolver {
 
         for file in results {
             let module_prefix = self.module_prefix(&file.file_path);
+            // Natura del file (test vs prod) dedotta una sola volta dal path: la
+            // ereditano tutte le entità del file e gli archi che ne escono.
+            let file_source_kind =
+                classify_source_kind(&file.file_path, &detect_language(&file.file_path));
 
             // Passo 0 — Pulizia: rimuovi dal grafo le entità (e relazioni) già
             // presenti per questo file, così non si accumulano dati stantii.
@@ -68,12 +77,22 @@ impl GraphResolver {
                     .push((id, qname.clone()));
                 new_by_id_lang.insert(id, lang);
 
+                // source_kind: il parser può già averlo dedotto (es. `#[cfg(test)]`
+                // inline); altrimenti vale la classificazione per path del file.
+                let mut metadata = parsed.metadata.clone();
+                let source_kind = metadata
+                    .get("source_kind")
+                    .cloned()
+                    .unwrap_or_else(|| file_source_kind.to_string());
+                metadata.insert("source_kind".to_string(), source_kind.clone());
+                new_by_id_source_kind.insert(id, source_kind);
+
                 delta.added_entities.push(Entity {
                     id,
                     kind: parsed.kind,
                     qualified_name: qname,
                     location: parsed.location.clone(),
-                    metadata: parsed.metadata.clone(),
+                    metadata,
                 });
             }
 
@@ -160,7 +179,7 @@ impl GraphResolver {
 
                 let resolved = resolve_target(&rctx, &target).await?;
 
-                let relation = match resolved {
+                let mut relation = match resolved {
                     Some((target_id, strategy)) => {
                         // Ogni arco risolto porta la strategia e la confidenza con cui
                         // ci siamo arrivati: il Guardian le legge per escludere dal
@@ -205,6 +224,11 @@ impl GraphResolver {
                                 .await?;
                                 let mut metadata = HashMap::new();
                                 metadata.insert("external_target".to_string(), target.clone());
+                                // Il pacchetto di provenienza (crate/npm/modulo):
+                                // chiave uniforme sia sull'arco sia sull'entità
+                                // esterna, così CLI/plugin possono raggruppare le
+                                // dipendenze per package senza riparsare il target.
+                                metadata.insert("package".to_string(), root.clone());
                                 metadata.insert(
                                     "resolution_strategy".to_string(),
                                     ResolutionStrategy::External.as_str().to_string(),
@@ -251,6 +275,15 @@ impl GraphResolver {
                         }
                     }
                 };
+
+                // Timbro la natura (test/prod) del file SORGENTE sull'arco: è il
+                // segnale che il Guardian legge in `cross_layer` per non far entrare
+                // gli archi dei test nel mining degli invarianti.
+                if let Some(sk) = new_by_id_source_kind.get(source_id) {
+                    relation
+                        .metadata
+                        .insert("source_kind".to_string(), sk.clone());
+                }
                 delta.added_relations.push(relation);
             }
         }
@@ -675,6 +708,48 @@ fn detect_language(file_path: &str) -> String {
     }
 }
 
+/// Classifica un file come codice di **test** o di **produzione** dalle convenzioni
+/// di percorso del suo linguaggio. Euristica pura sul path (nessun I/O): serve al
+/// Guardian per **escludere dal mining gli archi nati nei test** — un test importa e
+/// chiama liberamente attraverso i layer (è il suo mestiere), e non descrive
+/// l'architettura del prodotto.
+///
+/// Deliberatamente **conservativa**: nel dubbio risponde `"prod"`. Un falso "prod"
+/// lascia l'arco nel grafo (al più rumore), un falso "test" lo nasconderebbe — e la
+/// filosofia di CodeOS preferisce un arco di troppo a uno nascosto a sproposito.
+fn classify_source_kind(file_path: &str, language: &str) -> &'static str {
+    // Separatori normalizzati e tutto minuscolo: i match sotto sono
+    // case-insensitive e indipendenti dall'OS.
+    let path = file_path.replace('\\', "/").to_lowercase();
+    let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
+
+    // Segnale universale: una directory `tests/` o `__tests__/` ospita test in
+    // quasi tutti gli ecosistemi (inclusi i test d'integrazione Rust e i moduli
+    // `mod tests;` sotto `src/tests/`).
+    if path.contains("/tests/") || path.contains("/__tests__/") {
+        return "test";
+    }
+
+    let is_test = match language {
+        "go" => file_name.ends_with("_test.go"),
+        "java" | "kotlin" => path.contains("/src/test/"),
+        "python" => file_name.starts_with("test_") || file_name.ends_with("_test.py"),
+        "typescript" | "javascript" => {
+            file_name.contains(".test.") || file_name.contains(".spec.")
+        }
+        // Rust: i test d'integrazione vivono in `tests/` (già coperto sopra); gli
+        // unit test inline `#[cfg(test)]` non sono distinguibili dal path e li
+        // lasciamo "prod" finché un parser non li marca via metadata.
+        _ => false,
+    };
+
+    if is_test {
+        "test"
+    } else {
+        "prod"
+    }
+}
+
 fn language_matches(lang_a: &str, lang_b: &str) -> bool {
     if lang_a == lang_b {
         return true;
@@ -736,6 +811,9 @@ async fn external_entity_id(
     metadata.insert("language".to_string(), language.to_string());
     metadata.insert("external".to_string(), "true".to_string());
     metadata.insert("dependency_root".to_string(), root.to_string());
+    // Alias di `dependency_root` con la chiave uniforme `package`: lo stesso nome
+    // che gli archi esterni portano nei loro metadata (P1-b).
+    metadata.insert("package".to_string(), root.to_string());
     delta.added_entities.push(Entity {
         id,
         kind: codeos_types::EntityKind::ExternalDependency,
@@ -1046,12 +1124,23 @@ mod tests {
 
         let ext = find(&delta, "external::tokio");
         assert_eq!(ext.kind, EntityKind::ExternalDependency);
+        // P1-b: l'entità esterna porta il pacchetto sotto la chiave uniforme.
+        assert_eq!(
+            ext.metadata.get("package").map(String::as_str),
+            Some("tokio")
+        );
         let source = find(&delta, "crates::codeos-core::src::lib");
-        assert!(
-            delta.added_relations.iter().any(|r| {
+        let import = delta
+            .added_relations
+            .iter()
+            .find(|r| {
                 r.kind == RelationKind::Imports && r.source_id == source.id && r.target_id == ext.id
-            }),
-            "l'import di tokio deve collegare il modulo a external::tokio"
+            })
+            .expect("l'import di tokio deve collegare il modulo a external::tokio");
+        // P1-b: anche l'arco esterno porta lo stesso `package`.
+        assert_eq!(
+            import.metadata.get("package").map(String::as_str),
+            Some("tokio")
         );
     }
 
@@ -1262,5 +1351,95 @@ class Cache extends BaseCache {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn classify_source_kind_by_path_convention() {
+        // Directory `tests/` / `__tests__/`: segnale universale.
+        assert_eq!(
+            classify_source_kind("crates/foo/tests/it.rs", "rust"),
+            "test"
+        );
+        assert_eq!(
+            classify_source_kind("src/app/__tests__/x.ts", "typescript"),
+            "test"
+        );
+        // Go: suffisso `_test.go`.
+        assert_eq!(classify_source_kind("pkg/server_test.go", "go"), "test");
+        assert_eq!(classify_source_kind("pkg/server.go", "go"), "prod");
+        // Java/Kotlin: albero `src/test/`.
+        assert_eq!(
+            classify_source_kind("mod/src/test/java/AppTest.java", "java"),
+            "test"
+        );
+        assert_eq!(
+            classify_source_kind("mod/src/main/java/App.java", "java"),
+            "prod"
+        );
+        // Python: `test_*.py` o `*_test.py`.
+        assert_eq!(classify_source_kind("test_service.py", "python"), "test");
+        assert_eq!(classify_source_kind("service_test.py", "python"), "test");
+        assert_eq!(classify_source_kind("service.py", "python"), "prod");
+        // TS/JS: `.test.` o `.spec.` nel nome.
+        assert_eq!(
+            classify_source_kind("a/b/comp.test.ts", "typescript"),
+            "test"
+        );
+        assert_eq!(
+            classify_source_kind("a/b/comp.spec.tsx", "typescript"),
+            "test"
+        );
+        assert_eq!(classify_source_kind("a/b/comp.ts", "typescript"), "prod");
+        // Rust: gli unit test inline `#[cfg(test)]` non sono distinguibili dal
+        // path → "prod" (conservativo).
+        assert_eq!(classify_source_kind("src/lib.rs", "rust"), "prod");
+    }
+
+    #[tokio::test]
+    async fn stamps_source_kind_on_entities_and_relations() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None);
+
+        // Stessa forma (helper + chiamante nello stesso modulo) in due file: uno di
+        // produzione, uno di test (convenzione Python `test_*.py`).
+        let body = "def helper():\n    pass\n\ndef top():\n    helper()\n";
+        let prod = parse("app/m.py", body).await;
+        let test = parse("tests/test_m.py", body).await;
+
+        let delta = resolver.resolve(&[prod, test], &storage).await.unwrap();
+
+        // Entità: ereditano il source_kind del proprio file.
+        let prod_top = find(&delta, "app::m::top");
+        assert_eq!(
+            prod_top.metadata.get("source_kind").map(String::as_str),
+            Some("prod")
+        );
+        let test_top = find(&delta, "tests::test_m::top");
+        assert_eq!(
+            test_top.metadata.get("source_kind").map(String::as_str),
+            Some("test")
+        );
+
+        // Archi Calls: ognuno porta il source_kind del file SORGENTE (P0-1: la
+        // risoluzione per nome semplice è same-module, niente confusione fra i due
+        // `helper` omonimi).
+        let prod_call = delta
+            .added_relations
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls && r.source_id == prod_top.id)
+            .expect("call prod assente");
+        assert_eq!(
+            prod_call.metadata.get("source_kind").map(String::as_str),
+            Some("prod")
+        );
+        let test_call = delta
+            .added_relations
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls && r.source_id == test_top.id)
+            .expect("call test assente");
+        assert_eq!(
+            test_call.metadata.get("source_kind").map(String::as_str),
+            Some("test")
+        );
     }
 }

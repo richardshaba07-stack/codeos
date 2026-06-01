@@ -13,6 +13,7 @@ use crate::python::PythonParser;
 use crate::rust_lang::RustParser;
 use crate::traits::LanguageParser;
 use crate::typescript::TypeScriptParser;
+use crate::workspace::WorkspaceModel;
 
 /// Attore che indicizza i file.
 ///
@@ -88,9 +89,15 @@ impl ParserActor {
 
     async fn index_files(&self, files: &[String]) -> Vec<ParsedFileResult> {
         let mut results = Vec::with_capacity(files.len());
+        // Un solo modello di workspace per batch: la cache evita di rileggere lo
+        // stesso manifest una volta per file (P1-c).
+        let mut workspace = WorkspaceModel::new();
         for file in files {
             match self.index_one(file).await {
-                Ok(Some(result)) => results.push(result),
+                Ok(Some(mut result)) => {
+                    stamp_package(&mut result, &mut workspace);
+                    results.push(result);
+                }
                 Ok(None) => tracing::debug!(%file, "nessun parser per l'estensione, salto"),
                 Err(err) => tracing::warn!(%file, error = %err, "indicizzazione fallita"),
             }
@@ -141,6 +148,23 @@ impl ParserActor {
             }
         }
         found
+    }
+}
+
+/// Timbra il pacchetto di appartenenza (`package`) sui metadata di ogni entità del
+/// file, leggendolo dal manifest più vicino sul disco (P1-c). Se il file non è
+/// posseduto da alcun manifest noto, non aggiunge nulla: il Guardian ricadrà
+/// sull'euristica di profondità del path. Non sovrascrive un `package` che il
+/// parser avesse già dedotto.
+fn stamp_package(result: &mut ParsedFileResult, workspace: &mut WorkspaceModel) {
+    let Some(package) = workspace.package_for_file(Path::new(&result.file_path)) else {
+        return;
+    };
+    for entity in &mut result.entities {
+        entity
+            .metadata
+            .entry("package".to_string())
+            .or_insert_with(|| package.clone());
     }
 }
 
@@ -305,6 +329,68 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn index_stamps_package_from_the_nearest_cargo_manifest() {
+        // Regressione P1-c: le entità di un file dentro un crate devono ereditare il
+        // nome del pacchetto letto dal Cargo.toml più vicino, non l'euristica path.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codeos_parser_pkg_{nanos}"));
+        let crate_src = root.join("crates").join("alpha").join("src");
+        tokio::fs::create_dir_all(&crate_src).await.unwrap();
+        tokio::fs::write(
+            root.join("crates").join("alpha").join("Cargo.toml"),
+            "[package]\nname = \"alpha-core\"\n",
+        )
+        .await
+        .unwrap();
+        let file = crate_src.join("lib.rs");
+        tokio::fs::write(&file, "pub fn boot() {}\n").await.unwrap();
+
+        let actor = ParserActor::new(broadcast::channel(16).0);
+        let results = actor
+            .index_files(&[file.to_string_lossy().to_string()])
+            .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0]
+                .entities
+                .iter()
+                .all(|e| e.metadata.get("package").map(String::as_str) == Some("alpha-core")),
+            "ogni entità deve portare package=alpha-core: {:?}",
+            results[0].entities
+        );
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn index_without_manifest_leaves_package_unset() {
+        // Senza manifest sopra il file, nessun `package`: il Guardian ricadrà
+        // sull'euristica di profondità del path.
+        let path = temp_py_path();
+        tokio::fs::write(&path, "class Foo:\n    pass\n").await.unwrap();
+
+        let actor = ParserActor::new(broadcast::channel(16).0);
+        let results = actor
+            .index_files(&[path.to_string_lossy().to_string()])
+            .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0]
+                .entities
+                .iter()
+                .all(|e| !e.metadata.contains_key("package")),
+            "senza manifest non deve esserci alcun package"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]

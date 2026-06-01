@@ -21,7 +21,7 @@ use codeos_types::bus::{ArchitectureViolation, NewDecision};
 use codeos_types::{EntityId, EntityKind, Relation};
 
 use crate::invariant::{
-    boundary_entities, layer_of, mine_layering_rules, violations_for, LayerConfig, LayerKey,
+    boundary_entities, layer_of_entity, mine_layering_rules, violations_for, LayerConfig, LayerKey,
     LayeringRule,
 };
 use crate::meta::{mine_missing_invariants, MetaConfig, MissingInvariant};
@@ -483,10 +483,7 @@ impl Guardian {
                 if entity.kind == EntityKind::ExternalDependency {
                     continue;
                 }
-                map.insert(
-                    id,
-                    layer_of(&entity.qualified_name, self.config.layer_depth),
-                );
+                map.insert(id, layer_of_entity(&entity, self.config.layer_depth));
             }
         }
         Ok(map)
@@ -519,7 +516,7 @@ impl Guardian {
                 if entity.kind == EntityKind::ExternalDependency {
                     continue;
                 }
-                let layer = layer_of(&entity.qualified_name, self.config.layer_depth).0;
+                let layer = layer_of_entity(&entity, self.config.layer_depth).0;
                 map.entry(entity.location.file_path)
                     .or_default()
                     .insert(layer);
