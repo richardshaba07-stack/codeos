@@ -18,7 +18,7 @@ use codeos_memory::{Decision, DecisionKind, DecisionStore};
 use codeos_paleo::{excavate, occasions, Abstention, CommitHistory, DecisionFossil, Z_95};
 use codeos_storage::{GraphStorage, RelationFilter};
 use codeos_types::bus::{ArchitectureViolation, NewDecision};
-use codeos_types::{EntityId, Relation};
+use codeos_types::{EntityId, EntityKind, Relation};
 
 use crate::invariant::{
     boundary_entities, layer_of, mine_layering_rules, violations_for, LayerConfig, LayerKey,
@@ -448,6 +448,14 @@ impl Guardian {
     /// Mappa ogni entità che compare come estremo di una relazione al suo layer.
     /// Gli `EntityId` nulli (target di `Unresolved`) e le entità non trovate sono
     /// semplicemente assenti dalla mappa: chi le interroga le ignora.
+    ///
+    /// Le **dipendenze esterne** (`tokio`, `std`, `react`…) sono volutamente
+    /// **escluse** (P0-2): non sono layer *della tua* architettura, quindi un arco
+    /// `crates::codeos-rpc → external::std` non deve diventare l'invariante assurdo
+    /// "external::std non deve dipendere da codeos-rpc". Restano comunque nel grafo
+    /// (interrogabili via query/impatto): qui le togliamo solo dal *ragionamento sui
+    /// layer*. Essendo assenti dalla mappa, ogni arco che le tocca è ignorato in
+    /// blocco da [`crate::invariant::cross_layer`] (mining, gap e violazioni).
     async fn build_layer_map(
         &self,
         relations: &[Relation],
@@ -465,6 +473,9 @@ impl Guardian {
         let mut map = HashMap::with_capacity(ids.len());
         for id in ids {
             if let Some(entity) = self.storage.get_entity_by_id(&id).await? {
+                if entity.kind == EntityKind::ExternalDependency {
+                    continue;
+                }
                 map.insert(
                     id,
                     layer_of(&entity.qualified_name, self.config.layer_depth),
@@ -496,6 +507,11 @@ impl Guardian {
         let mut map: HashMap<String, HashSet<String>> = HashMap::new();
         for id in ids {
             if let Some(entity) = self.storage.get_entity_by_id(&id).await? {
+                // Coerente con build_layer_map: le esterne non sono layer e il loro
+                // file fittizio `<external>` non è mai toccato da un commit git.
+                if entity.kind == EntityKind::ExternalDependency {
+                    continue;
+                }
                 let layer = layer_of(&entity.qualified_name, self.config.layer_depth).0;
                 map.entry(entity.location.file_path)
                     .or_default()
@@ -699,6 +715,65 @@ mod tests {
         assert_eq!(rules.len(), 1, "regole = {rules:?}");
         assert_eq!(rules[0].upstream, LayerKey("app::core".to_string()));
         assert_eq!(rules[0].downstream, LayerKey("app::api".to_string()));
+    }
+
+    #[tokio::test]
+    async fn external_dependencies_never_become_layering_rules() {
+        // Regressione P0-2: un layer interno che importa `tokio` 3 volte è
+        // un'asimmetria a senso unico PERFETTA — esattamente la forma che il miner
+        // promuoverebbe a invariante. Ma `external::tokio` non è un layer della
+        // nostra architettura: non deve generare la regola assurda "external::tokio
+        // non deve dipendere da app::api". Deve restare però nel grafo (query/impatto).
+        let (storage, api, _core) = seeded_two_layer_graph().await;
+
+        let tokio = Entity {
+            id: EntityId::new(),
+            kind: EntityKind::ExternalDependency,
+            qualified_name: "external::tokio".to_string(),
+            location: SourceLocation {
+                file_path: "<external>".to_string(),
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+            metadata: Map::new(),
+        };
+        let ext_edges: Vec<Relation> = (0..3)
+            .map(|i| relation(RelationKind::Imports, api[i].id, tokio.id))
+            .collect();
+        storage
+            .apply_delta(GraphDelta {
+                added_entities: vec![tokio.clone()],
+                added_relations: ext_edges,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let guardian = Guardian::new(storage.clone());
+        let rules = guardian.mine_rules().await.unwrap();
+
+        // Solo l'invariante reale (app::core ← app::api). Nessuna regola che nomini
+        // un layer esterno, in nessuno dei due versi.
+        assert_eq!(rules.len(), 1, "atteso solo l'invariante interno: {rules:?}");
+        assert!(
+            !rules.iter().any(|r| {
+                r.upstream.0.starts_with("external")
+                    || r.downstream.0.starts_with("external")
+            }),
+            "nessun invariante deve nominare una dipendenza esterna: {rules:?}"
+        );
+
+        // La dipendenza esterna resta interrogabile nel grafo (non è stata rimossa).
+        assert!(
+            storage
+                .get_entity_by_qname("external::tokio")
+                .await
+                .unwrap()
+                .is_some(),
+            "external::tokio deve restare nel grafo per query e impatto"
+        );
     }
 
     #[tokio::test]
