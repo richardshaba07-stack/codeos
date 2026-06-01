@@ -572,6 +572,7 @@ fn detect_language(file_path: &str) -> String {
         "py" => "python".to_string(),
         "ts" | "tsx" | "mts" | "cts" => "typescript".to_string(),
         "js" | "jsx" | "mjs" | "cjs" => "javascript".to_string(),
+        "go" => "go".to_string(),
         _ => "unknown".to_string(),
     }
 }
@@ -731,7 +732,7 @@ fn npm_package_root(spec: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codeos_parser::{LanguageParser, PythonParser, RustParser, TypeScriptParser};
+    use codeos_parser::{GoParser, LanguageParser, PythonParser, RustParser, TypeScriptParser};
     use codeos_storage::SqliteStorage;
     use codeos_types::EntityKind;
     use std::path::Path;
@@ -742,6 +743,10 @@ mod tests {
 
     async fn parse_rust(path: &str, src: &str) -> ParsedFileResult {
         RustParser::new().parse_file(Path::new(path), src).await
+    }
+
+    async fn parse_go(path: &str, src: &str) -> ParsedFileResult {
+        GoParser::new().parse_file(Path::new(path), src).await
     }
 
     async fn parse_ts(path: &str, src: &str) -> ParsedFileResult {
@@ -954,6 +959,40 @@ mod tests {
                 .iter()
                 .any(|e| e.qualified_name == "external::missing_local"),
             "una call locale mancata non è una dipendenza esterna"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_go_intramodule_call_and_method_receiver() {
+        // End-to-end Go: prova che `detect_language` riconosca `.go` (altrimenti il
+        // resolver userebbe "unknown" e il language-match fallirebbe), così la call
+        // intra-modulo risolve e il metodo appartiene al tipo ricevente.
+        let src = "package m\n\ntype Server struct{}\n\nfunc (s *Server) Start() {\n    boot()\n}\n\nfunc boot() {}\n";
+        let parsed = parse_go("m.go", src).await;
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None);
+
+        let delta = resolver.resolve(&[parsed], &storage).await.unwrap();
+
+        let server = find(&delta, "m::Server");
+        assert_eq!(server.kind, EntityKind::Struct);
+        let start = find(&delta, "m::Server::Start");
+        assert_eq!(start.kind, EntityKind::Method);
+        let boot = find(&delta, "m::boot");
+
+        // Il metodo Start appartiene a Server (BelongsTo da parent_local_id).
+        assert!(
+            delta.added_relations.iter().any(|r| r.kind == RelationKind::BelongsTo
+                && r.source_id == start.id
+                && r.target_id == server.id),
+            "Start deve appartenere a Server"
+        );
+        // La call `boot()` dentro Start risolve alla funzione locale `boot`.
+        assert!(
+            delta.added_relations.iter().any(|r| r.kind == RelationKind::Calls
+                && r.source_id == start.id
+                && r.target_id == boot.id),
+            "la call intra-modulo a boot deve risolvere (non Unresolved)"
         );
     }
 

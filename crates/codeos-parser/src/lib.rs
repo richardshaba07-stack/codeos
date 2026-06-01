@@ -15,12 +15,14 @@
 //! `GraphResolver` (Blocco 3).
 
 mod actor;
+mod go;
 mod python;
 mod rust_lang;
 mod traits;
 mod typescript;
 
 pub use actor::ParserActor;
+pub use go::GoParser;
 pub use python::PythonParser;
 pub use rust_lang::RustParser;
 pub use traits::LanguageParser;
