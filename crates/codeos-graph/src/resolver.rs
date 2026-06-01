@@ -573,6 +573,7 @@ fn detect_language(file_path: &str) -> String {
         "ts" | "tsx" | "mts" | "cts" => "typescript".to_string(),
         "js" | "jsx" | "mjs" | "cjs" => "javascript".to_string(),
         "go" => "go".to_string(),
+        "java" => "java".to_string(),
         _ => "unknown".to_string(),
     }
 }
@@ -732,7 +733,9 @@ fn npm_package_root(spec: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codeos_parser::{GoParser, LanguageParser, PythonParser, RustParser, TypeScriptParser};
+    use codeos_parser::{
+        GoParser, JavaParser, LanguageParser, PythonParser, RustParser, TypeScriptParser,
+    };
     use codeos_storage::SqliteStorage;
     use codeos_types::EntityKind;
     use std::path::Path;
@@ -747,6 +750,10 @@ mod tests {
 
     async fn parse_go(path: &str, src: &str) -> ParsedFileResult {
         GoParser::new().parse_file(Path::new(path), src).await
+    }
+
+    async fn parse_java(path: &str, src: &str) -> ParsedFileResult {
+        JavaParser::new().parse_file(Path::new(path), src).await
     }
 
     async fn parse_ts(path: &str, src: &str) -> ParsedFileResult {
@@ -993,6 +1000,62 @@ mod tests {
                 && r.source_id == start.id
                 && r.target_id == boot.id),
             "la call intra-modulo a boot deve risolvere (non Unresolved)"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_java_intraclass_call_and_heritage() {
+        // End-to-end Java: prova che `detect_language` riconosca `.java` (altrimenti
+        // il resolver userebbe "unknown" e il language-match fallirebbe), così la
+        // call intra-classe risolve, il metodo appartiene alla classe e `extends`
+        // aggancia la superclasse locale.
+        let src = r#"package com.example;
+
+class BaseCache {}
+
+class Cache extends BaseCache {
+    String get(String key) {
+        return lookup(key);
+    }
+
+    String lookup(String key) {
+        return key;
+    }
+}
+"#;
+        let parsed = parse_java("app.java", src).await;
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None);
+
+        let delta = resolver.resolve(&[parsed], &storage).await.unwrap();
+
+        let cache = find(&delta, "app::Cache");
+        assert_eq!(cache.kind, EntityKind::Class);
+        let base = find(&delta, "app::BaseCache");
+        let get = find(&delta, "app::Cache::get");
+        assert_eq!(get.kind, EntityKind::Method);
+        let lookup = find(&delta, "app::Cache::lookup");
+
+        // `get` appartiene a Cache (BelongsTo da parent_local_id).
+        assert!(
+            delta.added_relations.iter().any(|r| r.kind == RelationKind::BelongsTo
+                && r.source_id == get.id
+                && r.target_id == cache.id),
+            "get deve appartenere a Cache"
+        );
+        // La call `lookup(key)` dentro `get` risolve al metodo locale `lookup`.
+        assert!(
+            delta.added_relations.iter().any(|r| r.kind == RelationKind::Calls
+                && r.source_id == get.id
+                && r.target_id == lookup.id),
+            "la call intra-classe a lookup deve risolvere (non Unresolved)"
+        );
+        // `extends BaseCache` aggancia la superclasse locale (non Unresolved).
+        assert!(
+            delta.added_relations.iter().any(|r| r.kind == RelationKind::Extends
+                && r.source_id == cache.id
+                && r.target_id == base.id),
+            "extends deve agganciare BaseCache"
         );
     }
 

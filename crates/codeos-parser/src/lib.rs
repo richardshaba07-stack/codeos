@@ -16,6 +16,7 @@
 
 mod actor;
 mod go;
+mod java_lang;
 mod python;
 mod rust_lang;
 mod traits;
@@ -23,6 +24,7 @@ mod typescript;
 
 pub use actor::ParserActor;
 pub use go::GoParser;
+pub use java_lang::JavaParser;
 pub use python::PythonParser;
 pub use rust_lang::RustParser;
 pub use traits::LanguageParser;
