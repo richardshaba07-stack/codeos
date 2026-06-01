@@ -134,8 +134,20 @@ impl GraphResolver {
                     continue;
                 };
 
+                // Sanitizzazione (P0-1): un target con whitespace/newline o non
+                // simbolico è rumore. Lo normalizziamo e, se resta vuoto o non è un
+                // simbolo, scartiamo la relazione del tutto — niente arco, nemmeno
+                // Unresolved.
+                let Some(target) = sanitize_target(&parsed.target_qualified_name) else {
+                    tracing::debug!(
+                        raw = %parsed.target_qualified_name,
+                        "target non simbolico dopo sanitizzazione, salto"
+                    );
+                    continue;
+                };
+
                 let resolved = resolve_target(
-                    &parsed.target_qualified_name,
+                    &target,
                     &ctx.module_prefix,
                     &ctx.language,
                     &ctx.namespace,
@@ -161,7 +173,7 @@ impl GraphResolver {
                         // dal progetto, lo aggancio a un'entità sintetica stabile
                         // invece di buttarlo in un Unresolved con target nullo.
                         match external_dependency_root(
-                            &parsed.target_qualified_name,
+                            &target,
                             &ctx.language,
                             &ctx.namespace,
                             parsed.kind == RelationKind::Imports,
@@ -176,10 +188,7 @@ impl GraphResolver {
                                 )
                                 .await?;
                                 let mut metadata = HashMap::new();
-                                metadata.insert(
-                                    "external_target".to_string(),
-                                    parsed.target_qualified_name.clone(),
-                                );
+                                metadata.insert("external_target".to_string(), target.clone());
                                 Relation {
                                     id: EntityId::new(),
                                     kind: parsed.kind,
@@ -194,10 +203,7 @@ impl GraphResolver {
                                 // nei metadata, così l'UI e il Memory Engine possono
                                 // mostrarli.
                                 let mut metadata = HashMap::new();
-                                metadata.insert(
-                                    "unresolved_target".to_string(),
-                                    parsed.target_qualified_name.clone(),
-                                );
+                                metadata.insert("unresolved_target".to_string(), target.clone());
                                 metadata.insert(
                                     "original_kind".to_string(),
                                     format!("{:?}", parsed.kind),
@@ -372,13 +378,16 @@ async fn resolve_target(
             .cloned()
             .collect();
 
+        // SOLO lo stesso modulo. Il match per nome semplice è sicuro soltanto se il
+        // candidato vive nel modulo del chiamante. NIENTE fallback globale `.first()`
+        // (P0-1): sceglierebbe un'entità arbitraria con lo stesso nome in un crate
+        // qualunque — la causa dei falsi positivi tipo `handle_import CALLS
+        // GraphDelta::is_empty`. Un arco mancante (Unresolved) è preferibile a un
+        // arco che mente: la fiducia nel grafo vale più della copertura.
         if let Some((id, _)) = lang_candidates
             .iter()
             .find(|(_, qname)| qname.starts_with(module_prefix))
         {
-            return Ok(Some(*id));
-        }
-        if let Some((id, _)) = lang_candidates.first() {
             return Ok(Some(*id));
         }
     }
@@ -398,11 +407,9 @@ async fn resolve_target(
     {
         return Ok(Some(e.id));
     }
-    if let Some(e) = exact.first() {
-        return Ok(Some(e.id));
-    }
 
-    // 4 — Nessun match: Unresolved.
+    // 4 — Nessun match: Unresolved. Stesso principio del batch: niente fallback
+    // globale sul DB, che aggancerebbe un omonimo in un altro modulo/crate.
     Ok(None)
 }
 
@@ -593,6 +600,25 @@ fn first_segment(target: &str) -> Option<&str> {
 
 fn last_segment(target: &str) -> Option<&str> {
     target.rsplit(['.', ':']).find(|s| !s.is_empty())
+}
+
+/// Normalizza un `target_qualified_name` grezzo emesso dal parser. I simboli del
+/// codice non contengono mai whitespace: rimuoviamo spazi e newline interni —
+/// introdotti quando il testo del nodo abbraccia più righe (`obj\n    .metodo`). È
+/// la prima difesa contro i target sporchi che producevano layer ed archi finti.
+///
+/// Restituisce `None` se dopo la pulizia il target è vuoto o non contiene **alcun**
+/// carattere da identificatore (lettera, cifra, `_`): non è un simbolo risolvibile,
+/// e va scartato del tutto invece di inquinare il grafo con un arco senza senso.
+fn sanitize_target(raw: &str) -> Option<String> {
+    let cleaned: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    if !cleaned.chars().any(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(cleaned)
 }
 
 /// Restituisce l'`EntityId` dell'entità sintetica per la dipendenza esterna
@@ -966,6 +992,57 @@ mod tests {
                 .iter()
                 .any(|e| e.qualified_name == "external::missing_local"),
             "una call locale mancata non è una dipendenza esterna"
+        );
+    }
+
+    #[test]
+    fn sanitize_target_strips_whitespace_and_rejects_non_symbols() {
+        // Whitespace interno (catturato da un'espressione multi-riga) rimosso.
+        assert_eq!(
+            sanitize_target("obj\n    .metodo").as_deref(),
+            Some("obj.metodo")
+        );
+        assert_eq!(sanitize_target("  Foo::bar  ").as_deref(), Some("Foo::bar"));
+        // Vuoto o privo di identificatori ⇒ non è un simbolo: scartato.
+        assert_eq!(sanitize_target("   "), None);
+        assert_eq!(sanitize_target("::"), None);
+        assert_eq!(sanitize_target(""), None);
+    }
+
+    #[tokio::test]
+    async fn cross_module_homonym_is_not_falsely_linked() {
+        // Regressione P0-1: `v.is_empty()` in un crate NON deve agganciarsi a
+        // `GraphDelta::is_empty` di un ALTRO crate solo perché condividono il nome.
+        // È esattamente il falso positivo che il fallback globale per nome produceva
+        // (`handle_import CALLS GraphDelta::is_empty` indicizzando CodeOS stesso).
+        let parsed = vec![
+            parse_rust(
+                "/repo/crates/codeos-types/src/lib.rs",
+                "pub struct GraphDelta;\nimpl GraphDelta {\n    pub fn is_empty(&self) -> bool {\n        true\n    }\n}\n",
+            )
+            .await,
+            parse_rust(
+                "/repo/crates/codeos-graph/src/resolver.rs",
+                "pub fn handle_import() {\n    let v: Vec<u8> = Vec::new();\n    v.is_empty();\n}\n",
+            )
+            .await,
+        ];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+
+        let handle = find(&delta, "crates::codeos-graph::src::resolver::handle_import");
+        let is_empty = find(&delta, "crates::codeos-types::src::lib::GraphDelta::is_empty");
+
+        // NESSUN arco Calls cross-crate da handle_import all'omonimo is_empty.
+        assert!(
+            !delta.added_relations.iter().any(|r| {
+                r.kind == RelationKind::Calls
+                    && r.source_id == handle.id
+                    && r.target_id == is_empty.id
+            }),
+            "il nome semplice non deve agganciare un omonimo di un altro crate"
         );
     }
 
