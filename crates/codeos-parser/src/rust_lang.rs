@@ -322,7 +322,7 @@ impl<'src> FileWalk<'src> {
             return;
         };
         let target = clean_call_target(&self.text(func));
-        if target.is_empty() {
+        if target.is_empty() || is_noise_call(&target) {
             return;
         }
         self.relations.push(ParsedRelation {
@@ -343,6 +343,13 @@ impl<'src> FileWalk<'src> {
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         if target.is_empty() {
+            return;
+        }
+        // Le macro "di rumore" (assert!, vec!, println!, format!, …) sono onnipresenti
+        // ma non esprimono una dipendenza architetturale: si risolverebbero a nulla
+        // (`Unresolved`) e gonfierebbero il grafo — specie nei moduli di test. Le
+        // scartiamo, così il grafo resta una mappa di relazioni *significative*.
+        if is_noise_macro(&target) {
             return;
         }
         self.relations.push(ParsedRelation {
@@ -381,6 +388,54 @@ fn bare_type_name(raw: &str) -> Option<String> {
     } else {
         Some(name)
     }
+}
+
+/// `true` se la macro è una delle "macro di rumore" della libreria standard (o di
+/// test): onnipresenti, non risolvibili a un'entità e prive di valore architetturale.
+/// Il match è sull'ultimo segmento del path (`std::println` → `println`).
+fn is_noise_macro(target: &str) -> bool {
+    let name = target.rsplit("::").next().unwrap_or(target).trim();
+    matches!(
+        name,
+        "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
+            | "panic"
+            | "unreachable"
+            | "unimplemented"
+            | "todo"
+            | "dbg"
+            | "print"
+            | "println"
+            | "eprint"
+            | "eprintln"
+            | "write"
+            | "writeln"
+            | "format"
+            | "format_args"
+            | "vec"
+            | "matches"
+            | "concat"
+            | "stringify"
+            | "include"
+            | "include_str"
+            | "include_bytes"
+            | "env"
+            | "option_env"
+            | "line"
+            | "file"
+            | "column"
+    )
+}
+
+/// `true` se il bersaglio di una `call_expression` è un costruttore-wrapper della
+/// libreria standard (`Ok`/`Err`/`Some`) o un costrutto onnipresente senza valore
+/// architetturale: sono chiamate che non rappresentano una dipendenza tra moduli.
+fn is_noise_call(target: &str) -> bool {
+    matches!(target, "Ok" | "Err" | "Some")
 }
 
 fn clean_call_target(raw: &str) -> String {
@@ -531,6 +586,67 @@ fn helper() {}
             .map(|r| r.target_qualified_name.as_str())
             .collect();
         assert!(calls.contains(&"helper"), "calls = {calls:?}");
+    }
+
+    #[tokio::test]
+    async fn noise_macros_are_not_recorded_as_calls() {
+        // `assert_eq!`/`vec!`/`println!` sono rumore; `my_router!` è una macro
+        // applicativa e deve restare una dipendenza (Calls) significativa.
+        let src = r#"
+fn run() {
+    let v = vec![1, 2, 3];
+    assert_eq!(v.len(), 3);
+    println!("done");
+    my_router!(home);
+}
+"#;
+        let result = parse(src).await;
+        let calls: Vec<&str> = result
+            .relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .map(|r| r.target_qualified_name.as_str())
+            .collect();
+        assert!(
+            !calls.iter().any(|c| matches!(*c, "vec" | "assert_eq" | "println")),
+            "le macro di rumore non devono comparire fra le call: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"my_router"),
+            "la macro applicativa deve restare una call: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn is_noise_macro_matches_std_macros_and_paths() {
+        assert!(is_noise_macro("assert_eq"));
+        assert!(is_noise_macro("std::println"));
+        assert!(is_noise_macro("vec"));
+        assert!(!is_noise_macro("my_router"));
+        assert!(!is_noise_macro("tracing::info"));
+    }
+
+    #[tokio::test]
+    async fn enum_constructor_wrappers_are_not_recorded_as_calls() {
+        let src = r#"
+fn run() -> Result<i32, String> {
+    let x = Some(1);
+    do_work();
+    Ok(42)
+}
+"#;
+        let result = parse(src).await;
+        let calls: Vec<&str> = result
+            .relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .map(|r| r.target_qualified_name.as_str())
+            .collect();
+        assert!(
+            !calls.iter().any(|c| matches!(*c, "Ok" | "Some" | "Err")),
+            "i wrapper Ok/Err/Some non devono comparire fra le call: {calls:?}"
+        );
+        assert!(calls.contains(&"do_work"), "calls = {calls:?}");
     }
 
     #[test]
