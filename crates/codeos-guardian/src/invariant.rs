@@ -114,14 +114,29 @@ fn confidence_for(support: u32) -> f32 {
     1.0 - 1.0 / (support as f32 + 1.0)
 }
 
+/// Una relazione risolta con confidenza `low` non è abbastanza affidabile per
+/// reggere un ragionamento architetturale: il resolver l'ha agganciata con
+/// un'euristica fuzzy/cross-package che potrebbe mentire. La escludiamo dal mining
+/// a monte (in [`cross_layer`]), così non entra né nel conteggio degli archi né
+/// nelle violazioni. Le relazioni **senza** il metadato (es. i `BelongsTo`
+/// strutturali, o relazioni create prima di questo campo) sono trattate come
+/// **non-low**: nessuna regressione, lo spazio negativo storico resta invariato.
+fn relation_confidence_is_low(rel: &Relation) -> bool {
+    rel.metadata
+        .get("resolution_confidence")
+        .map(|c| c == "low")
+        .unwrap_or(false)
+}
+
 /// La coppia (layer sorgente, layer destinazione) di una relazione, se entrambi
-/// gli estremi sono noti, la relazione è una dipendenza e attraversa due layer
-/// diversi. Altrimenti `None` (non contribuisce al ragionamento sui layer).
+/// gli estremi sono noti, la relazione è una dipendenza, attraversa due layer
+/// diversi ed è risolta con confidenza sufficiente. Altrimenti `None` (non
+/// contribuisce al ragionamento sui layer).
 fn cross_layer<'a>(
     rel: &Relation,
     entity_layer: &'a HashMap<EntityId, LayerKey>,
 ) -> Option<(&'a LayerKey, &'a LayerKey)> {
-    if !is_dependency_kind(rel.kind) || rel.target_id.is_nil() {
+    if !is_dependency_kind(rel.kind) || rel.target_id.is_nil() || relation_confidence_is_low(rel) {
         return None;
     }
     let (Some(s), Some(t)) = (
@@ -296,6 +311,19 @@ mod tests {
         }
     }
 
+    /// Come `rel`, ma con una confidenza di risoluzione esplicita nei metadata.
+    fn rel_conf(
+        kind: RelationKind,
+        source: EntityId,
+        target: EntityId,
+        confidence: &str,
+    ) -> Relation {
+        let mut r = rel(kind, source, target);
+        r.metadata
+            .insert("resolution_confidence".to_string(), confidence.to_string());
+        r
+    }
+
     /// Costruisce N entità di un dato layer e ritorna (id, mappa id→layer).
     fn layered(n: usize, layer: &str, map: &mut HashMap<EntityId, LayerKey>) -> Vec<EntityId> {
         (0..n)
@@ -422,6 +450,40 @@ mod tests {
         assert_eq!(boundary.len(), 6);
         assert!(boundary.contains(&api[0]));
         assert!(boundary.contains(&core[2]));
+    }
+
+    #[test]
+    fn low_confidence_relations_do_not_form_rules() {
+        let mut map = HashMap::new();
+        let api = layered(3, "app::api", &mut map);
+        let core = layered(3, "app::core", &mut map);
+
+        // Tre archi api → core, ma tutti risolti con confidenza `low`: il resolver
+        // li ha agganciati con un'euristica fragile. Niente regola: una base
+        // architetturale non può poggiare su archi che potrebbero mentire.
+        let low = vec![
+            rel_conf(RelationKind::Calls, api[0], core[0], "low"),
+            rel_conf(RelationKind::Calls, api[1], core[1], "low"),
+            rel_conf(RelationKind::Calls, api[2], core[2], "low"),
+        ];
+        assert!(
+            mine_layering_rules(&low, &map, &LayerConfig::default()).is_empty(),
+            "archi a bassa confidenza non devono produrre invarianti"
+        );
+
+        // Controprova: gli stessi archi con confidenza `high` formano la regola.
+        let high = vec![
+            rel_conf(RelationKind::Calls, api[0], core[0], "high"),
+            rel_conf(RelationKind::Calls, api[1], core[1], "high"),
+            rel_conf(RelationKind::Calls, api[2], core[2], "high"),
+        ];
+        let rules = mine_layering_rules(&high, &map, &LayerConfig::default());
+        assert_eq!(rules.len(), 1, "archi affidabili devono formare la regola");
+
+        // Una candidata `low` nel verso proibito non è nemmeno una violazione:
+        // troppo incerta per accusare il codice.
+        let bad_low = rel_conf(RelationKind::Calls, core[0], api[0], "low");
+        assert!(violations_for(&[bad_low], &map, &rules).is_empty());
     }
 
     #[test]

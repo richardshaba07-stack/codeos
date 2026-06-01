@@ -125,6 +125,18 @@ impl GraphResolver {
         // Passo 3 — Name resolution: ora che l'indice del batch è completo,
         // risolvi ogni relazione del parser in un arco con EntityId.
         for ctx in &file_ctxs {
+            // Contesto di risoluzione condiviso da tutte le relazioni del file: un
+            // solo riferimento agli indici del batch invece di otto argomenti
+            // ripetuti a ogni chiamata (clippy `too_many_arguments`).
+            let rctx = ResolutionContext {
+                module_prefix: ctx.module_prefix.as_str(),
+                language: ctx.language.as_str(),
+                namespace: &ctx.namespace,
+                new_by_qname: &new_by_qname,
+                new_by_name: &new_by_name,
+                new_by_id_lang: &new_by_id_lang,
+                storage,
+            };
             for parsed in &ctx.relations {
                 let Some(source_id) = ctx.local_map.get(&parsed.source_local_id) else {
                     tracing::warn!(
@@ -146,26 +158,30 @@ impl GraphResolver {
                     continue;
                 };
 
-                let resolved = resolve_target(
-                    &target,
-                    &ctx.module_prefix,
-                    &ctx.language,
-                    &ctx.namespace,
-                    &new_by_qname,
-                    &new_by_name,
-                    &new_by_id_lang,
-                    storage,
-                )
-                .await?;
+                let resolved = resolve_target(&rctx, &target).await?;
 
                 let relation = match resolved {
-                    Some(target_id) => Relation {
-                        id: EntityId::new(),
-                        kind: parsed.kind,
-                        source_id: *source_id,
-                        target_id,
-                        metadata: HashMap::new(),
-                    },
+                    Some((target_id, strategy)) => {
+                        // Ogni arco risolto porta la strategia e la confidenza con cui
+                        // ci siamo arrivati: il Guardian le legge per escludere dal
+                        // mining le relazioni a bassa confidenza (vedi `cross_layer`).
+                        let mut metadata = HashMap::new();
+                        metadata.insert(
+                            "resolution_strategy".to_string(),
+                            strategy.as_str().to_string(),
+                        );
+                        metadata.insert(
+                            "resolution_confidence".to_string(),
+                            strategy.confidence().to_string(),
+                        );
+                        Relation {
+                            id: EntityId::new(),
+                            kind: parsed.kind,
+                            source_id: *source_id,
+                            target_id,
+                            metadata,
+                        }
+                    }
                     None => {
                         // Passo 3.4 — Prima del fallback Unresolved, prova a
                         // riconoscere una dipendenza esterna (std/tokio/serde,
@@ -189,6 +205,14 @@ impl GraphResolver {
                                 .await?;
                                 let mut metadata = HashMap::new();
                                 metadata.insert("external_target".to_string(), target.clone());
+                                metadata.insert(
+                                    "resolution_strategy".to_string(),
+                                    ResolutionStrategy::External.as_str().to_string(),
+                                );
+                                metadata.insert(
+                                    "resolution_confidence".to_string(),
+                                    ResolutionStrategy::External.confidence().to_string(),
+                                );
                                 Relation {
                                     id: EntityId::new(),
                                     kind: parsed.kind,
@@ -207,6 +231,14 @@ impl GraphResolver {
                                 metadata.insert(
                                     "original_kind".to_string(),
                                     format!("{:?}", parsed.kind),
+                                );
+                                metadata.insert(
+                                    "resolution_strategy".to_string(),
+                                    "unresolved".to_string(),
+                                );
+                                metadata.insert(
+                                    "resolution_confidence".to_string(),
+                                    "none".to_string(),
                                 );
                                 Relation {
                                     id: EntityId::new(),
@@ -318,59 +350,117 @@ struct FileContext {
     relations: Vec<codeos_types::ParsedRelation>,
 }
 
+/// Come un target è stato risolto a un `EntityId`. Determina la **confidenza** della
+/// relazione e, di riflesso, se può partecipare al ragionamento architetturale: le
+/// relazioni a confidenza `low` vengono escluse dal mining (vedi `Guardian`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolutionStrategy {
+    /// Match esatto sul `qualified_name` (path normalizzato o full-qualified).
+    Exact,
+    /// Risolto via import esplicito del file (la namespace table).
+    Import,
+    /// Nome semplice risolto nello *stesso modulo* del chiamante: euristica
+    /// sull'ultimo segmento, affidabile ma non certa ⇒ confidenza media.
+    SameModule,
+    /// Dipendenza esterna sintetica (`tokio`, `std`, `react`…).
+    External,
+}
+
+impl ResolutionStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Import => "import",
+            Self::SameModule => "same_module",
+            Self::External => "external",
+        }
+    }
+
+    /// La confidenza associata: `high` per i match basati su path/import espliciti,
+    /// `medium` per il match euristico per nome semplice. Nessuna strategia attuale
+    /// produce `low`: la soglia esiste come rete di sicurezza per future strategie
+    /// fuzzy/cross-package, già escluse dal mining dal Guardian.
+    fn confidence(self) -> &'static str {
+        match self {
+            Self::Exact | Self::Import | Self::External => "high",
+            Self::SameModule => "medium",
+        }
+    }
+}
+
+/// Tutto ciò che serve a risolvere i target di **un** file: modulo corrente,
+/// linguaggio, import e indici globali del batch + lo storage. Sostituisce la
+/// cascata di 8 argomenti di [`resolve_target`] (clippy `too_many_arguments`) con un
+/// unico riferimento condiviso, costruito una volta per file.
+struct ResolutionContext<'a> {
+    module_prefix: &'a str,
+    language: &'a str,
+    namespace: &'a HashMap<String, String>,
+    new_by_qname: &'a HashMap<String, EntityId>,
+    new_by_name: &'a HashMap<String, Vec<(EntityId, String)>>,
+    new_by_id_lang: &'a HashMap<EntityId, String>,
+    storage: &'a dyn GraphStorage,
+}
+
 /// Algoritmo a cascata del Passo 3 (briefing sez. 7.2). Restituisce `None` se
-/// nessuno stadio risolve il target (⇒ relazione `Unresolved`).
+/// nessuno stadio risolve il target (⇒ relazione `Unresolved`), altrimenti l'id
+/// risolto e la [`ResolutionStrategy`] con cui ci è arrivato.
 async fn resolve_target(
+    ctx: &ResolutionContext<'_>,
     target: &str,
-    module_prefix: &str,
-    src_language: &str,
-    namespace: &HashMap<String, String>,
-    new_by_qname: &HashMap<String, EntityId>,
-    new_by_name: &HashMap<String, Vec<(EntityId, String)>>,
-    new_by_id_lang: &HashMap<EntityId, String>,
-    storage: &dyn GraphStorage,
-) -> anyhow::Result<Option<EntityId>> {
+) -> anyhow::Result<Option<(EntityId, ResolutionStrategy)>> {
     // 0 — Import path normalisation. I parser mantengono i target come li scrive
     // il linguaggio (`crate::x`, `codeos_types::x`, `./client`); qui li traduciamo
     // nel namespace interno basato sui path (`crates::codeos-types::src::...`).
-    for candidate in target_candidates(target, module_prefix) {
-        if let Some(id) = lookup_progressive(&candidate, src_language, new_by_qname, new_by_id_lang, storage).await? {
-            return Ok(Some(id));
+    for candidate in target_candidates(target, ctx.module_prefix) {
+        if let Some(id) =
+            lookup_progressive(&candidate, ctx.language, ctx.new_by_qname, ctx.new_by_id_lang, ctx.storage)
+                .await?
+        {
+            return Ok(Some((id, ResolutionStrategy::Exact)));
         }
     }
 
     // 1 — Full-qualified match (sia sul batch sia sul DB).
-    if let Some(id) = lookup_exact(target, src_language, new_by_qname, new_by_id_lang, storage).await? {
-        return Ok(Some(id));
+    if let Some(id) =
+        lookup_exact(target, ctx.language, ctx.new_by_qname, ctx.new_by_id_lang, ctx.storage).await?
+    {
+        return Ok(Some((id, ResolutionStrategy::Exact)));
     }
     // Le `call` usano `.`, i nostri qualified_name usano `::`: prova la variante.
     let colonized = target.replace('.', "::");
     if colonized != target {
-        if let Some(id) = lookup_exact(&colonized, src_language, new_by_qname, new_by_id_lang, storage).await? {
-            return Ok(Some(id));
+        if let Some(id) =
+            lookup_exact(&colonized, ctx.language, ctx.new_by_qname, ctx.new_by_id_lang, ctx.storage)
+                .await?
+        {
+            return Ok(Some((id, ResolutionStrategy::Exact)));
         }
     }
 
     // 2 — Import-based match: se il primo segmento è importato, sostituiscine il
     // prefisso col target dell'import e riprova il match esatto.
     if let Some(seg) = first_segment(target) {
-        if let Some(full) = namespace.get(seg) {
+        if let Some(full) = ctx.namespace.get(seg) {
             let remainder = &target[seg.len()..];
             let candidate = format!("{full}{remainder}").replace('.', "::");
-            if let Some(id) = lookup_exact(&candidate, src_language, new_by_qname, new_by_id_lang, storage).await? {
-                return Ok(Some(id));
+            if let Some(id) =
+                lookup_exact(&candidate, ctx.language, ctx.new_by_qname, ctx.new_by_id_lang, ctx.storage)
+                    .await?
+            {
+                return Ok(Some((id, ResolutionStrategy::Import)));
             }
         }
     }
 
-    // 3 — Scope-local match: per nome semplice, preferendo lo stesso modulo.
+    // 3 — Scope-local match: per nome semplice, SOLO nello stesso modulo.
     let bare = last_segment(target).unwrap_or(target);
-    if let Some(candidates) = new_by_name.get(bare) {
+    if let Some(candidates) = ctx.new_by_name.get(bare) {
         let lang_candidates: Vec<(EntityId, String)> = candidates
             .iter()
             .filter(|(id, _)| {
-                if let Some(t_lang) = new_by_id_lang.get(id) {
-                    language_matches(src_language, t_lang)
+                if let Some(t_lang) = ctx.new_by_id_lang.get(id) {
+                    language_matches(ctx.language, t_lang)
                 } else {
                     false
                 }
@@ -386,26 +476,26 @@ async fn resolve_target(
         // arco che mente: la fiducia nel grafo vale più della copertura.
         if let Some((id, _)) = lang_candidates
             .iter()
-            .find(|(_, qname)| qname.starts_with(module_prefix))
+            .find(|(_, qname)| qname.starts_with(ctx.module_prefix))
         {
-            return Ok(Some(*id));
+            return Ok(Some((*id, ResolutionStrategy::SameModule)));
         }
     }
     let suffix = format!("::{bare}");
-    let db_hits = storage.find_entities_by_name_pattern(bare).await?;
+    let db_hits = ctx.storage.find_entities_by_name_pattern(bare).await?;
     let exact: Vec<&Entity> = db_hits
         .iter()
         .filter(|e| e.qualified_name == bare || e.qualified_name.ends_with(&suffix))
         .filter(|e| {
             let t_lang = e.metadata.get("language").cloned().unwrap_or_else(|| detect_language(&e.location.file_path));
-            language_matches(src_language, &t_lang)
+            language_matches(ctx.language, &t_lang)
         })
         .collect();
     if let Some(e) = exact
         .iter()
-        .find(|e| e.qualified_name.starts_with(module_prefix))
+        .find(|e| e.qualified_name.starts_with(ctx.module_prefix))
     {
-        return Ok(Some(e.id));
+        return Ok(Some((e.id, ResolutionStrategy::SameModule)));
     }
 
     // 4 — Nessun match: Unresolved. Stesso principio del batch: niente fallback
