@@ -773,6 +773,11 @@ impl Guardian {
         _for_ai: bool,
     ) -> anyhow::Result<codeos_types::bus::GetContextPackResponse> {
         let target_entities = self.select_target_entities(goal).await;
+        // Goal non localizzato: nessuna entità del grafo corrisponde. blast_count
+        // sarà 0 e il rischio scivolerebbe a "low" — una falsa rassicurazione
+        // servita dritta a un'AI. "low" qui significherebbe «non valutabile», non
+        // «sicuro»: meglio dichiararlo «unknown» e dirlo a chiare lettere.
+        let unlocalized = target_entities.is_empty();
 
         let mut files_to_read: Vec<String> = target_entities
             .iter()
@@ -885,7 +890,9 @@ impl Guardian {
                 blast_count += rels.len();
             }
         }
-        let estimated_risk = if blast_count > 8 {
+        let estimated_risk = if unlocalized {
+            "unknown".to_string()
+        } else if blast_count > 8 {
             "high".to_string()
         } else if blast_count > 2 {
             "medium".to_string()
@@ -893,16 +900,34 @@ impl Guardian {
             "low".to_string()
         };
 
-        let goal_interpretation = format!(
-            "Analisi e preparazione del contesto per raggiungere il goal: \"{}\"",
-            goal
-        );
+        let goal_interpretation = if unlocalized {
+            format!(
+                "Goal non localizzato: nessuna entità del grafo corrisponde a \"{}\" \
+                 (simbolo inesistente o termini troppo generici, scartati). Il rischio \
+                 «unknown» significa «non valutabile», non «sicuro»: rinomina il goal \
+                 con un modulo o una funzione concreti.",
+                goal
+            )
+        } else {
+            format!(
+                "Analisi e preparazione del contesto per raggiungere il goal: \"{}\"",
+                goal
+            )
+        };
 
         let mut markdown = format!("# AI Context Pack - goal: \"{}\"\n\n", goal);
         markdown.push_str(&format!(
             "**Stima del rischio:** {}\n\n",
             estimated_risk.to_uppercase()
         ));
+        if unlocalized {
+            markdown.push_str(
+                "> ⚠️ **Goal non localizzato**: nessuna entità del grafo corrisponde a \
+                 questo goal. Rischio «unknown» = «non valutabile», non «sicuro». Le \
+                 sezioni qui sotto sono vuote perché non c'è nulla da ancorare: rinomina \
+                 il goal con un modulo o una funzione concreti.\n\n",
+            );
+        }
         markdown.push_str("## 1. Interpretazione del Goal\n");
         markdown.push_str(&format!("{}\n\n", goal_interpretation));
         markdown.push_str("## 2. File da Leggere / Modificare\n");
@@ -2255,6 +2280,66 @@ mod tests {
             1,
             "un estremo che combacia col tag deve ancora trovare la decisione: {:?}",
             paired.markdown_decisions
+        );
+    }
+
+    #[tokio::test]
+    async fn context_pack_does_not_report_low_risk_when_the_goal_is_unlocalized() {
+        // "app" compare ovunque → scartata da select_target_entities → nessun
+        // bersaglio. blast_count 0 darebbe rischio "low": una falsa sicurezza
+        // servita dritta a un'AI. Deve invece essere "unknown", e il markdown deve dirlo.
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let target = entity("app::svc::pay::charge");
+        let callers: Vec<Entity> = (0..3)
+            .map(|i| entity(&format!("app::ui::screen_{i}::run")))
+            .collect();
+        let rels: Vec<Relation> = callers
+            .iter()
+            .map(|c| relation(RelationKind::Calls, c.id, target.id))
+            .collect();
+        storage
+            .apply_delta(GraphDelta {
+                added_entities: std::iter::once(target.clone())
+                    .chain(callers.iter().cloned())
+                    .collect(),
+                added_relations: rels,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let guardian = Guardian::new(storage);
+
+        let vague = guardian.get_context_pack("app", true).await.unwrap();
+        assert_eq!(
+            vague.estimated_risk, "unknown",
+            "un goal non localizzato non è a basso rischio, è non valutabile: {}",
+            vague.estimated_risk
+        );
+        assert!(
+            vague.relevant_entities.is_empty(),
+            "nessun bersaglio: niente entità rilevanti, erano {:?}",
+            vague.relevant_entities
+        );
+        assert!(
+            vague.formatted_markdown.contains("non localizzato"),
+            "il markdown deve avvertire che il goal non è localizzato: {}",
+            vague.formatted_markdown
+        );
+        assert!(
+            !vague.formatted_markdown.contains("rischio:** LOW"),
+            "il rischio non deve apparire come LOW per un goal non localizzato: {}",
+            vague.formatted_markdown
+        );
+
+        // Anti-regressione: un goal localizzato torna a un rischio concreto, non «unknown».
+        let precise = guardian.get_context_pack("charge", true).await.unwrap();
+        assert_ne!(
+            precise.estimated_risk, "unknown",
+            "un goal localizzato deve avere un rischio concreto, non «unknown»"
+        );
+        assert!(
+            !precise.relevant_entities.is_empty(),
+            "un goal localizzato deve avere entità rilevanti"
         );
     }
 }
