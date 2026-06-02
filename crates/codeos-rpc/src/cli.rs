@@ -383,12 +383,153 @@ async fn run_doctor() {
         println!("  [-] Liveness gRPC saltata (porta non raggiungibile)");
     }
 
+    // 4) Configurazione del server via variabili d'ambiente. Filosofia
+    // anti-falso-positivo: marco come [✗] solo il *set-but-broken* (variabile
+    // impostata che punta a un percorso inesistente) — l'unico caso inequivocabile,
+    // che farebbe fallire l'avvio o degradare il referto in silenzio. Variabile non
+    // impostata = scelta legittima (i default sono documentati), quindi solo nota [-].
+    let repo = std::env::var("CODEOS_REPO").ok();
+    let repo_diag = match repo.as_deref() {
+        Some(p) => {
+            let path = Path::new(p);
+            let exists = path.exists();
+            let is_git = exists && path.join(".git").exists();
+            diagnose_repo(Some(p), exists, is_git)
+        }
+        None => diagnose_repo(None, false, false),
+    };
+    report_env_diag(&repo_diag, &mut problems);
+
+    let db = std::env::var("CODEOS_DB").ok();
+    let db_diag = match db.as_deref() {
+        Some(v) => {
+            let looks_like_uri = v.starts_with("file:") || v.contains("://") || v.contains('?');
+            let path = Path::new(v);
+            let parent_exists = match path.parent() {
+                // Path senza componente di cartella (es. "graph.db") ⇒ cwd, che esiste.
+                Some(dir) => dir.as_os_str().is_empty() || dir.exists(),
+                None => true,
+            };
+            let file_exists = path.is_file();
+            diagnose_db(Some(v), looks_like_uri, parent_exists, file_exists)
+        }
+        None => diagnose_db(None, false, false, false),
+    };
+    report_env_diag(&db_diag, &mut problems);
+
     println!();
     if problems == 0 {
         println!("✅ Tutto a posto: CodeOS è pronto all'uso.");
     } else {
         println!("⚠️  {problems} problema/i rilevato/i. Risolvi i punti [✗] qui sopra.");
         std::process::exit(1);
+    }
+}
+
+/// Severità di una riga di diagnosi. Solo `Problem` conta come problema (incrementa
+/// il contatore e fa uscire `doctor` con codice 1); `Ok` e `Note` sono informative.
+#[derive(Debug, PartialEq, Eq)]
+enum DiagKind {
+    Ok,
+    Note,
+    Problem,
+}
+
+/// Una riga di diagnosi: severità, messaggio e un suggerimento azionabile opzionale.
+#[derive(Debug)]
+struct EnvDiag {
+    kind: DiagKind,
+    message: String,
+    hint: Option<String>,
+}
+
+impl EnvDiag {
+    fn ok(message: impl Into<String>) -> Self {
+        Self {
+            kind: DiagKind::Ok,
+            message: message.into(),
+            hint: None,
+        }
+    }
+    fn note(message: impl Into<String>) -> Self {
+        Self {
+            kind: DiagKind::Note,
+            message: message.into(),
+            hint: None,
+        }
+    }
+    fn problem(message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
+            kind: DiagKind::Problem,
+            message: message.into(),
+            hint: Some(hint.into()),
+        }
+    }
+}
+
+/// Decisione **pura** per `CODEOS_REPO`, dati i fatti già rilevati dal filesystem
+/// (separata dall'I/O così è testabile senza server né disco). Anti-falso-positivo:
+/// solo *impostata-ma-inesistente* è un problema; non impostata o «esiste ma non è
+/// git» sono note (il server degrada con grazia, non si rompe).
+fn diagnose_repo(value: Option<&str>, exists: bool, is_git: bool) -> EnvDiag {
+    match value {
+        None => EnvDiag::note(
+            "CODEOS_REPO non impostata: referto solo strutturale (Campo di Astensione e Fossili git disattivati)",
+        ),
+        Some(path) if !exists => EnvDiag::problem(
+            format!("CODEOS_REPO impostata ma il percorso non esiste: '{path}'"),
+            "Correggi CODEOS_REPO: deve puntare alla root del repository git",
+        ),
+        Some(path) if !is_git => EnvDiag::note(format!(
+            "CODEOS_REPO punta a '{path}': esiste ma non sembra un repo git (manca .git), la storia non verrà letta"
+        )),
+        Some(path) => EnvDiag::ok(format!("CODEOS_REPO: '{path}' (storia git agganciabile)")),
+    }
+}
+
+/// Decisione **pura** per `CODEOS_DB`, dati i fatti già rilevati dal filesystem.
+/// Anti-falso-positivo: è un problema solo se la cartella che conterrebbe il DB non
+/// esiste (l'apertura fallirebbe). Il file mancante NON è un errore: SQLite lo crea
+/// al primo avvio. Le forme URI (`file:…`) sfuggono al controllo path e restano note.
+fn diagnose_db(
+    value: Option<&str>,
+    looks_like_uri: bool,
+    parent_exists: bool,
+    file_exists: bool,
+) -> EnvDiag {
+    match value {
+        None => EnvDiag::note(
+            "CODEOS_DB non impostata: grafo SQLite in memoria (effimero), nessuna persistenza tra i riavvii",
+        ),
+        Some(_) if looks_like_uri => {
+            EnvDiag::note("CODEOS_DB in forma URI (file:…): salto il controllo del filesystem")
+        }
+        Some(path) if !parent_exists => EnvDiag::problem(
+            format!("CODEOS_DB impostata ('{path}') ma la cartella che la conterrebbe non esiste: l'apertura del DB fallirebbe"),
+            "Crea la cartella padre, oppure correggi CODEOS_DB",
+        ),
+        Some(path) if file_exists => {
+            EnvDiag::ok(format!("CODEOS_DB: userà il file esistente '{path}'"))
+        }
+        Some(path) => {
+            EnvDiag::ok(format!("CODEOS_DB: il file '{path}' verrà creato al primo avvio"))
+        }
+    }
+}
+
+/// Stampa una [`EnvDiag`] col glifo della sua severità e l'eventuale hint, e
+/// incrementa il contatore dei problemi solo se è un `Problem`.
+fn report_env_diag(diag: &EnvDiag, problems: &mut u32) {
+    match diag.kind {
+        DiagKind::Ok => println!("  [✓] {}", diag.message),
+        DiagKind::Note => println!("  [-] {}", diag.message),
+        DiagKind::Problem => {
+            *problems += 1;
+            println!("  [✗] {}", diag.message);
+        }
+    }
+    if let Some(hint) = &diag.hint {
+        println!("      → {hint}");
     }
 }
 
@@ -876,7 +1017,7 @@ fn severity_rank(severity: &str) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::usage_text;
+    use super::{diagnose_db, diagnose_repo, usage_text, DiagKind};
 
     /// Ogni comando gestito dal dispatcher in `main` deve comparire nell'help.
     /// È il guard-rail contro la regressione «comando aggiunto al `match`, scordato
@@ -896,5 +1037,55 @@ mod tests {
                 "comando '{cmd}' gestito da main ma assente dall'help (usage_text)"
             );
         }
+    }
+
+    /// `doctor` deve segnalare `CODEOS_REPO` solo quando è *impostata ma rotta*.
+    /// Non impostata o «esiste ma non è git» non sono problemi: il referto degrada
+    /// con grazia. È la regola anti-falso-positivo applicata alla diagnosi.
+    #[test]
+    fn diagnose_repo_flags_only_set_but_missing() {
+        // Non impostata ⇒ nota, non problema (default legittimo).
+        assert_eq!(diagnose_repo(None, false, false).kind, DiagKind::Note);
+        // Impostata ma il path non esiste ⇒ problema inequivocabile.
+        assert_eq!(
+            diagnose_repo(Some("/non/esiste"), false, false).kind,
+            DiagKind::Problem
+        );
+        // Esiste ma non è un repo git ⇒ nota (il server degrada con grazia).
+        assert_eq!(
+            diagnose_repo(Some("/tmp"), true, false).kind,
+            DiagKind::Note
+        );
+        // Esiste ed è git ⇒ ok.
+        assert_eq!(diagnose_repo(Some("/repo"), true, true).kind, DiagKind::Ok);
+    }
+
+    /// `doctor` deve segnalare `CODEOS_DB` solo quando la cartella che conterrebbe
+    /// il file non esiste (l'apertura fallirebbe). Il file ancora assente NON è un
+    /// errore: SQLite lo crea al primo avvio — segnalarlo sarebbe un falso positivo.
+    #[test]
+    fn diagnose_db_flags_only_missing_parent_dir() {
+        // Non impostata ⇒ nota (grafo in memoria).
+        assert_eq!(diagnose_db(None, false, false, false).kind, DiagKind::Note);
+        // Forma URI ⇒ nota (controllo filesystem saltato, niente falsi positivi).
+        assert_eq!(
+            diagnose_db(Some("file:/x?mode=ro"), true, false, false).kind,
+            DiagKind::Note
+        );
+        // Cartella padre mancante ⇒ problema (l'apertura fallirebbe).
+        assert_eq!(
+            diagnose_db(Some("/non/esiste/g.db"), false, false, false).kind,
+            DiagKind::Problem
+        );
+        // Padre esiste, file presente ⇒ ok.
+        assert_eq!(
+            diagnose_db(Some("/tmp/g.db"), false, true, true).kind,
+            DiagKind::Ok
+        );
+        // Padre esiste, file ancora assente ⇒ ok (SQLite lo crea), NON problema.
+        assert_eq!(
+            diagnose_db(Some("/tmp/g.db"), false, true, false).kind,
+            DiagKind::Ok
+        );
     }
 }
