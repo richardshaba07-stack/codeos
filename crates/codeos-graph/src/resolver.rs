@@ -66,7 +66,11 @@ impl GraphResolver {
             for parsed in &file.entities {
                 let id = EntityId::new();
                 let qname = self.qualified_name(parsed, &module_prefix, &local_qname);
-                let lang = parsed.metadata.get("language").cloned().unwrap_or_else(|| detect_language(&file.file_path));
+                let lang = parsed
+                    .metadata
+                    .get("language")
+                    .cloned()
+                    .unwrap_or_else(|| detect_language(&file.file_path));
 
                 local_map.insert(parsed.local_id.clone(), id);
                 local_qname.insert(parsed.local_id.clone(), qname.clone());
@@ -446,26 +450,42 @@ async fn resolve_target(
     // il linguaggio (`crate::x`, `codeos_types::x`, `./client`); qui li traduciamo
     // nel namespace interno basato sui path (`crates::codeos-types::src::...`).
     for candidate in target_candidates(target, ctx.module_prefix) {
-        if let Some(id) =
-            lookup_progressive(&candidate, ctx.language, ctx.new_by_qname, ctx.new_by_id_lang, ctx.storage)
-                .await?
+        if let Some(id) = lookup_progressive(
+            &candidate,
+            ctx.language,
+            ctx.new_by_qname,
+            ctx.new_by_id_lang,
+            ctx.storage,
+        )
+        .await?
         {
             return Ok(Some((id, ResolutionStrategy::Exact)));
         }
     }
 
     // 1 — Full-qualified match (sia sul batch sia sul DB).
-    if let Some(id) =
-        lookup_exact(target, ctx.language, ctx.new_by_qname, ctx.new_by_id_lang, ctx.storage).await?
+    if let Some(id) = lookup_exact(
+        target,
+        ctx.language,
+        ctx.new_by_qname,
+        ctx.new_by_id_lang,
+        ctx.storage,
+    )
+    .await?
     {
         return Ok(Some((id, ResolutionStrategy::Exact)));
     }
     // Le `call` usano `.`, i nostri qualified_name usano `::`: prova la variante.
     let colonized = target.replace('.', "::");
     if colonized != target {
-        if let Some(id) =
-            lookup_exact(&colonized, ctx.language, ctx.new_by_qname, ctx.new_by_id_lang, ctx.storage)
-                .await?
+        if let Some(id) = lookup_exact(
+            &colonized,
+            ctx.language,
+            ctx.new_by_qname,
+            ctx.new_by_id_lang,
+            ctx.storage,
+        )
+        .await?
         {
             return Ok(Some((id, ResolutionStrategy::Exact)));
         }
@@ -477,9 +497,14 @@ async fn resolve_target(
         if let Some(full) = ctx.namespace.get(seg) {
             let remainder = &target[seg.len()..];
             let candidate = format!("{full}{remainder}").replace('.', "::");
-            if let Some(id) =
-                lookup_exact(&candidate, ctx.language, ctx.new_by_qname, ctx.new_by_id_lang, ctx.storage)
-                    .await?
+            if let Some(id) = lookup_exact(
+                &candidate,
+                ctx.language,
+                ctx.new_by_qname,
+                ctx.new_by_id_lang,
+                ctx.storage,
+            )
+            .await?
             {
                 return Ok(Some((id, ResolutionStrategy::Import)));
             }
@@ -520,7 +545,11 @@ async fn resolve_target(
         .iter()
         .filter(|e| e.qualified_name == bare || e.qualified_name.ends_with(&suffix))
         .filter(|e| {
-            let t_lang = e.metadata.get("language").cloned().unwrap_or_else(|| detect_language(&e.location.file_path));
+            let t_lang = e
+                .metadata
+                .get("language")
+                .cloned()
+                .unwrap_or_else(|| detect_language(&e.location.file_path));
             language_matches(ctx.language, &t_lang)
         })
         .collect();
@@ -566,11 +595,7 @@ fn target_candidates(target: &str, module_prefix: &str) -> Vec<String> {
                 out.push(format!("crates::{dir}::src::lib"));
             } else {
                 out.push(format!("crates::{dir}::src::lib::{rest}").replace('.', "::"));
-                if rest
-                    .split("::")
-                    .next()
-                    .is_some_and(starts_lowercase)
-                {
+                if rest.split("::").next().is_some_and(starts_lowercase) {
                     out.push(format!("crates::{dir}::src::{rest}").replace('.', "::"));
                 }
             }
@@ -668,7 +693,11 @@ async fn lookup_exact(
         }
     }
     if let Some(entity) = storage.get_entity_by_qname(qname).await? {
-        let t_lang = entity.metadata.get("language").cloned().unwrap_or_else(|| detect_language(&entity.location.file_path));
+        let t_lang = entity
+            .metadata
+            .get("language")
+            .cloned()
+            .unwrap_or_else(|| detect_language(&entity.location.file_path));
         if language_matches(src_language, &t_lang) {
             return Ok(Some(entity.id));
         }
@@ -685,7 +714,15 @@ async fn lookup_progressive(
 ) -> anyhow::Result<Option<EntityId>> {
     let mut current = qname.to_string();
     loop {
-        if let Some(id) = lookup_exact(&current, src_language, new_by_qname, new_by_id_lang, storage).await? {
+        if let Some(id) = lookup_exact(
+            &current,
+            src_language,
+            new_by_qname,
+            new_by_id_lang,
+            storage,
+        )
+        .await?
+        {
             return Ok(Some(id));
         }
         let Some((parent, _last)) = current.rsplit_once("::") else {
@@ -734,9 +771,7 @@ fn classify_source_kind(file_path: &str, language: &str) -> &'static str {
         "go" => file_name.ends_with("_test.go"),
         "java" | "kotlin" => path.contains("/src/test/"),
         "python" => file_name.starts_with("test_") || file_name.ends_with("_test.py"),
-        "typescript" | "javascript" => {
-            file_name.contains(".test.") || file_name.contains(".spec.")
-        }
+        "typescript" | "javascript" => file_name.contains(".test.") || file_name.contains(".spec."),
         // Rust: i test d'integrazione vivono in `tests/` (già coperto sopra); gli
         // unit test inline `#[cfg(test)]` non sono distinguibili dal path e li
         // lasciamo "prod" finché un parser non li marca via metadata.
@@ -1083,7 +1118,10 @@ mod tests {
 
         let ext = find(&delta, "external::os");
         assert_eq!(ext.kind, EntityKind::ExternalDependency);
-        assert_eq!(ext.metadata.get("external").map(String::as_str), Some("true"));
+        assert_eq!(
+            ext.metadata.get("external").map(String::as_str),
+            Some("true")
+        );
 
         // L'import `os` è un arco Imports verso il nodo esterno (target non nullo).
         assert!(
@@ -1212,7 +1250,10 @@ mod tests {
         let delta = resolver.resolve(&parsed, &storage).await.unwrap();
 
         let handle = find(&delta, "crates::codeos-graph::src::resolver::handle_import");
-        let is_empty = find(&delta, "crates::codeos-types::src::lib::GraphDelta::is_empty");
+        let is_empty = find(
+            &delta,
+            "crates::codeos-types::src::lib::GraphDelta::is_empty",
+        );
 
         // NESSUN arco Calls cross-crate da handle_import all'omonimo is_empty.
         assert!(
@@ -1245,16 +1286,22 @@ mod tests {
 
         // Il metodo Start appartiene a Server (BelongsTo da parent_local_id).
         assert!(
-            delta.added_relations.iter().any(|r| r.kind == RelationKind::BelongsTo
-                && r.source_id == start.id
-                && r.target_id == server.id),
+            delta
+                .added_relations
+                .iter()
+                .any(|r| r.kind == RelationKind::BelongsTo
+                    && r.source_id == start.id
+                    && r.target_id == server.id),
             "Start deve appartenere a Server"
         );
         // La call `boot()` dentro Start risolve alla funzione locale `boot`.
         assert!(
-            delta.added_relations.iter().any(|r| r.kind == RelationKind::Calls
-                && r.source_id == start.id
-                && r.target_id == boot.id),
+            delta
+                .added_relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Calls
+                    && r.source_id == start.id
+                    && r.target_id == boot.id),
             "la call intra-modulo a boot deve risolvere (non Unresolved)"
         );
     }
@@ -1294,23 +1341,32 @@ class Cache extends BaseCache {
 
         // `get` appartiene a Cache (BelongsTo da parent_local_id).
         assert!(
-            delta.added_relations.iter().any(|r| r.kind == RelationKind::BelongsTo
-                && r.source_id == get.id
-                && r.target_id == cache.id),
+            delta
+                .added_relations
+                .iter()
+                .any(|r| r.kind == RelationKind::BelongsTo
+                    && r.source_id == get.id
+                    && r.target_id == cache.id),
             "get deve appartenere a Cache"
         );
         // La call `lookup(key)` dentro `get` risolve al metodo locale `lookup`.
         assert!(
-            delta.added_relations.iter().any(|r| r.kind == RelationKind::Calls
-                && r.source_id == get.id
-                && r.target_id == lookup.id),
+            delta
+                .added_relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Calls
+                    && r.source_id == get.id
+                    && r.target_id == lookup.id),
             "la call intra-classe a lookup deve risolvere (non Unresolved)"
         );
         // `extends BaseCache` aggancia la superclasse locale (non Unresolved).
         assert!(
-            delta.added_relations.iter().any(|r| r.kind == RelationKind::Extends
-                && r.source_id == cache.id
-                && r.target_id == base.id),
+            delta
+                .added_relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Extends
+                    && r.source_id == cache.id
+                    && r.target_id == base.id),
             "extends deve agganciare BaseCache"
         );
     }
