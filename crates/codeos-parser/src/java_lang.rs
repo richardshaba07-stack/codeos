@@ -330,8 +330,7 @@ fn bare_type_name(raw: &str) -> String {
 /// non un'espressione complessa (con chiamate, spazi o a-capo).
 fn is_simple_receiver(obj: &str) -> bool {
     let obj = obj.trim();
-    !obj.is_empty()
-        && !obj.contains(['(', ')', ' ', '\n', '\t', '[', ']', '{', '}'])
+    !obj.is_empty() && !obj.contains(['(', ')', ' ', '\n', '\t', '[', ']', '{', '}'])
 }
 
 /// Raccoglie i nomi dei tipi (`type_identifier`/`scoped_type_identifier`) dentro
@@ -340,10 +339,7 @@ fn type_names_in(node: Node, source: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
-        if matches!(
-            current.kind(),
-            "type_identifier" | "scoped_type_identifier"
-        ) {
+        if matches!(current.kind(), "type_identifier" | "scoped_type_identifier") {
             let value = current.utf8_text(source).unwrap_or("").trim();
             if !value.is_empty() && !out.iter().any(|existing| existing == value) {
                 out.push(value.to_string());
@@ -439,13 +435,18 @@ public class Cache extends BaseCache implements Repository {
 
         // extends BaseCache, implements Repository.
         assert!(
-            result.relations.iter().any(|r| r.kind == RelationKind::Extends
-                && r.target_qualified_name == "BaseCache"),
+            result
+                .relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Extends && r.target_qualified_name == "BaseCache"),
             "manca extends BaseCache"
         );
         assert!(
-            result.relations.iter().any(|r| r.kind == RelationKind::Implements
-                && r.target_qualified_name == "Repository"),
+            result
+                .relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Implements
+                    && r.target_qualified_name == "Repository"),
             "manca implements Repository"
         );
 

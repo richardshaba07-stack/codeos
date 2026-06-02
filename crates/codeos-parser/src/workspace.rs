@@ -193,7 +193,11 @@ mod tests {
         let deep = crate_dir.join("src").join("inner");
         std::fs::create_dir_all(&deep).unwrap();
         // Root di workspace (senza [package]) + crate con [package].
-        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[\"crates/*\"]\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/*\"]\n",
+        )
+        .unwrap();
         std::fs::write(
             crate_dir.join("Cargo.toml"),
             "[package]\nname = \"alpha\"\n",

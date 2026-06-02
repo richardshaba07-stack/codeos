@@ -320,7 +320,10 @@ mod tests {
         let files = actor.collect_source_files(&root.to_string_lossy());
         let endings: Vec<&str> = files.iter().filter_map(|f| f.rsplit('/').next()).collect();
 
-        assert!(endings.contains(&"real.ts"), "il sorgente vero manca: {files:?}");
+        assert!(
+            endings.contains(&"real.ts"),
+            "il sorgente vero manca: {files:?}"
+        );
         assert!(
             !files.iter().any(|f| f.contains("/out/")
                 || f.contains("/dist/")
@@ -374,7 +377,9 @@ mod tests {
         // Senza manifest sopra il file, nessun `package`: il Guardian ricadrà
         // sull'euristica di profondità del path.
         let path = temp_py_path();
-        tokio::fs::write(&path, "class Foo:\n    pass\n").await.unwrap();
+        tokio::fs::write(&path, "class Foo:\n    pass\n")
+            .await
+            .unwrap();
 
         let actor = ParserActor::new(broadcast::channel(16).0);
         let results = actor

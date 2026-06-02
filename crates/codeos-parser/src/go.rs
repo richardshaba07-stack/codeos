@@ -436,8 +436,14 @@ func New() *Cache {
         // Il metodo `Get` è figlio del tipo ricevente `Cache`, non del modulo.
         let get = find(&result, "Get");
         assert_eq!(get.kind, EntityKind::Method);
-        assert_eq!(get.parent_local_id.as_deref(), Some(cache.local_id.as_str()));
-        assert_eq!(get.metadata.get("receiver").map(String::as_str), Some("Cache"));
+        assert_eq!(
+            get.parent_local_id.as_deref(),
+            Some(cache.local_id.as_str())
+        );
+        assert_eq!(
+            get.metadata.get("receiver").map(String::as_str),
+            Some("Cache")
+        );
 
         // Tutte le entità sono marcate come Go (per il resolver per-linguaggio).
         assert!(result
@@ -499,7 +505,11 @@ type Server struct{}
         );
         // Un solo entità `Server` (nessun duplicato segnaposto + reale).
         assert_eq!(
-            result.entities.iter().filter(|e| e.name == "Server").count(),
+            result
+                .entities
+                .iter()
+                .filter(|e| e.name == "Server")
+                .count(),
             1
         );
     }
