@@ -30,3 +30,43 @@ pub use python::PythonParser;
 pub use rust_lang::RustParser;
 pub use traits::LanguageParser;
 pub use typescript::TypeScriptParser;
+
+/// `true` se il target di una call è un *path pulito*: identificatori separati da
+/// `.` o `::`, senza sintassi d'espressione (parentesi, argomenti, stringhe, `?`,
+/// closure…).
+///
+/// Tree-sitter espone come campo `function` l'intera testa della catena: per
+/// `a.b().c()` il callee esterno è `a.b().c`, che ingloba la sub-call `a.b()`.
+/// Registrarlo creerebbe un arco *bugiardo* verso un simbolo inesistente. Le
+/// sub-call significative (`a.b`) vengono comunque catturate dalla ricorsione di
+/// `walk_children`, quindi qui scartiamo soltanto il guscio non risolvibile.
+///
+/// Condiviso da tutti i parser Tree-sitter: la guardia anti-arco-bugiardo
+/// dev'essere identica per ogni linguaggio.
+pub(crate) fn is_clean_call_path(target: &str) -> bool {
+    if target.is_empty() {
+        return false;
+    }
+    let chars_ok = target
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == ':');
+    chars_ok && !target.starts_with('.') && !target.ends_with('.') && !target.ends_with(':')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_clean_call_path;
+
+    #[test]
+    fn is_clean_call_path_rejects_expressions() {
+        assert!(is_clean_call_path("foo"));
+        assert!(is_clean_call_path("a.b.c"));
+        assert!(is_clean_call_path("Foo::bar"));
+        assert!(is_clean_call_path("self.storage.query_relations"));
+        assert!(!is_clean_call_path("SqliteStorage::in_memory().unwrap"));
+        assert!(!is_clean_call_path("items.iter().map"));
+        assert!(!is_clean_call_path("raw.split('"));
+        assert!(!is_clean_call_path(""));
+        assert!(!is_clean_call_path("foo."));
+    }
+}

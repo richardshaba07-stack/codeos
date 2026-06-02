@@ -10,6 +10,7 @@ use codeos_types::{
 };
 use tree_sitter::{Node, Parser};
 
+use crate::is_clean_call_path;
 use crate::traits::LanguageParser;
 
 pub struct TypeScriptParser;
@@ -38,13 +39,21 @@ impl LanguageParser for TypeScriptParser {
     async fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
         let path_str = file_path.to_string_lossy().to_string();
         let extension = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let is_js = matches!(extension.to_ascii_lowercase().as_str(), "js" | "jsx" | "mjs" | "cjs");
-        let language_str = if is_js { "javascript".to_string() } else { "typescript".to_string() };
-        let language = if extension.eq_ignore_ascii_case("tsx") || extension.eq_ignore_ascii_case("jsx") {
-            tree_sitter_typescript::language_tsx()
+        let is_js = matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "js" | "jsx" | "mjs" | "cjs"
+        );
+        let language_str = if is_js {
+            "javascript".to_string()
         } else {
-            tree_sitter_typescript::language_typescript()
+            "typescript".to_string()
         };
+        let language =
+            if extension.eq_ignore_ascii_case("tsx") || extension.eq_ignore_ascii_case("jsx") {
+                tree_sitter_typescript::language_tsx()
+            } else {
+                tree_sitter_typescript::language_typescript()
+            };
 
         let mut parser = Parser::new();
         if let Err(err) = parser.set_language(&language) {
@@ -70,7 +79,11 @@ impl LanguageParser for TypeScriptParser {
         };
 
         let root = tree.root_node();
-        let mut walk = FileWalk::new(source_code.as_bytes(), path_str.clone(), language_str.clone());
+        let mut walk = FileWalk::new(
+            source_code.as_bytes(),
+            path_str.clone(),
+            language_str.clone(),
+        );
         let module_id = walk.fresh_id();
         let module_name = file_path
             .file_stem()
@@ -323,7 +336,7 @@ impl<'src> FileWalk<'src> {
             return;
         };
         let target = clean_ts_target(&self.text(func));
-        if target.is_empty() {
+        if !is_clean_call_path(&target) {
             return;
         }
         self.relations.push(ParsedRelation {
@@ -340,7 +353,7 @@ impl<'src> FileWalk<'src> {
             .or_else(|| first_named_child(node))
             .map(|n| clean_ts_target(&self.text(n)))
             .unwrap_or_default();
-        if target.is_empty() || target == "new" {
+        if target == "new" || !is_clean_call_path(&target) {
             return;
         }
         self.relations.push(ParsedRelation {
@@ -580,7 +593,10 @@ export function Badge(props) {
         );
         assert_eq!(find(&result, "Badge").kind, EntityKind::Function);
         assert_eq!(
-            find(&result, "Badge").metadata.get("language").map(String::as_str),
+            find(&result, "Badge")
+                .metadata
+                .get("language")
+                .map(String::as_str),
             Some("javascript")
         );
         let imports: Vec<&str> = result
@@ -590,5 +606,49 @@ export function Badge(props) {
             .map(|r| r.target_qualified_name.as_str())
             .collect();
         assert!(imports.contains(&"react"), "imports = {imports:?}");
+    }
+
+    #[tokio::test]
+    async fn chained_calls_do_not_record_garbage_targets() {
+        // Tree-sitter espone come campo `function` l'intera testa della catena:
+        // per `items.filter(...).map(...)` il callee esterno è
+        // `items.filter(x => x.ok).map`, che ingloba la sub-call e la sintassi
+        // della closure. Registrarlo sarebbe un arco *bugiardo*; va scartato,
+        // mentre le sub-call pulite vanno recuperate dalla ricorsione del walk.
+        let src = r#"export function load() {
+  const cfg = vscode.workspace.getConfiguration('codeos');
+  return items.filter(x => x.ok).map(x => x.id);
+}
+"#;
+        let result = parse(src).await;
+
+        let calls: Vec<&str> = result
+            .relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .map(|r| r.target_qualified_name.as_str())
+            .collect();
+
+        assert!(
+            calls.iter().all(|t| !t.contains('(')
+                && !t.contains(')')
+                && !t.contains('\'')
+                && !t.contains('=')),
+            "nessun target di call deve contenere sintassi d'espressione: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"vscode.workspace.getConfiguration"),
+            "la method-chain pulita deve restare: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"items.filter"),
+            "la sub-call pulita va recuperata dalla ricorsione: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|t| t.contains("filter") && t.contains("map")),
+            "il guscio sovra-catturato non dev'essere registrato: {calls:?}"
+        );
     }
 }
