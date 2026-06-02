@@ -79,11 +79,32 @@ pub async fn serve(
         .await
 }
 
-async fn wait_for_graph_update(mut graph_rx: broadcast::Receiver<CodeOsEvent>, operation: &str) {
+/// L'esito dell'attesa dell'aggiornamento del grafo dopo un comando di indicizzazione.
+///
+/// Filosofia (P0, «un arco mancante è preferibile a uno che mente»): il ponte gRPC
+/// non deve *mai* dichiarare un successo che non ha osservato. Distinguiamo tre casi
+/// onesti invece di collassarli tutti in «torna comunque».
+enum GraphWaitOutcome {
+    /// Osservato `GraphUpdated`: il grafo riflette i file appena indicizzati.
+    Updated,
+    /// Osservato `GraphUpdateFailed`: il `GraphActor` ha fallito resolution/persistenza.
+    Failed(String),
+    /// Né successo né fallimento entro il timeout, o bus chiuso: esito *ignoto*.
+    /// Non possiamo affermare il successo, quindi lo segnaliamo come tale.
+    Unconfirmed,
+}
+
+async fn wait_for_graph_update(
+    mut graph_rx: broadcast::Receiver<CodeOsEvent>,
+    operation: &str,
+) -> GraphWaitOutcome {
     let observed = timeout(GRAPH_UPDATE_WAIT, async {
         loop {
             match graph_rx.recv().await {
-                Ok(CodeOsEvent::GraphUpdated { .. }) => return true,
+                Ok(CodeOsEvent::GraphUpdated { .. }) => return GraphWaitOutcome::Updated,
+                Ok(CodeOsEvent::GraphUpdateFailed { reason }) => {
+                    return GraphWaitOutcome::Failed(reason)
+                }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::warn!(
@@ -92,23 +113,39 @@ async fn wait_for_graph_update(mut graph_rx: broadcast::Receiver<CodeOsEvent>, o
                         "attesa GraphUpdated: eventi persi dal subscriber"
                     );
                 }
-                Err(broadcast::error::RecvError::Closed) => return false,
+                Err(broadcast::error::RecvError::Closed) => return GraphWaitOutcome::Unconfirmed,
             }
         }
     })
     .await;
 
     match observed {
-        Ok(true) => {}
-        Ok(false) => tracing::warn!(
-            operation,
-            "attesa GraphUpdated interrotta: event bus chiuso"
-        ),
-        Err(_) => tracing::warn!(
-            operation,
-            timeout_ms = GRAPH_UPDATE_WAIT.as_millis(),
-            "attesa GraphUpdated scaduta: il comando di indicizzazione torna comunque"
-        ),
+        Ok(outcome) => outcome,
+        Err(_) => {
+            tracing::warn!(
+                operation,
+                timeout_ms = GRAPH_UPDATE_WAIT.as_millis(),
+                "attesa GraphUpdated scaduta: esito dell'indicizzazione non confermato"
+            );
+            GraphWaitOutcome::Unconfirmed
+        }
+    }
+}
+
+/// Traduce l'esito dell'attesa in un `Result` per il ponte gRPC: solo `Updated`
+/// autorizza a dichiarare successo. `Failed` e `Unconfirmed` diventano errori
+/// onesti (rispettivamente `internal` e `deadline_exceeded`) così che la CLI non
+/// stampi mai «completata con successo» su un grafo che non è stato aggiornato.
+fn ensure_graph_updated(outcome: GraphWaitOutcome, operation: &str) -> Result<(), Status> {
+    match outcome {
+        GraphWaitOutcome::Updated => Ok(()),
+        GraphWaitOutcome::Failed(reason) => Err(Status::internal(format!(
+            "{operation}: aggiornamento del grafo fallito: {reason}"
+        ))),
+        GraphWaitOutcome::Unconfirmed => Err(Status::deadline_exceeded(format!(
+            "{operation}: esito dell'indicizzazione non confermato entro {} ms",
+            GRAPH_UPDATE_WAIT.as_millis()
+        ))),
     }
 }
 
@@ -217,7 +254,8 @@ impl CodeOs for CodeOsService {
             .ok_or_else(|| Status::internal("nessuna risposta dal parser actor"))?
             .map_err(|e| Status::internal(format!("indicizzazione progetto fallita: {e}")))?;
 
-        wait_for_graph_update(graph_rx, "IndexProject").await;
+        let outcome = wait_for_graph_update(graph_rx, "IndexProject").await;
+        ensure_graph_updated(outcome, "IndexProject")?;
         Ok(Response::new(proto::IndexProjectResponse {}))
     }
 
@@ -243,7 +281,8 @@ impl CodeOs for CodeOsService {
             .ok_or_else(|| Status::internal("nessuna risposta dal parser actor"))?
             .map_err(|e| Status::internal(format!("indicizzazione file fallita: {e}")))?;
 
-        wait_for_graph_update(graph_rx, "IndexFiles").await;
+        let outcome = wait_for_graph_update(graph_rx, "IndexFiles").await;
+        ensure_graph_updated(outcome, "IndexFiles")?;
         Ok(Response::new(proto::IndexFilesResponse {
             entity_ids: ids.iter().map(|id| id.to_string()).collect(),
         }))
@@ -504,7 +543,12 @@ impl CodeOs for CodeOsService {
             loop {
                 match bus.recv().await {
                     Ok(event) => {
-                        if tx.send(Ok(event_to_proto(event))).await.is_err() {
+                        // Alcuni eventi (es. GraphUpdateFailed) non hanno un
+                        // EventMessage nel proto: `event_to_proto` li scarta con None.
+                        let Some(msg) = event_to_proto(event) else {
+                            continue;
+                        };
+                        if tx.send(Ok(msg)).await.is_err() {
                             break; // il client ha chiuso lo stream
                         }
                     }
@@ -604,7 +648,7 @@ fn graph_quality_to_proto(info: GraphQualityInfo) -> proto::GraphQuality {
     }
 }
 
-fn event_to_proto(event: CodeOsEvent) -> proto::EventMessage {
+fn event_to_proto(event: CodeOsEvent) -> Option<proto::EventMessage> {
     use proto::event_message::Event;
     let inner = match event {
         CodeOsEvent::FilesIndexed { results } => Event::FilesIndexed(proto::FilesIndexedEvent {
@@ -633,17 +677,20 @@ fn event_to_proto(event: CodeOsEvent) -> proto::EventMessage {
             current_file,
             skipped_files,
             parse_errors,
-        } => {
-            Event::IndexProgress(proto::IndexProgressEvent {
-                total_files,
-                processed_files,
-                current_file,
-                skipped_files,
-                parse_errors,
-            })
-        }
+        } => Event::IndexProgress(proto::IndexProgressEvent {
+            total_files,
+            processed_files,
+            current_file,
+            skipped_files,
+            parse_errors,
+        }),
+        // `GraphUpdateFailed` è un segnale interno di onestà: lo consumano i ponti
+        // IndexProject/IndexFiles (che restituiscono un errore gRPC al chiamante).
+        // Non esiste un EventMessage corrispondente nel proto, quindi non lo
+        // inoltriamo allo stream WatchEvents.
+        CodeOsEvent::GraphUpdateFailed { .. } => return None,
     };
-    proto::EventMessage { event: Some(inner) }
+    Some(proto::EventMessage { event: Some(inner) })
 }
 
 /// Nome stabile e leggibile della variante (indipendente dall'ordinale enum).
@@ -844,7 +891,9 @@ mod tests {
 
         // La qualità del grafo (P2-7) viaggia sempre sul filo, anche a vuoto: tutti
         // i contatori a zero, ma il messaggio è presente (wiring end-to-end ok).
-        let quality = response.quality.expect("la qualità del grafo deve essere presente");
+        let quality = response
+            .quality
+            .expect("la qualità del grafo deve essere presente");
         assert_eq!(quality.total_entities, 0);
         assert_eq!(quality.total_relations, 0);
         assert_eq!(quality.resolved_relations, 0);
@@ -915,9 +964,40 @@ mod tests {
                 assert_eq!(loc.file_path, "app/core/service.py");
                 assert_eq!(loc.start_line, 42);
                 assert_eq!(loc.start_column, 4);
-                assert_eq!(v.severity, "high_risk", "una violazione attiva è alto rischio");
+                assert_eq!(
+                    v.severity, "high_risk",
+                    "una violazione attiva è alto rischio"
+                );
             }
             other => panic!("atteso un evento Violation, ricevuto {other:?}"),
         }
+    }
+
+    /// Il cuore di onestà del ponte di indicizzazione (P0): solo un aggiornamento
+    /// *osservato* autorizza a dichiarare successo. Un fallimento o un esito non
+    /// confermato DEVONO diventare errori gRPC — mai un falso «completata con
+    /// successo». Questo blinda il bug in cui la CLI stampava il successo mentre il
+    /// GraphActor aveva fallito (o il server era andato in timeout «tornando
+    /// comunque»).
+    #[test]
+    fn ensure_graph_updated_only_blesses_an_observed_update() {
+        // Updated → successo onesto.
+        assert!(ensure_graph_updated(GraphWaitOutcome::Updated, "Op").is_ok());
+
+        // Failed → errore interno, con la causa propagata.
+        let err = ensure_graph_updated(
+            GraphWaitOutcome::Failed("persistenza ko".to_string()),
+            "IndexProject",
+        )
+        .expect_err("un fallimento del grafo non deve diventare successo");
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("persistenza ko"));
+        assert!(err.message().contains("IndexProject"));
+
+        // Unconfirmed (timeout o bus chiuso) → deadline_exceeded, mai successo.
+        let err = ensure_graph_updated(GraphWaitOutcome::Unconfirmed, "IndexFiles")
+            .expect_err("un esito non confermato non deve diventare successo");
+        assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
+        assert!(err.message().contains("IndexFiles"));
     }
 }

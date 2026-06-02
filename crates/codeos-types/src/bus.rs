@@ -104,6 +104,15 @@ pub enum CodeOsEvent {
     FilesIndexed { results: Vec<ParsedFileResult> },
     /// Il grafo è stato aggiornato con un delta.
     GraphUpdated { delta: GraphDelta },
+    /// L'aggiornamento del grafo è **fallito**: il `GraphActor` ha ricevuto i
+    /// risultati del parser ma resolution o persistenza hanno dato errore, quindi
+    /// il grafo NON riflette i file appena analizzati.
+    ///
+    /// Filosofia (P0, «un arco mancante è preferibile a uno che mente»): un esito
+    /// negativo dev'essere *dichiarato*, non silenziato. Chi attende l'aggiornamento
+    /// (i ponti gRPC IndexProject/IndexFiles) lo intercetta e restituisce un errore
+    /// onesto al chiamante invece di un falso «completato con successo».
+    GraphUpdateFailed { reason: String },
     /// Il Guardian ha rilevato una violazione architetturale.
     ArchitectureViolationDetected { violation: ArchitectureViolation },
     /// Progresso reale dell'indicizzazione (P5-18)

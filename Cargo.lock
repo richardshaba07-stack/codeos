@@ -273,6 +273,7 @@ name = "codeos-graph"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "codeos-parser",
  "codeos-storage",
  "codeos-types",

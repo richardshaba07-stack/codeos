@@ -15,6 +15,7 @@ anyhow = { workspace = true }
 [dev-dependencies]
 codeos-parser = { workspace = true }
 criterion = { workspace = true }
+async-trait = { workspace = true }
 
 [[bench]]
 name = "resolve"
