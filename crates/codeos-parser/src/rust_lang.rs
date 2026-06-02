@@ -322,7 +322,7 @@ impl<'src> FileWalk<'src> {
             return;
         };
         let target = clean_call_target(&self.text(func));
-        if target.is_empty() || is_noise_call(&target) {
+        if is_noise_call(&target) || !is_clean_call_path(&target) {
             return;
         }
         self.relations.push(ParsedRelation {
@@ -446,6 +446,25 @@ fn clean_call_target(raw: &str) -> String {
         .trim()
         .trim_end_matches('!')
         .to_string()
+}
+
+/// `true` se il target di una call è un *path pulito*: identificatori separati da
+/// `.` o `::`, senza sintassi d'espressione (parentesi, argomenti, stringhe, `?`,
+/// closure…).
+///
+/// Tree-sitter espone come campo `function` l'intera testa della catena: per
+/// `a.b().c()` il callee esterno è `a.b().c`, che ingloba la sub-call `a.b()`.
+/// Registrarlo creerebbe un arco *bugiardo* verso un simbolo inesistente. Le
+/// sub-call significative (`a.b`) vengono comunque catturate dalla ricorsione di
+/// `walk_children`, quindi qui scartiamo soltanto il guscio non risolvibile.
+fn is_clean_call_path(target: &str) -> bool {
+    if target.is_empty() {
+        return false;
+    }
+    let chars_ok = target
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == ':');
+    chars_ok && !target.starts_with('.') && !target.ends_with('.') && !target.ends_with(':')
 }
 
 fn expand_use_targets(raw: &str) -> Vec<String> {
@@ -608,7 +627,9 @@ fn run() {
             .map(|r| r.target_qualified_name.as_str())
             .collect();
         assert!(
-            !calls.iter().any(|c| matches!(*c, "vec" | "assert_eq" | "println")),
+            !calls
+                .iter()
+                .any(|c| matches!(*c, "vec" | "assert_eq" | "println")),
             "le macro di rumore non devono comparire fra le call: {calls:?}"
         );
         assert!(
@@ -664,5 +685,53 @@ fn run() -> Result<i32, String> {
             targets.contains(&"std::sync::Mutex".to_string()),
             "targets = {targets:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn chained_calls_do_not_record_garbage_targets() {
+        // Tree-sitter dà come callee esterno l'intera catena (`build().unwrap`):
+        // senza ripulitura finirebbe nel grafo come arco bugiardo. Vogliamo che
+        // resti solo la sub-call pulita, catturata dalla ricorsione.
+        let src = r#"
+fn run() {
+    let s = build().unwrap();
+    items.iter().map(|x| x.id).collect();
+    self.storage.query_relations();
+}
+"#;
+        let result = parse(src).await;
+        let calls: Vec<&str> = result
+            .relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .map(|r| r.target_qualified_name.as_str())
+            .collect();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains('(') || c.contains(')') || c.contains('\'')),
+            "nessun target deve contenere sintassi d'espressione: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"build"),
+            "la sub-call pulita deve restare: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"self.storage.query_relations"),
+            "il method-call con path pulito deve restare: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn is_clean_call_path_rejects_expressions() {
+        assert!(is_clean_call_path("foo"));
+        assert!(is_clean_call_path("a.b.c"));
+        assert!(is_clean_call_path("Foo::bar"));
+        assert!(is_clean_call_path("self.storage.query_relations"));
+        assert!(!is_clean_call_path("SqliteStorage::in_memory().unwrap"));
+        assert!(!is_clean_call_path("items.iter().map"));
+        assert!(!is_clean_call_path("raw.split('"));
+        assert!(!is_clean_call_path(""));
+        assert!(!is_clean_call_path("foo."));
     }
 }
