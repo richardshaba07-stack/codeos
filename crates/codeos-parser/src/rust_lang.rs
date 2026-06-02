@@ -80,6 +80,7 @@ impl LanguageParser for RustParser {
         let scope = Scope {
             local_id: module_id,
             kind: EntityKind::Module,
+            impl_trait: None,
         };
         walk.walk_children(root, &scope);
 
@@ -96,6 +97,10 @@ impl LanguageParser for RustParser {
 struct Scope {
     local_id: String,
     kind: EntityKind,
+    /// Se lo scope è il corpo di un `impl Trait for Tipo`, il testo del trait
+    /// (con i generici, es. `From<u64>`); altrimenti `None`. Serve a disambiguare
+    /// i nomi degli item — vedi `scoped_name`.
+    impl_trait: Option<String>,
 }
 
 struct FileWalk<'src> {
@@ -210,6 +215,7 @@ impl<'src> FileWalk<'src> {
         let child_scope = Scope {
             local_id: id,
             kind: EntityKind::Module,
+            impl_trait: None,
         };
         self.walk_children(node, &child_scope);
     }
@@ -234,7 +240,11 @@ impl<'src> FileWalk<'src> {
             });
             id
         };
-        let child_scope = Scope { local_id: id, kind };
+        let child_scope = Scope {
+            local_id: id,
+            kind,
+            impl_trait: None,
+        };
         self.walk_children(node, &child_scope);
     }
 
@@ -244,9 +254,20 @@ impl<'src> FileWalk<'src> {
             return;
         };
         let id = self.ensure_type_entity(&type_name, node, scope);
+        // In un `impl Trait for Tipo`, trait diversi — o lo stesso trait con
+        // generici diversi — producono item omonimi: `Display::fmt` e `Debug::fmt`,
+        // oppure `From<u64>::from` e `From<&str>::from`. Senza il trait nel
+        // `qualified_name` questi collidono sul vincolo UNIQUE e l'INSERT fa
+        // abortire l'intero indice. Usiamo il testo completo del trait (con i
+        // generici) come disambiguatore: l'equivalente di `<Tipo as Trait>::item`.
+        let impl_trait = self
+            .field_text(node, "trait")
+            .map(|t| t.split_whitespace().collect::<String>())
+            .filter(|t| !t.is_empty());
         let child_scope = Scope {
             local_id: id,
             kind: EntityKind::Struct,
+            impl_trait,
         };
         self.walk_children(node, &child_scope);
     }
@@ -298,12 +319,16 @@ impl<'src> FileWalk<'src> {
         self.entities.push(ParsedEntity {
             local_id: id.clone(),
             kind,
-            name,
+            name: scoped_name(scope, &name),
             parent_local_id: Some(scope.local_id.clone()),
             location: self.loc(node),
             metadata: rust_metadata(None, None),
         });
-        let child_scope = Scope { local_id: id, kind };
+        let child_scope = Scope {
+            local_id: id,
+            kind,
+            impl_trait: None,
+        };
         self.walk_children(node, &child_scope);
     }
 
@@ -369,6 +394,17 @@ fn rust_metadata(extra_key: Option<&str>, extra_val: Option<&str>) -> HashMap<St
         out.insert(k.to_string(), v.to_string());
     }
     out
+}
+
+/// Disambigua il nome di un item dichiarato nel corpo di un `impl Trait for Tipo`:
+/// antepone il trait (`fmt` → `Display::fmt`), così item omonimi provenienti da
+/// impl di trait diversi non collidono nel `qualified_name`. Negli altri scope
+/// (modulo, `impl` inerente) restituisce il nome invariato.
+fn scoped_name(scope: &Scope, raw: &str) -> String {
+    match &scope.impl_trait {
+        Some(trait_name) => format!("{trait_name}::{raw}"),
+        None => raw.to_string(),
+    }
 }
 
 fn bare_type_name(raw: &str) -> Option<String> {
@@ -629,6 +665,80 @@ fn helper() {}
             .map(|r| r.target_qualified_name.as_str())
             .collect();
         assert!(calls.contains(&"helper"), "calls = {calls:?}");
+    }
+
+    /// Regressione: in semver `display.rs` lo stesso tipo implementa sia `Display`
+    /// sia `Debug`, e `impls.rs` ha più `impl From<…>` — tutti con metodi omonimi
+    /// (`fmt`, `from`). Senza il trait nel nome questi item collidono sul vincolo
+    /// `UNIQUE(qualified_name)` e l'INSERT fa abortire l'intero indice (misurato
+    /// sul crate reale: 8 file letti, 0 entità salvate). Il trait nel nome
+    /// — l'equivalente di `<Tipo as Trait>::item` — li tiene distinti.
+    #[tokio::test]
+    async fn trait_impl_methods_are_disambiguated_by_trait() {
+        const SRC: &str = r#"
+pub struct Version;
+
+impl Version {
+    pub fn parse() {}
+}
+
+impl Display for Version {
+    fn fmt(&self) {}
+}
+
+impl Debug for Version {
+    fn fmt(&self) {}
+}
+
+impl From<u64> for Version {
+    fn from(_v: u64) {}
+}
+
+impl From<&str> for Version {
+    fn from(_v: &str) {}
+}
+"#;
+        let result = parse(SRC).await;
+
+        // Il metodo inerente resta col nome nudo (caso comune: nessuna regressione).
+        assert_eq!(find(&result, "parse").kind, EntityKind::Method);
+
+        // I quattro item da impl di trait hanno nomi distinti ⇒ niente collisione.
+        for name in [
+            "Display::fmt",
+            "Debug::fmt",
+            "From<u64>::from",
+            "From<&str>::from",
+        ] {
+            assert_eq!(
+                find(&result, name).kind,
+                EntityKind::Method,
+                "atteso un metodo disambiguato '{name}'"
+            );
+        }
+
+        // Nessun item conserva il nome nudo che collideva.
+        let bare: Vec<&str> = result
+            .entities
+            .iter()
+            .map(|e| e.name.as_str())
+            .filter(|n| *n == "fmt" || *n == "from")
+            .collect();
+        assert!(
+            bare.is_empty(),
+            "nomi nudi collidenti ancora presenti: {bare:?}"
+        );
+
+        // Tutti restano sotto l'unico tipo `Version`: il tipo non è frammentato,
+        // a disambiguare è solo il nome del metodo.
+        let version = find(&result, "Version");
+        for name in ["parse", "Display::fmt", "Debug::fmt"] {
+            assert_eq!(
+                find(&result, name).parent_local_id.as_deref(),
+                Some(version.local_id.as_str()),
+                "'{name}' dovrebbe stare sotto Version"
+            );
+        }
     }
 
     #[tokio::test]
