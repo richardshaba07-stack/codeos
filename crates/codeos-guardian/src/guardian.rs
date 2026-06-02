@@ -644,8 +644,18 @@ impl Guardian {
             }
         }
 
-        let safe_path = if target_entities.is_empty() {
-            "Nessun modulo a rischio rilevato. Procedi con cautela.".to_string()
+        // `target_entities` vuoto NON vuol dire «modifica sicura»: vuol dire che
+        // non siamo riusciti a localizzare il goal nel grafo (nessun simbolo
+        // corrispondente, oppure solo parole troppo generiche, scartate perché
+        // matchavano mezzo grafo). Dirlo a voce alta è meglio di un blast radius 0
+        // rassicurante che mente — un arco mancante è meglio di uno che inganna.
+        let unlocalized = target_entities.is_empty();
+        let safe_path = if unlocalized {
+            "Goal non localizzato: nessun simbolo corrispondente nel grafo \
+             (o solo parole troppo generiche, scartate). Blast radius 0 qui NON \
+             significa «modifica sicura», significa «non lo so». Riprova nominando \
+             un modulo o una funzione specifici."
+                .to_string()
         } else {
             format!(
                 "Per modificare i file in sicurezza, mantieni separati i layer: {}",
@@ -657,6 +667,14 @@ impl Guardian {
             "# AI Architecture Firewall - Guard Before\n\n**Goal:** \"{}\"\n\n",
             goal
         );
+        if unlocalized {
+            context_pack.push_str(
+                "> ⚠️ **Goal non localizzato**: nessun simbolo nel grafo corrisponde \
+                 a questo goal (o le parole erano troppo generiche e sono state \
+                 scartate). Blast radius 0 qui significa «non lo so», non «modifica \
+                 sicura». Rinomina il goal con un modulo o una funzione concreti.\n\n",
+            );
+        }
         context_pack.push_str("## Target Files a rischio:\n");
         for f in &target_files {
             context_pack.push_str(&format!("- {}\n", f));
@@ -2120,6 +2138,20 @@ mod tests {
             vague.blast_radius, 0,
             "una keyword che matcha l'intero grafo non deve produrre impatto (blast={})",
             vague.blast_radius
+        );
+
+        // …e blast radius 0 senza bersaglio NON deve mai presentarsi come
+        // «modifica sicura»: dev'essere un onesto «non lo so». La vecchia frase
+        // rassicurante era una falsa sicurezza.
+        assert!(
+            !vague.safe_path.contains("Nessun modulo a rischio"),
+            "il vecchio messaggio rassicurante non deve più comparire: {}",
+            vague.safe_path
+        );
+        assert!(
+            vague.safe_path.contains("non lo so"),
+            "un goal non localizzato deve ammettere l'incertezza, non rassicurare: {}",
+            vague.safe_path
         );
     }
 }
