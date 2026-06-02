@@ -1106,51 +1106,78 @@ impl Guardian {
         let upstream = parts.first().unwrap_or(&"").trim().to_string();
         let downstream = parts.get(1).unwrap_or(&"").trim().to_string();
 
-        let fossils = self.fossils().await.unwrap_or_default();
-        let matching_fossil = fossils.into_iter().find(|f| {
-            (f.upstream == upstream && f.downstream == downstream)
-                || (f.upstream == downstream && f.downstream == upstream)
-        });
+        // Spiegare un confine richiede DUE estremi. Senza, non c'è una relazione da
+        // raccontare: niente fossili, niente decisioni. Col matching per sottostringa
+        // un estremo vuoto è veleno — `contains("")` è sempre vero, quindi `why "foo"`
+        // (senza separatore) trascinava dentro OGNI decisione con un tag qualsiasi.
+        // Meglio chiedere l'input giusto che mentire con "decisioni correlate" inventate.
+        let well_formed = !upstream.is_empty() && !downstream.is_empty();
 
         let mut born_commit = String::new();
         let mut born_date = String::new();
         let mut intent = String::new();
         let mut co_changed_files = Vec::new();
         let mut history_insufficient = false;
-
-        if let Some(f) = matching_fossil {
-            born_commit = f.born_at.clone();
-            born_date = chrono::DateTime::from_timestamp(f.born_at_unix, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_default();
-            intent = f.intent.clone();
-            co_changed_files = f.born_structure.clone();
-            history_insufficient = self.check_history_adequacy(&[f]).await.unwrap_or(false);
-        }
-
+        let mut fossil_found = false;
         let mut markdown_decisions = Vec::new();
-        if let Some(store) = &self.decisions {
-            if let Ok(all_decisions) = store.all().await {
-                for dec in all_decisions {
-                    if (dec.title.contains(&upstream) && dec.title.contains(&downstream))
-                        || dec
-                            .tags
-                            .iter()
-                            .any(|t| t.contains(&upstream) || t.contains(&downstream))
-                    {
-                        markdown_decisions.push(format!(
-                            "### {}\n\n**Autore:** {}\n\n**Razionale:** {}\n\n**Contesto:** {}",
-                            dec.title, dec.author, dec.rationale, dec.context
-                        ));
+
+        if well_formed {
+            let fossils = self.fossils().await.unwrap_or_default();
+            let matching_fossil = fossils.into_iter().find(|f| {
+                (f.upstream == upstream && f.downstream == downstream)
+                    || (f.upstream == downstream && f.downstream == upstream)
+            });
+
+            if let Some(f) = matching_fossil {
+                fossil_found = true;
+                born_commit = f.born_at.clone();
+                born_date = chrono::DateTime::from_timestamp(f.born_at_unix, 0)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_default();
+                intent = f.intent.clone();
+                co_changed_files = f.born_structure.clone();
+                history_insufficient = self.check_history_adequacy(&[f]).await.unwrap_or(false);
+            }
+
+            if let Some(store) = &self.decisions {
+                if let Ok(all_decisions) = store.all().await {
+                    for dec in all_decisions {
+                        if (dec.title.contains(&upstream) && dec.title.contains(&downstream))
+                            || dec
+                                .tags
+                                .iter()
+                                .any(|t| t.contains(&upstream) || t.contains(&downstream))
+                        {
+                            markdown_decisions.push(format!(
+                                "### {}\n\n**Autore:** {}\n\n**Razionale:** {}\n\n**Contesto:** {}",
+                                dec.title, dec.author, dec.rationale, dec.context
+                            ));
+                        }
                     }
                 }
             }
         }
 
-        let explanation = format!(
-            "Il confine architetturale tra '{}' e '{}' è nato nel commit {} in data {}.",
-            upstream, downstream, born_commit, born_date
-        );
+        // L'explanation non deve MAI affermare una nascita che non abbiamo trovato.
+        // Senza fossile il vecchio codice stampava "è nato nel commit  in data ."
+        // (campi vuoti): un confine inventato. Ora i tre casi sono distinti.
+        let explanation = if !well_formed {
+            "Per spiegare un confine servono due estremi: usa why \"a|b\" (oppure \
+             \"a->b\"). Con un solo nome non c'è una relazione da raccontare."
+                .to_string()
+        } else if fossil_found {
+            format!(
+                "Il confine architetturale tra '{}' e '{}' è nato nel commit {} in data {}.",
+                upstream, downstream, born_commit, born_date
+            )
+        } else {
+            format!(
+                "Nessun confine registrato tra '{}' e '{}': non risulta un fossile \
+                 nella storia analizzata. Non lo invento — un confine assente è meglio \
+                 di uno inventato.",
+                upstream, downstream
+            )
+        };
 
         Ok(codeos_types::bus::WhyResponse {
             born_commit,
@@ -2152,6 +2179,82 @@ mod tests {
             vague.safe_path.contains("non lo so"),
             "un goal non localizzato deve ammettere l'incertezza, non rassicurare: {}",
             vague.safe_path
+        );
+    }
+
+    #[tokio::test]
+    async fn why_does_not_invent_a_boundary_that_was_never_born() {
+        // Senza storia non c'è alcun fossile: il confine 'alpha|beta' non è mai
+        // "nato". Il vecchio codice stampava comunque "è nato nel commit  in data ."
+        // con i campi vuoti — un confine inventato. Ora lo ammette.
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let guardian = Guardian::new(storage);
+
+        let resp = guardian.why("alpha|beta").await.unwrap();
+
+        assert!(
+            resp.born_commit.is_empty(),
+            "nessun fossile: born_commit deve restare vuoto, era {:?}",
+            resp.born_commit
+        );
+        assert!(
+            !resp.explanation.contains("è nato nel commit"),
+            "non si afferma una nascita che non esiste: {}",
+            resp.explanation
+        );
+        assert!(
+            resp.explanation.contains("non risulta"),
+            "un confine assente va dichiarato assente, non inventato: {}",
+            resp.explanation
+        );
+    }
+
+    #[tokio::test]
+    async fn why_with_a_single_name_does_not_flood_unrelated_decisions() {
+        use codeos_memory::{Decision, DecisionKind, DecisionStore, InMemoryDecisionStore};
+
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let store = Arc::new(InMemoryDecisionStore::new());
+        // Una decisione del tutto estranea a "foo": né il titolo né il tag lo contengono.
+        store
+            .record(&Decision {
+                id: EntityId::new(),
+                kind: DecisionKind::Decision,
+                author: "human:Marco".to_string(),
+                title: "Adottare l'architettura esagonale".to_string(),
+                context: String::new(),
+                rationale: "isolare il dominio".to_string(),
+                related_entity_ids: vec![],
+                related_decision_ids: vec![],
+                tags: vec!["payments".to_string()],
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        let guardian = Guardian::with_memory(storage, store);
+
+        // Un solo nome → downstream vuoto. Col vecchio `contains("")` questa
+        // decisione (e ogni altra con un tag qualsiasi) finiva fra le "correlate".
+        let single = guardian.why("foo").await.unwrap();
+        assert!(
+            single.markdown_decisions.is_empty(),
+            "un solo nome non deve agganciare decisioni estranee: {:?}",
+            single.markdown_decisions
+        );
+        assert!(
+            single.explanation.contains("due estremi"),
+            "con un solo nome why deve chiedere l'espressione 'a|b': {}",
+            single.explanation
+        );
+
+        // Espressione ben formata: il tag che combacia continua a far emergere la
+        // decisione — il filtro più severo non spegne i match legittimi.
+        let paired = guardian.why("payments|orders").await.unwrap();
+        assert_eq!(
+            paired.markdown_decisions.len(),
+            1,
+            "un estremo che combacia col tag deve ancora trovare la decisione: {:?}",
+            paired.markdown_decisions
         );
     }
 }
