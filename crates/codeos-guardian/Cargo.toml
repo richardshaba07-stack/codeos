@@ -13,3 +13,4 @@ codeos-paleo = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+chrono = { workspace = true }

@@ -224,7 +224,13 @@ async fn dispatch_loop(mut commands: mpsc::Receiver<Command>, routes: Routes) {
             | Command::RemoveFiles { .. } => (&routes.parser, "parser"),
             Command::QueryGraph { .. } => (&routes.query, "query"),
             Command::RecordDecision { .. } => (&routes.memory, "memory"),
-            Command::ArchitectureReport { .. } => (&routes.guardian, "guardian"),
+            Command::ArchitectureReport { .. }
+            | Command::GuardBefore { .. }
+            | Command::GuardAfter { .. }
+            | Command::GetContextPack { .. }
+            | Command::PrMri { .. }
+            | Command::Why { .. }
+            | Command::Simulate { .. } => (&routes.guardian, "guardian"),
         };
 
         if let Err(err) = target.send(command).await {

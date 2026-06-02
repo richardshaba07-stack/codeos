@@ -59,7 +59,15 @@ export type CodeOsEvent =
       addedRelations: number;
       removedRelations: number;
     }
-  | { type: 'violation'; violation: ViolationEvent };
+  | { type: 'violation'; violation: ViolationEvent }
+  | {
+      type: 'indexProgress';
+      totalFiles: number;
+      processedFiles: number;
+      currentFile: string;
+      skippedFiles: number;
+      parseErrors: number;
+    };
 
 export interface RecordDecisionInput {
   author: string;
@@ -109,6 +117,61 @@ export interface ArchitectureReport {
   invariants: LayeringInvariant[];
   fossils: DecisionFossil[];
   gaps: ArchitecturalGap[];
+}
+
+export interface GuardBeforeResponse {
+  targetFiles: string[];
+  boundaries: string[];
+  blastRadius: number;
+  safePath: string;
+  contextPack: string;
+}
+
+export interface GuardAfterResponse {
+  newRelations: string[];
+  violations: ViolationEvent[];
+  proposedFixes: string[];
+}
+
+export interface GetContextPackResponse {
+  goalInterpretation: string;
+  filesToRead: string[];
+  relevantEntities: string[];
+  keyDependencies: string[];
+  boundariesToPreserve: string[];
+  localPatterns: string[];
+  suggestedTests: string[];
+  estimatedRisk: string;
+  formattedMarkdown: string;
+}
+
+export interface PrMriResponse {
+  newDependencies: string[];
+  violatedBoundaries: string[];
+  blastRadiusChange: number;
+  historicalHotspots: string[];
+  newExternalDependencies: string[];
+  impactedTests: string[];
+  riskScore: string;
+  summary: string;
+}
+
+export interface SimulateResponse {
+  dependenciesToRewrite: string[];
+  changedBoundaries: string[];
+  risks: string[];
+  suggestedTests: string[];
+  recommendationPlan: string[];
+}
+
+export interface WhyResponse {
+  bornCommit: string;
+  bornDate: string;
+  intent: string;
+  coChangedFiles: string[];
+  markdownDecisions: string[];
+  explanation: string;
+  historyInsufficient: boolean;
 }
 
 interface WatchHandlers {
@@ -173,6 +236,30 @@ export class CodeOsClient {
     };
   }
 
+  guardBefore(goal: string): Promise<GuardBeforeResponse> {
+    return this.unary<GuardBeforeResponse>('GuardBefore', { goal });
+  }
+
+  guardAfter(): Promise<GuardAfterResponse> {
+    return this.unary<GuardAfterResponse>('GuardAfter', {});
+  }
+
+  getContextPack(goal: string, forAi: boolean): Promise<GetContextPackResponse> {
+    return this.unary<GetContextPackResponse>('GetContextPack', { goal, forAi });
+  }
+
+  prMri(base: string, head: string): Promise<PrMriResponse> {
+    return this.unary<PrMriResponse>('PrMri', { base, head });
+  }
+
+  simulate(expr: string): Promise<SimulateResponse> {
+    return this.unary<SimulateResponse>('Simulate', { expr });
+  }
+
+  why(expr: string): Promise<WhyResponse> {
+    return this.unary<WhyResponse>('Why', { expr });
+  }
+
   /** Apre lo stream server `WatchEvents`. Restituisce una funzione per chiuderlo. */
   watchEvents(handlers: WatchHandlers): () => void {
     const stream: grpc.ClientReadableStream<any> = this.client.WatchEvents({});
@@ -219,6 +306,15 @@ function decodeEvent(msg: any): CodeOsEvent | undefined {
       };
     case 'violation':
       return { type: 'violation', violation: msg.violation as ViolationEvent };
+    case 'indexProgress':
+      return {
+        type: 'indexProgress',
+        totalFiles: Number(msg.indexProgress?.totalFiles ?? 0),
+        processedFiles: Number(msg.indexProgress?.processedFiles ?? 0),
+        currentFile: String(msg.indexProgress?.currentFile ?? ''),
+        skippedFiles: Number(msg.indexProgress?.skippedFiles ?? 0),
+        parseErrors: Number(msg.indexProgress?.parseErrors ?? 0),
+      };
     default:
       return undefined;
   }

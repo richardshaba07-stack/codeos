@@ -80,6 +80,179 @@ async fn main() -> anyhow::Result<()> {
         "doctor" => {
             run_doctor().await;
         }
+        "guard" => {
+            let mut client = connect_server().await?;
+            if args.len() < 3 {
+                eprintln!("Errore: usa `--before \"goal\"` o `--after`.");
+                std::process::exit(1);
+            }
+            if args[2] == "--before" {
+                if args.len() < 4 {
+                    eprintln!("Errore: specifica il goal dopo `--before`.");
+                    std::process::exit(1);
+                }
+                let goal = &args[3];
+                let req = proto::GuardBeforeRequest { goal: goal.clone() };
+                let res = client.guard_before(req).await?.into_inner();
+                println!("🛡️  FIREWALL ARCHITETTURALE - GUARD BEFORE");
+                println!("------------------------------------------");
+                println!("🎯 Goal: \"{}\"", goal);
+                println!("📊 Raggio d'impatto (Blast Radius): {} entità", res.blast_radius);
+                println!("🛣️  Percorso sicuro consigliato: {}", res.safe_path);
+                println!("\n📂 File target a rischio:");
+                for f in &res.target_files {
+                    println!("  • {}", f);
+                }
+                println!("\n🧱 Confini da preservare:");
+                for b in &res.boundaries {
+                    println!("  • {}", b);
+                }
+            } else if args[2] == "--after" {
+                let req = proto::GuardAfterRequest {};
+                let res = client.guard_after(req).await?.into_inner();
+                println!("🛡️  FIREWALL ARCHITETTURALE - GUARD AFTER");
+                println!("-----------------------------------------");
+                if res.violations.is_empty() {
+                    println!("✅ Nessuna violazione architetturale rilevata! Ottimo lavoro.");
+                } else {
+                    println!("🔴 Rilevate {} violazioni architetturali!", res.violations.len());
+                    for vio in &res.violations {
+                        let loc_str = if let Some(loc) = &vio.location {
+                            format!("{}:{}", loc.file_path, loc.start_line)
+                        } else {
+                            "posizione sconosciuta".to_string()
+                        };
+                        println!("  • [{}] {}", loc_str, vio.message);
+                    }
+                    println!("\n🔧 Correzioni proposte:");
+                    for fix in &res.proposed_fixes {
+                        println!("  • {}", fix);
+                    }
+                }
+            } else {
+                eprintln!("Errore: flag '{}' sconosciuto. Usa `--before` o `--after`.", args[2]);
+                std::process::exit(1);
+            }
+        }
+        "context" => {
+            if args.len() < 3 {
+                eprintln!("Errore: specifica il goal.");
+                eprintln!("Uso: codeos context \"goal\" [--for ai]");
+                std::process::exit(1);
+            }
+            let goal = &args[2];
+            let for_ai = args.iter().any(|arg| arg == "--for" || arg == "ai" || arg == "--for=ai");
+            let mut client = connect_server().await?;
+            let req = proto::GetContextPackRequest {
+                goal: goal.clone(),
+                for_ai,
+            };
+            let res = client.get_context_pack(req).await?.into_inner();
+            println!("{}", res.formatted_markdown);
+        }
+        "mri" => {
+            let mut base = "main".to_string();
+            let mut head = "HEAD".to_string();
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "--base" && i + 1 < args.len() {
+                    base = args[i + 1].clone();
+                    i += 2;
+                } else if args[i] == "--head" && i + 1 < args.len() {
+                    head = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            let mut client = connect_server().await?;
+            let req = proto::PrMriRequest { base, head };
+            let res = client.pr_mri(req).await?.into_inner();
+            println!("🩺 PR ARCHITECTURE MRI REPORT");
+            println!("-----------------------------");
+            println!("📋 Sintesi: {}", res.summary);
+            println!("📈 Variazione Blast Radius: {}", res.blast_radius_change);
+            println!("⚠️  Livello di rischio: {}", res.risk_score.to_uppercase());
+            println!("\n🔍 Nuove dipendenze introdotte:");
+            for dep in &res.new_dependencies {
+                println!("  • {}", dep);
+            }
+            println!("\n🔴 Confini violati:");
+            for vio in &res.violated_boundaries {
+                println!("  • {}", vio);
+            }
+            println!("\n🔥 Hotspot storici toccati:");
+            for hot in &res.historical_hotspots {
+                println!("  • {}", hot);
+            }
+            println!("\n🔌 Nuove dipendenze esterne:");
+            for ext in &res.new_external_dependencies {
+                println!("  • {}", ext);
+            }
+            println!("\n🧪 Test influenzati:");
+            for t in &res.impacted_tests {
+                println!("  • {}", t);
+            }
+        }
+        "why" => {
+            if args.len() < 3 {
+                eprintln!("Errore: specifica l'espressione (es. 'modulo_a|modulo_b').");
+                std::process::exit(1);
+            }
+            let expr = &args[2];
+            let mut client = connect_server().await?;
+            let req = proto::WhyRequest { expr: expr.clone() };
+            let res = client.why(req).await?.into_inner();
+            println!("🕰️  TIME MACHINE ARCHITETTURALE - WHY");
+            println!("------------------------------------");
+            if res.history_insufficient {
+                println!("⚠️  BADGE WARNING: La storia Git del repository è insufficiente per tracciare i confini in modo affidabile!");
+            }
+            println!("💬 Spiegazione: {}", res.explanation);
+            println!("📅 Data di nascita: {}", res.born_date);
+            println!("🔑 Hash commit nascita: {}", res.born_commit);
+            println!("✍️  Intento originario: \"{}\"", res.intent);
+            println!("\n📂 File co-modificati alla nascita:");
+            for f in &res.co_changed_files {
+                println!("  • {}", f);
+            }
+            println!("\n📜 Decisioni correlate:");
+            for dec in &res.markdown_decisions {
+                println!("{}", dec);
+            }
+        }
+        "simulate" => {
+            if args.len() < 3 {
+                eprintln!("Errore: specifica l'espressione di refactoring (es. 'move A to B').");
+                std::process::exit(1);
+            }
+            let expr = &args[2];
+            let mut client = connect_server().await?;
+            let req = proto::SimulateRequest { expr: expr.clone() };
+            let res = client.simulate(req).await?.into_inner();
+            println!("🧪 WHAT-IF REFACTOR SIMULATOR");
+            println!("-----------------------------");
+            println!("🔄 Dipendenze da riscrivere/aggiornare:");
+            for dep in &res.dependencies_to_rewrite {
+                println!("  • {}", dep);
+            }
+            println!("\n🧱 Confini che cambieranno:");
+            for boundary in &res.changed_boundaries {
+                println!("  • {}", boundary);
+            }
+            println!("\n⚠️  Rischi identificati:");
+            for risk in &res.risks {
+                println!("  • {}", risk);
+            }
+            println!("\n🧪 Test raccomandati:");
+            for t in &res.suggested_tests {
+                println!("  • {}", t);
+            }
+            println!("\n📋 Piano d'azione consigliato:");
+            for step in &res.recommendation_plan {
+                println!("  {}", step);
+            }
+        }
         "help" | "--help" | "-h" => {
             print_usage();
         }

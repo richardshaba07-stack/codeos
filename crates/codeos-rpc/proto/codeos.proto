@@ -152,6 +152,7 @@ message GetArchitectureReportResponse {
   repeated ArchitecturalGap gaps = 3;
   // La misura di affidabilità del referto qui sopra.
   GraphQuality quality = 4;
+  bool history_insufficient = 5;
 }
 
 // ---------------------------------------------------------------------------
@@ -186,12 +187,102 @@ message ArchitectureViolationEvent {
   string severity = 7;
 }
 
+message IndexProgressEvent {
+  uint32 total_files = 1;
+  uint32 processed_files = 2;
+  string current_file = 3;
+  uint32 skipped_files = 4;
+  uint32 parse_errors = 5;
+}
+
 message EventMessage {
   oneof event {
     FilesIndexedEvent files_indexed = 1;
     GraphUpdatedEvent graph_updated = 2;
     ArchitectureViolationEvent violation = 3;
+    IndexProgressEvent index_progress = 4;
   }
+}
+
+// --- MESSAGGI DI SERVIZIO P3 ---
+
+message GuardBeforeRequest {
+  string goal = 1;
+}
+
+message GuardBeforeResponse {
+  repeated string target_files = 1;
+  repeated string boundaries = 2;
+  uint32 blast_radius = 3;
+  string safe_path = 4;
+  string context_pack = 5;
+}
+
+message GuardAfterRequest {}
+
+message GuardAfterResponse {
+  repeated string new_relations = 1;
+  repeated ArchitectureViolationEvent violations = 2;
+  repeated string proposed_fixes = 3;
+}
+
+message GetContextPackRequest {
+  string goal = 1;
+  bool for_ai = 2;
+}
+
+message GetContextPackResponse {
+  string goal_interpretation = 1;
+  repeated string files_to_read = 2;
+  repeated string relevant_entities = 3;
+  repeated string key_dependencies = 4;
+  repeated string boundaries_to_preserve = 5;
+  repeated string local_patterns = 6;
+  repeated string suggested_tests = 7;
+  string estimated_risk = 8;
+  string formatted_markdown = 9;
+}
+
+message PrMriRequest {
+  string base = 1;
+  string head = 2;
+}
+
+message PrMriResponse {
+  repeated string new_dependencies = 1;
+  repeated string violated_boundaries = 2;
+  int32 blast_radius_change = 3;
+  repeated string historical_hotspots = 4;
+  repeated string new_external_dependencies = 5;
+  repeated string impacted_tests = 6;
+  string risk_score = 7;
+  string summary = 8;
+}
+
+message SimulateRequest {
+  string expr = 1;
+}
+
+message SimulateResponse {
+  repeated string dependencies_to_rewrite = 1;
+  repeated string changed_boundaries = 2;
+  repeated string risks = 3;
+  repeated string suggested_tests = 4;
+  repeated string recommendation_plan = 5;
+}
+
+message WhyRequest {
+  string expr = 1;
+}
+
+message WhyResponse {
+  string born_commit = 1;
+  string born_date = 2;
+  string intent = 3;
+  repeated string co_changed_files = 4;
+  repeated string markdown_decisions = 5;
+  string explanation = 6;
+  bool history_insufficient = 7;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,4 +296,12 @@ service CodeOs {
   rpc IndexFiles(IndexFilesRequest) returns (IndexFilesResponse);
   rpc GetArchitectureReport(GetArchitectureReportRequest) returns (GetArchitectureReportResponse);
   rpc WatchEvents(WatchEventsRequest) returns (stream EventMessage);
+
+  // --- RPC P3 WOW FEATURES ---
+  rpc GuardBefore(GuardBeforeRequest) returns (GuardBeforeResponse);
+  rpc GuardAfter(GuardAfterRequest) returns (GuardAfterResponse);
+  rpc GetContextPack(GetContextPackRequest) returns (GetContextPackResponse);
+  rpc PrMri(PrMriRequest) returns (PrMriResponse);
+  rpc Simulate(SimulateRequest) returns (SimulateResponse);
+  rpc Why(WhyRequest) returns (WhyResponse);
 }

@@ -56,6 +56,37 @@ pub enum Command {
     ArchitectureReport {
         reply_to: mpsc::Sender<anyhow::Result<ArchitectureReport>>,
     },
+    /// AI Architecture Firewall: pre-check prima delle modifiche
+    GuardBefore {
+        goal: String,
+        reply_to: mpsc::Sender<anyhow::Result<GuardBeforeResponse>>,
+    },
+    /// AI Architecture Firewall: post-check dopo le modifiche
+    GuardAfter {
+        reply_to: mpsc::Sender<anyhow::Result<GuardAfterResponse>>,
+    },
+    /// Genera un Context Pack mirato per un LLM/AI Agent
+    GetContextPack {
+        goal: String,
+        for_ai: bool,
+        reply_to: mpsc::Sender<anyhow::Result<GetContextPackResponse>>,
+    },
+    /// PR Architecture MRI: scansione impatto di una PR o commit diff
+    PrMri {
+        base: String,
+        head: String,
+        reply_to: mpsc::Sender<anyhow::Result<PrMriResponse>>,
+    },
+    /// Time machine architetturale: perché esiste un confine o regola
+    Why {
+        expr: String,
+        reply_to: mpsc::Sender<anyhow::Result<WhyResponse>>,
+    },
+    /// What-If Refactor Simulator: simula spostamenti/ristrutturazioni
+    Simulate {
+        expr: String,
+        reply_to: mpsc::Sender<anyhow::Result<SimulateResponse>>,
+    },
 }
 
 /// Evento pubblicato sull'event bus broadcast.
@@ -75,6 +106,14 @@ pub enum CodeOsEvent {
     GraphUpdated { delta: GraphDelta },
     /// Il Guardian ha rilevato una violazione architetturale.
     ArchitectureViolationDetected { violation: ArchitectureViolation },
+    /// Progresso reale dell'indicizzazione (P5-18)
+    IndexProgress {
+        total_files: u32,
+        processed_files: u32,
+        current_file: String,
+        skipped_files: u32,
+        parse_errors: u32,
+    },
 }
 
 /// Richiesta di interrogazione del grafo / costruzione del contesto.
@@ -132,6 +171,8 @@ pub struct ArchitectureReport {
     /// dato di partenza (roadmap P2-7). Non è un asse dello spazio negativo, è la
     /// sua misura di affidabilità.
     pub quality: GraphQualityInfo,
+    /// true se la storia git è insufficiente per tracciare i confini in modo affidabile (P2-8).
+    pub history_insufficient: bool,
 }
 
 /// La **qualità del grafo**: la misura di quanta fiducia merita il referto.
@@ -350,4 +391,65 @@ pub struct ArchitectureViolation {
     pub location: Option<SourceLocation>,
     /// Gravità della violazione. Una violazione attiva è sempre alto rischio.
     pub severity: Severity,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GuardBeforeResponse {
+    pub target_files: Vec<String>,
+    pub boundaries: Vec<String>,
+    pub blast_radius: u32,
+    pub safe_path: String,
+    pub context_pack: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GuardAfterResponse {
+    pub new_relations: Vec<String>,
+    pub violations: Vec<ArchitectureViolation>,
+    pub proposed_fixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GetContextPackResponse {
+    pub goal_interpretation: String,
+    pub files_to_read: Vec<String>,
+    pub relevant_entities: Vec<String>,
+    pub key_dependencies: Vec<String>,
+    pub boundaries_to_preserve: Vec<String>,
+    pub local_patterns: Vec<String>,
+    pub suggested_tests: Vec<String>,
+    pub estimated_risk: String,
+    pub formatted_markdown: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PrMriResponse {
+    pub new_dependencies: Vec<String>,
+    pub violated_boundaries: Vec<String>,
+    pub blast_radius_change: i32,
+    pub historical_hotspots: Vec<String>,
+    pub new_external_dependencies: Vec<String>,
+    pub impacted_tests: Vec<String>,
+    pub risk_score: String, // "low", "medium", "high"
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WhyResponse {
+    pub born_commit: String,
+    pub born_date: String,
+    pub intent: String,
+    pub co_changed_files: Vec<String>,
+    pub markdown_decisions: Vec<String>,
+    pub explanation: String,
+    pub history_insufficient: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SimulateResponse {
+    pub dependencies_to_rewrite: Vec<String>,
+    pub changed_boundaries: Vec<String>,
+    pub risks: Vec<String>,
+    pub suggested_tests: Vec<String>,
+    pub recommendation_plan: Vec<String>,
 }

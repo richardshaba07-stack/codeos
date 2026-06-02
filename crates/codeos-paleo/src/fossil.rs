@@ -94,6 +94,55 @@ pub fn excavate(
     })
 }
 
+impl DecisionFossil {
+    /// Rende relativi i path di `born_structure` rimuovendo il prefisso specificato.
+    pub fn make_paths_relative(&mut self, prefix: &str) {
+        for file in &mut self.born_structure {
+            if let Some(stripped) = file.strip_prefix(prefix) {
+                *file = stripped.to_string();
+            }
+        }
+    }
+}
+
+/// Rileva se la storia del repository è insufficiente per tracciare i confini in modo affidabile.
+///
+/// La classificazione risponde a tre euristiche della roadmap P2-8:
+/// 1. La storia ha pochissimi commit utili (meno di 3).
+/// 2. Il commit di nascita tocca troppi file (es. initial commit massivo, con più di 30 file modificati).
+/// 3. Quasi tutti i confini (>= 80%, se ci sono almeno 2 confini) nascono nello stesso commit.
+pub fn is_history_insufficient(
+    commits: &[Commit],
+    fossils: &[DecisionFossil],
+) -> bool {
+    let useful_commits = commits.iter().filter(|c| !c.changed_files.is_empty()).count();
+    if useful_commits < 3 {
+        return true;
+    }
+
+    for fossil in fossils {
+        if let Some(commit) = commits.iter().find(|c| c.hash == fossil.born_at) {
+            if commit.changed_files.len() > 30 {
+                return true;
+            }
+        }
+    }
+
+    if fossils.len() >= 2 {
+        let mut birth_counts = std::collections::HashMap::new();
+        for fossil in fossils {
+            *birth_counts.entry(&fossil.born_at).or_insert(0) += 1;
+        }
+        for &count in birth_counts.values() {
+            if count as f64 / fossils.len() as f64 >= 0.8 {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +227,117 @@ mod tests {
         let b = excavate("app::core", "app::api", &fl, &commits).unwrap();
         assert_eq!(a.born_at, b.born_at);
         assert_eq!(a.born_structure, b.born_structure);
+    }
+
+    #[test]
+    fn test_make_paths_relative() {
+        let mut fossil = DecisionFossil {
+            upstream: "up".to_string(),
+            downstream: "down".to_string(),
+            born_at: "hash".to_string(),
+            born_at_unix: 1234,
+            intent: "intent".to_string(),
+            born_structure: vec![
+                "/root/src/main.rs".to_string(),
+                "/root/src/lib.rs".to_string(),
+            ],
+        };
+        fossil.make_paths_relative("/root/");
+        assert_eq!(fossil.born_structure, vec!["src/main.rs", "src/lib.rs"]);
+    }
+
+    #[test]
+    fn test_is_history_insufficient() {
+        // 1. Pochi commit utili (meno di 3)
+        let commits = vec![
+            Commit::with_meta("c1", 100, "init", ["file1.rs"]),
+            Commit::with_meta("c2", 200, "work", ["file2.rs"]),
+        ];
+        let fossils = vec![
+            DecisionFossil {
+                upstream: "up".to_string(),
+                downstream: "down".to_string(),
+                born_at: "c1".to_string(),
+                born_at_unix: 100,
+                intent: "init".to_string(),
+                born_structure: vec!["file1.rs".to_string()],
+            }
+        ];
+        assert!(is_history_insufficient(&commits, &fossils));
+
+        // 2. Commit con troppi file (initial commit massivo > 30 file)
+        let mut mass_files = Vec::new();
+        for i in 0..35 {
+            mass_files.push(format!("file_{i}.rs"));
+        }
+        let commits_mass = vec![
+            Commit::with_meta("c1", 100, "mass init", mass_files),
+            Commit::with_meta("c2", 200, "work1", ["file_a.rs"]),
+            Commit::with_meta("c3", 300, "work2", ["file_b.rs"]),
+        ];
+        let fossils_mass = vec![
+            DecisionFossil {
+                upstream: "up".to_string(),
+                downstream: "down".to_string(),
+                born_at: "c1".to_string(),
+                born_at_unix: 100,
+                intent: "mass init".to_string(),
+                born_structure: vec!["file_1.rs".to_string()],
+            }
+        ];
+        assert!(is_history_insufficient(&commits_mass, &fossils_mass));
+
+        // 3. Quasi tutti i confini nascono nello stesso commit (>= 80%)
+        let commits_same = vec![
+            Commit::with_meta("c1", 100, "init", ["file1.rs", "file2.rs"]),
+            Commit::with_meta("c2", 200, "work", ["file3.rs"]),
+            Commit::with_meta("c3", 300, "work2", ["file4.rs"]),
+        ];
+        let fossils_same = vec![
+            DecisionFossil {
+                upstream: "a".to_string(),
+                downstream: "b".to_string(),
+                born_at: "c1".to_string(),
+                born_at_unix: 100,
+                intent: "init".to_string(),
+                born_structure: vec!["file1.rs".to_string()],
+            },
+            DecisionFossil {
+                upstream: "c".to_string(),
+                downstream: "d".to_string(),
+                born_at: "c1".to_string(),
+                born_at_unix: 100,
+                intent: "init".to_string(),
+                born_structure: vec!["file2.rs".to_string()],
+            },
+        ];
+        assert!(is_history_insufficient(&commits_same, &fossils_same));
+
+        // Caso sufficiente
+        let commits_ok = vec![
+            Commit::with_meta("c1", 100, "init", ["file1.rs"]),
+            Commit::with_meta("c2", 200, "work1", ["file2.rs"]),
+            Commit::with_meta("c3", 300, "work2", ["file3.rs"]),
+            Commit::with_meta("c4", 400, "work3", ["file4.rs"]),
+        ];
+        let fossils_ok = vec![
+            DecisionFossil {
+                upstream: "a".to_string(),
+                downstream: "b".to_string(),
+                born_at: "c2".to_string(),
+                born_at_unix: 200,
+                intent: "work1".to_string(),
+                born_structure: vec!["file2.rs".to_string()],
+            },
+            DecisionFossil {
+                upstream: "c".to_string(),
+                downstream: "d".to_string(),
+                born_at: "c3".to_string(),
+                born_at_unix: 300,
+                intent: "work2".to_string(),
+                born_structure: vec!["file3.rs".to_string()],
+            },
+        ];
+        assert!(!is_history_insufficient(&commits_ok, &fossils_ok));
     }
 }

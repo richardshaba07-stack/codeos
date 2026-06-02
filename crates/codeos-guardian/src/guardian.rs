@@ -234,6 +234,18 @@ impl Guardian {
             .iter()
             .filter_map(|rule| by_key.get(&rule_key(rule)).cloned())
             .collect();
+
+        // Relativizzazione dei path di born_structure (roadmap P2-8)
+        let relations = self
+            .storage
+            .query_relations(RelationFilter::default())
+            .await?;
+        let file_layers = self.build_file_layers(&relations).await?;
+        let common_prefix = find_common_prefix(file_layers.keys());
+        for f in &mut out {
+            f.make_paths_relative(&common_prefix);
+        }
+
         out.sort_by(|a, b| {
             a.born_at_unix
                 .cmp(&b.born_at_unix)
@@ -524,6 +536,562 @@ impl Guardian {
         }
         Ok(map)
     }
+
+    /// Rileva se la storia del repository è insufficiente per tracciare i confini in modo affidabile.
+    pub async fn check_history_adequacy(&self, fossils: &[DecisionFossil]) -> anyhow::Result<bool> {
+        let Some(history) = &self.history else {
+            return Ok(false);
+        };
+        let history = history.clone();
+        let commits = tokio::task::spawn_blocking(move || history.commits()).await??;
+        Ok(codeos_paleo::is_history_insufficient(&commits, fossils))
+    }
+
+    pub async fn guard_before(&self, goal: &str) -> anyhow::Result<codeos_types::bus::GuardBeforeResponse> {
+        let keywords: Vec<String> = goal
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| s.len() >= 3)
+            .map(|s| s.to_lowercase())
+            .collect();
+
+        let mut target_entities = Vec::new();
+        for kw in &keywords {
+            if let Ok(ents) = self.storage.find_entities_by_name_pattern(kw).await {
+                target_entities.extend(ents);
+            }
+        }
+
+        let mut target_files: Vec<String> = target_entities.iter().map(|e| e.location.file_path.clone()).collect();
+        target_files.sort();
+        target_files.dedup();
+
+        let rules = self.mine_rules_calibrated().await.unwrap_or_default();
+        let mut target_layers = HashSet::new();
+        for ent in &target_entities {
+            let layer = layer_of_entity(ent, self.config.layer_depth);
+            target_layers.insert(layer.0);
+        }
+
+        let mut boundaries = Vec::new();
+        for rule in &rules {
+            if target_layers.contains(&rule.upstream.0) || target_layers.contains(&rule.downstream.0) {
+                boundaries.push(format!("'{}' non deve dipendere da '{}' (confidenza: {:.2})", rule.downstream.0, rule.upstream.0, rule.confidence));
+            }
+        }
+
+        let mut blast_radius = 0;
+        let mut incoming_visited = HashSet::new();
+        for ent in &target_entities {
+            if let Ok(rels) = self.storage.query_relations(RelationFilter {
+                target_id: Some(ent.id),
+                ..Default::default()
+            }).await {
+                for rel in rels {
+                    if incoming_visited.insert(rel.id) {
+                        blast_radius += 1;
+                    }
+                }
+            }
+        }
+
+        let safe_path = if target_entities.is_empty() {
+            "Nessun modulo a rischio rilevato. Procedi con cautela.".to_string()
+        } else {
+            format!("Per modificare i file in sicurezza, mantieni separati i layer: {}", 
+                target_layers.into_iter().collect::<Vec<_>>().join(", "))
+        };
+
+        let mut context_pack = format!("# AI Architecture Firewall - Guard Before\n\n**Goal:** \"{}\"\n\n", goal);
+        context_pack.push_str("## Target Files a rischio:\n");
+        for f in &target_files {
+            context_pack.push_str(&format!("- {}\n", f));
+        }
+        context_pack.push_str("\n## Confini architetturali da preservare:\n");
+        for b in &boundaries {
+            context_pack.push_str(&format!("- {}\n", b));
+        }
+        context_pack.push_str(&format!("\n**Raggio d'impatto (Blast Radius):** {} entità dipendenti.\n", blast_radius));
+
+        Ok(codeos_types::bus::GuardBeforeResponse {
+            target_files,
+            boundaries,
+            blast_radius,
+            safe_path,
+            context_pack,
+        })
+    }
+
+    pub async fn guard_after(&self) -> anyhow::Result<codeos_types::bus::GuardAfterResponse> {
+        let mut latest_relations = Vec::new();
+        if let Some(history) = &self.history {
+            if let Ok(commits) = history.commits() {
+                if let Some(latest_commit) = commits.first() {
+                    for file_path in &latest_commit.changed_files {
+                        if let Ok(entities) = self.storage.get_entities_by_file(file_path).await {
+                            for ent in entities {
+                                if let Ok(rels) = self.storage.query_relations(RelationFilter {
+                                    source_id: Some(ent.id),
+                                    ..Default::default()
+                                }).await {
+                                    latest_relations.extend(rels);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut candidate_relations = latest_relations;
+        if candidate_relations.is_empty() {
+            if let Ok(all_rels) = self.storage.query_relations(RelationFilter::default()).await {
+                candidate_relations = all_rels;
+            }
+        }
+
+        let violations = self.check(&candidate_relations).await.unwrap_or_default();
+
+        let mut new_relations = Vec::new();
+        for rel in &candidate_relations {
+            if let (Ok(Some(src)), Ok(Some(tgt))) = (self.storage.get_entity_by_id(&rel.source_id).await, self.storage.get_entity_by_id(&rel.target_id).await) {
+                new_relations.push(format!("'{}' -> '{}' ({:?})", src.qualified_name, tgt.qualified_name, rel.kind));
+            }
+        }
+
+        let mut proposed_fixes = Vec::new();
+        for vio in &violations {
+            if let Some(loc) = &vio.location {
+                proposed_fixes.push(format!("Riferimento illegale in {}:{}. Dettaglio: {}", loc.file_path, loc.start_line, vio.message));
+            } else {
+                proposed_fixes.push(format!("Riferimento illegale. Dettaglio: {}", vio.message));
+            }
+        }
+
+        Ok(codeos_types::bus::GuardAfterResponse {
+            new_relations,
+            violations,
+            proposed_fixes,
+        })
+    }
+
+    pub async fn get_context_pack(&self, goal: &str, _for_ai: bool) -> anyhow::Result<codeos_types::bus::GetContextPackResponse> {
+        let keywords: Vec<String> = goal
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| s.len() >= 3)
+            .map(|s| s.to_lowercase())
+            .collect();
+
+        let mut target_entities = Vec::new();
+        for kw in &keywords {
+            if let Ok(ents) = self.storage.find_entities_by_name_pattern(kw).await {
+                target_entities.extend(ents);
+            }
+        }
+
+        let mut files_to_read: Vec<String> = target_entities.iter().map(|e| e.location.file_path.clone()).collect();
+        files_to_read.sort();
+        files_to_read.dedup();
+
+        let mut relevant_entities: Vec<String> = target_entities.iter().map(|e| e.qualified_name.clone()).collect();
+        relevant_entities.sort();
+        relevant_entities.dedup();
+
+        let mut key_dependencies = Vec::new();
+        let selected_ids: HashSet<EntityId> = target_entities.iter().map(|e| e.id).collect();
+        for ent in &target_entities {
+            if let Ok(rels) = self.storage.query_relations(RelationFilter {
+                source_id: Some(ent.id),
+                ..Default::default()
+            }).await {
+                for rel in rels {
+                    if selected_ids.contains(&rel.target_id) {
+                        if let (Ok(Some(src)), Ok(Some(tgt))) = (self.storage.get_entity_by_id(&rel.source_id).await, self.storage.get_entity_by_id(&rel.target_id).await) {
+                            key_dependencies.push(format!("{} -> {} ({:?})", src.qualified_name, tgt.qualified_name, rel.kind));
+                        }
+                    }
+                }
+            }
+        }
+
+        let rules = self.mine_rules_calibrated().await.unwrap_or_default();
+        let mut target_layers = HashSet::new();
+        for ent in &target_entities {
+            let layer = layer_of_entity(ent, self.config.layer_depth);
+            target_layers.insert(layer.0);
+        }
+
+        let mut boundaries_to_preserve = Vec::new();
+        for rule in &rules {
+            if target_layers.contains(&rule.upstream.0) || target_layers.contains(&rule.downstream.0) {
+                boundaries_to_preserve.push(format!("'{}' non deve dipendere da '{}' (confidenza: {:.2})", rule.downstream.0, rule.upstream.0, rule.confidence));
+            }
+        }
+
+        let mut local_patterns = Vec::new();
+        for rule in rules.iter().take(3) {
+            local_patterns.push(format!("Convenzione: '{}' dipende da '{}' a senso unico.", rule.downstream.0, rule.upstream.0));
+        }
+        if local_patterns.is_empty() {
+            local_patterns.push("Nessun pattern strutturale specifico rilevato.".to_string());
+        }
+
+        let mut suggested_tests = Vec::new();
+        for ent in &target_entities {
+            if let Ok(rels) = self.storage.query_relations(RelationFilter {
+                target_id: Some(ent.id),
+                kind: Some(codeos_types::RelationKind::Tests),
+                ..Default::default()
+            }).await {
+                for rel in rels {
+                    if let Ok(Some(test_ent)) = self.storage.get_entity_by_id(&rel.source_id).await {
+                        suggested_tests.push(format!("Esegui il test: {} ({})", test_ent.qualified_name, test_ent.location.file_path));
+                    }
+                }
+            }
+        }
+        if suggested_tests.is_empty() {
+            suggested_tests.push("Scrivi nuovi test unitari per coprire le modifiche apportate.".to_string());
+        }
+
+        let mut blast_count = 0;
+        for ent in &target_entities {
+            if let Ok(rels) = self.storage.query_relations(RelationFilter {
+                target_id: Some(ent.id),
+                ..Default::default()
+            }).await {
+                blast_count += rels.len();
+            }
+        }
+        let estimated_risk = if blast_count > 8 {
+            "high".to_string()
+        } else if blast_count > 2 {
+            "medium".to_string()
+        } else {
+            "low".to_string()
+        };
+
+        let goal_interpretation = format!("Analisi e preparazione del contesto per raggiungere il goal: \"{}\"", goal);
+
+        let mut markdown = format!("# AI Context Pack - goal: \"{}\"\n\n", goal);
+        markdown.push_str(&format!("**Stima del rischio:** {}\n\n", estimated_risk.to_uppercase()));
+        markdown.push_str("## 1. Interpretazione del Goal\n");
+        markdown.push_str(&format!("{}\n\n", goal_interpretation));
+        markdown.push_str("## 2. File da Leggere / Modificare\n");
+        for f in &files_to_read {
+            markdown.push_str(&format!("- {}\n", f));
+        }
+        markdown.push_str("\n## 3. Entità Rilevanti nel Contesto\n");
+        for e in &relevant_entities {
+            markdown.push_str(&format!("- {}\n", e));
+        }
+        markdown.push_str("\n## 4. Dipendenze Chiave\n");
+        for dep in &key_dependencies {
+            markdown.push_str(&format!("- {}\n", dep));
+        }
+        markdown.push_str("\n## 5. Confini da Preservare\n");
+        for b in &boundaries_to_preserve {
+            markdown.push_str(&format!("- {}\n", b));
+        }
+        markdown.push_str("\n## 6. Pattern Locali\n");
+        for p in &local_patterns {
+            markdown.push_str(&format!("- {}\n", p));
+        }
+        markdown.push_str("\n## 7. Test Suggeriti\n");
+        for t in &suggested_tests {
+            markdown.push_str(&format!("- {}\n", t));
+        }
+
+        Ok(codeos_types::bus::GetContextPackResponse {
+            goal_interpretation,
+            files_to_read,
+            relevant_entities,
+            key_dependencies,
+            boundaries_to_preserve,
+            local_patterns,
+            suggested_tests,
+            estimated_risk,
+            formatted_markdown: markdown,
+        })
+    }
+
+    pub async fn pr_mri(&self, base: &str, head: &str) -> anyhow::Result<codeos_types::bus::PrMriResponse> {
+        let repo_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/Users/richard/Desktop/CodeOs 3"));
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(&repo_dir).arg("diff").arg("--name-only").arg(format!("{}..{}", base, head));
+        let mut files = Vec::new();
+        if let Ok(output) = cmd.output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    if !line.trim().is_empty() {
+                        if let Ok(abs_path) = repo_dir.join(line).canonicalize() {
+                            files.push(abs_path.to_string_lossy().to_string());
+                        } else {
+                            files.push(repo_dir.join(line).to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut target_entities = Vec::new();
+        for file in &files {
+            if let Ok(entities) = self.storage.get_entities_by_file(file).await {
+                target_entities.extend(entities);
+            }
+        }
+
+        let mut relations = Vec::new();
+        for ent in &target_entities {
+            if let Ok(rels) = self.storage.query_relations(RelationFilter {
+                source_id: Some(ent.id),
+                ..Default::default()
+            }).await {
+                relations.extend(rels);
+            }
+        }
+
+        let mut new_dependencies = Vec::new();
+        for rel in &relations {
+            if let (Ok(Some(src)), Ok(Some(tgt))) = (self.storage.get_entity_by_id(&rel.source_id).await, self.storage.get_entity_by_id(&rel.target_id).await) {
+                new_dependencies.push(format!("'{}' -> '{}'", src.qualified_name, tgt.qualified_name));
+            }
+        }
+
+        let mut violated_boundaries = Vec::new();
+        let violations = self.check(&relations).await.unwrap_or_default();
+        for vio in &violations {
+            violated_boundaries.push(vio.message.clone());
+        }
+
+        let mut new_external_dependencies = Vec::new();
+        for rel in &relations {
+            if let Ok(Some(tgt)) = self.storage.get_entity_by_id(&rel.target_id).await {
+                if tgt.kind == codeos_types::EntityKind::ExternalDependency {
+                    new_external_dependencies.push(tgt.qualified_name.clone());
+                }
+            }
+        }
+        new_external_dependencies.sort();
+        new_external_dependencies.dedup();
+
+        let mut historical_hotspots = Vec::new();
+        if let Some(history) = &self.history {
+            if let Ok(commits) = history.commits() {
+                let mut file_counts = HashMap::new();
+                for commit in &commits {
+                    for file in &commit.changed_files {
+                        *file_counts.entry(file.clone()).or_insert(0) += 1;
+                    }
+                }
+                for file in &files {
+                    if let Some(&count) = file_counts.get(file) {
+                        if count > 2 {
+                            historical_hotspots.push(format!("{} (modificato {} volte)", file, count));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut impacted_tests = Vec::new();
+        for ent in &target_entities {
+            if let Ok(rels) = self.storage.query_relations(RelationFilter {
+                target_id: Some(ent.id),
+                kind: Some(codeos_types::RelationKind::Tests),
+                ..Default::default()
+            }).await {
+                for r in rels {
+                    if let Ok(Some(test_ent)) = self.storage.get_entity_by_id(&r.source_id).await {
+                        impacted_tests.push(test_ent.qualified_name.clone());
+                    }
+                }
+            }
+        }
+        impacted_tests.sort();
+        impacted_tests.dedup();
+
+        let blast_radius_change = (violations.len() + new_external_dependencies.len()) as i32;
+
+        let risk_score = if !violated_boundaries.is_empty() {
+            "high".to_string()
+        } else if relations.len() > 10 {
+            "medium".to_string()
+        } else {
+            "low".to_string()
+        };
+
+        let summary = format!(
+            "PR MRI Scansionato tra {} e {}. Rilevate {} nuove dipendenze, {} violazioni architetturali.",
+            base, head, new_dependencies.len(), violated_boundaries.len()
+        );
+
+        Ok(codeos_types::bus::PrMriResponse {
+            new_dependencies,
+            violated_boundaries,
+            blast_radius_change,
+            historical_hotspots,
+            new_external_dependencies,
+            impacted_tests,
+            risk_score,
+            summary,
+        })
+    }
+
+    pub async fn why(&self, expr: &str) -> anyhow::Result<codeos_types::bus::WhyResponse> {
+        let parts: Vec<&str> = if expr.contains('|') {
+            expr.split('|').collect()
+        } else if expr.contains("->") {
+            expr.split("->").collect()
+        } else {
+            expr.split_whitespace().collect()
+        };
+
+        let upstream = parts.first().unwrap_or(&"").trim().to_string();
+        let downstream = parts.get(1).unwrap_or(&"").trim().to_string();
+
+        let fossils = self.fossils().await.unwrap_or_default();
+        let matching_fossil = fossils.into_iter().find(|f| {
+            (f.upstream == upstream && f.downstream == downstream) || 
+            (f.upstream == downstream && f.downstream == upstream)
+        });
+
+        let mut born_commit = String::new();
+        let mut born_date = String::new();
+        let mut intent = String::new();
+        let mut co_changed_files = Vec::new();
+        let mut history_insufficient = false;
+
+        if let Some(f) = matching_fossil {
+            born_commit = f.born_at.clone();
+            born_date = chrono::DateTime::from_timestamp(f.born_at_unix, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default();
+            intent = f.intent.clone();
+            co_changed_files = f.born_structure.clone();
+            history_insufficient = self.check_history_adequacy(&[f]).await.unwrap_or(false);
+        }
+
+        let mut markdown_decisions = Vec::new();
+        if let Some(store) = &self.decisions {
+            if let Ok(all_decisions) = store.all().await {
+                for dec in all_decisions {
+                    if (dec.title.contains(&upstream) && dec.title.contains(&downstream)) ||
+                       dec.tags.iter().any(|t| t.contains(&upstream) || t.contains(&downstream)) {
+                        markdown_decisions.push(format!("### {}\n\n**Autore:** {}\n\n**Razionale:** {}\n\n**Contesto:** {}", dec.title, dec.author, dec.rationale, dec.context));
+                    }
+                }
+            }
+        }
+
+        let explanation = format!(
+            "Il confine architetturale tra '{}' e '{}' è nato nel commit {} in data {}.",
+            upstream, downstream, born_commit, born_date
+        );
+
+        Ok(codeos_types::bus::WhyResponse {
+            born_commit,
+            born_date,
+            intent,
+            co_changed_files,
+            markdown_decisions,
+            explanation,
+            history_insufficient,
+        })
+    }
+
+    pub async fn simulate(&self, expr: &str) -> anyhow::Result<codeos_types::bus::SimulateResponse> {
+        let mut source = String::new();
+        let mut target = String::new();
+        if expr.to_lowercase().contains("move") && expr.to_lowercase().contains("to") {
+            let parts: Vec<&str> = expr.split_whitespace().collect();
+            if let Some(pos) = parts.iter().position(|&w| w.to_lowercase() == "move") {
+                if let Some(to_pos) = parts.iter().position(|&w| w.to_lowercase() == "to") {
+                    if to_pos > pos + 1 && parts.len() > to_pos + 1 {
+                        source = parts[pos+1..to_pos].join(" ");
+                        target = parts[to_pos+1..].join(" ");
+                    }
+                }
+            }
+        }
+
+        let mut dependencies_to_rewrite = Vec::new();
+        let mut changed_boundaries = Vec::new();
+        let mut risks = Vec::new();
+        let mut suggested_tests = Vec::new();
+        let mut recommendation_plan = Vec::new();
+
+        if !source.is_empty() && !target.is_empty() {
+            if let Ok(entities) = self.storage.find_entities_by_name_pattern(&source).await {
+                for ent in entities {
+                    if let Ok(outgoing) = self.storage.query_relations(RelationFilter {
+                        source_id: Some(ent.id),
+                        ..Default::default()
+                    }).await {
+                        for r in outgoing {
+                            if let Ok(Some(tgt)) = self.storage.get_entity_by_id(&r.target_id).await {
+                                dependencies_to_rewrite.push(format!("Modifica chiamata da '{}' a '{}'", ent.qualified_name, tgt.qualified_name));
+                            }
+                        }
+                    }
+                    if let Ok(incoming) = self.storage.query_relations(RelationFilter {
+                        target_id: Some(ent.id),
+                        ..Default::default()
+                    }).await {
+                        for r in incoming {
+                            if let Ok(Some(src)) = self.storage.get_entity_by_id(&r.source_id).await {
+                                dependencies_to_rewrite.push(format!("Aggiorna chiamata da '{}' a '{}' (nuova destinazione: {})", src.qualified_name, ent.qualified_name, target));
+                            }
+                        }
+                    }
+                }
+            }
+
+            risks.push(format!("Lo spostamento di '{}' potrebbe rompere l'incapsulamento del layer.", source));
+            changed_boundaries.push(format!("Il confine di '{}' verrà fuso con '{}'.", source, target));
+            recommendation_plan.push(format!("1. Crea il modulo di destinazione '{}'", target));
+            recommendation_plan.push(format!("2. Sposta le classi/funzioni da '{}' a '{}'", source, target));
+            recommendation_plan.push("3. Aggiorna i relativi import nel resto del progetto".to_string());
+            recommendation_plan.push("4. Esegui i test di regressione".to_string());
+            suggested_tests.push(format!("Esegui tutti i test nel modulo '{}'", target));
+        } else {
+            dependencies_to_rewrite.push("Specifica un'espressione nel formato 'move <sorgente> to <destinazione>' per simulare.".to_string());
+            risks.push("Espressione non riconosciuta.".to_string());
+        }
+
+        Ok(codeos_types::bus::SimulateResponse {
+            dependencies_to_rewrite,
+            changed_boundaries,
+            risks,
+            suggested_tests,
+            recommendation_plan,
+        })
+    }
+}
+
+/// Trova il prefisso comune più lungo fra una serie di stringhe (es. cartella radice).
+fn find_common_prefix<'a>(mut paths: impl Iterator<Item = &'a String>) -> String {
+    let Some(first) = paths.next() else {
+        return String::new();
+    };
+    let mut common = first.clone();
+    for path in paths {
+        let mut new_common = String::new();
+        for (c1, c2) in common.chars().zip(path.chars()) {
+            if c1 == c2 {
+                new_common.push(c1);
+            } else {
+                break;
+            }
+        }
+        common = new_common;
+    }
+    if let Some(idx) = common.rfind('/') {
+        common.truncate(idx + 1);
+    } else if let Some(idx) = common.rfind('\\') {
+        common.truncate(idx + 1);
+    }
+    common
 }
 
 /// La chiave stabile di un invariante: identifica la coppia ordinata
@@ -1168,8 +1736,11 @@ mod tests {
         assert_eq!(f.intent, "draw the boundary");
         assert_eq!(f.upstream, "app::core");
         assert_eq!(f.downstream, "app::api");
-        assert!(f.born_structure.contains(&api_file));
-        assert!(f.born_structure.contains(&core_file));
+        let common_prefix = find_common_prefix([&api_file, &core_file].into_iter());
+        let api_rel = api_file.strip_prefix(&common_prefix).unwrap_or(&api_file).to_string();
+        let core_rel = core_file.strip_prefix(&common_prefix).unwrap_or(&core_file).to_string();
+        assert!(f.born_structure.contains(&api_rel));
+        assert!(f.born_structure.contains(&core_rel));
     }
 
     #[tokio::test]

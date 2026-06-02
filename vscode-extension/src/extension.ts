@@ -25,6 +25,8 @@ let diagnostics: vscode.DiagnosticCollection;
 let sidebar: ArchitectureTreeProvider;
 /** Timer di debounce per l'aggiornamento della sidebar dopo i `graphUpdated`. */
 let sidebarRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+/** Timer di debounce per l'auto-indicizzazione al salvataggio. */
+let indexOnSaveTimer: ReturnType<typeof setTimeout> | undefined;
 /** Diagnostiche di violazione accumulate per file (fsPath → lista). */
 const violationsByFile = new Map<string, vscode.Diagnostic[]>();
 
@@ -63,6 +65,41 @@ export function activate(context: vscode.ExtensionContext): void {
   if (autoConnect) {
     startWatch(context);
   }
+
+  // Auto-index on save:
+  context.subscriptions.push(
+    vscode.workspace.onDidSaveTextDocument((document) => {
+      const autoIndex = vscode.workspace
+        .getConfiguration('codeos')
+        .get<boolean>('autoIndexOnSave', true);
+      if (!autoIndex) {
+        return;
+      }
+      
+      const file = document.uri.fsPath;
+      const ext = path.extname(file).toLowerCase();
+      const supported = ['.rs', '.ts', '.tsx', '.js', '.jsx', '.go', '.java', '.py'];
+      if (!supported.includes(ext)) {
+        return;
+      }
+
+      // Clear stale diagnostic errors for the saved file
+      diagnostics.delete(document.uri);
+      violationsByFile.delete(file);
+
+      // Debounce (500ms) to avoid overlapping runs
+      if (indexOnSaveTimer) {
+        clearTimeout(indexOnSaveTimer);
+      }
+      indexOnSaveTimer = setTimeout(() => {
+        indexOnSaveTimer = undefined;
+        log(`Auto-indicizzo dopo il salvataggio: ${path.basename(file)}`);
+        getClient(context).indexFiles([file]).catch((err) => {
+          log(`Auto-indicizzazione fallita per ${file}: ${err}`);
+        });
+      }, 500);
+    })
+  );
 }
 
 export function deactivate(): void {
@@ -393,6 +430,17 @@ function handleEvent(event: CodeOsEvent): void {
             revealViolation(v);
           }
         });
+      break;
+    }
+    case 'indexProgress': {
+      const total = event.totalFiles;
+      const processed = event.processedFiles;
+      const skipped = event.skippedFiles;
+      const errors = event.parseErrors;
+      const current = event.currentFile;
+      
+      statusBar.text = `$(sync~spin) CodeOS: ${processed}/${total} file`;
+      statusBar.tooltip = `Indicizzazione in corso: ${current}\nSaltati: ${skipped}, Errori: ${errors}`;
       break;
     }
   }

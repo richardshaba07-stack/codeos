@@ -148,10 +148,31 @@ impl GuardianActor {
                 // Se il chiamante è andato via, la risposta si perde: non è un errore.
                 let _ = reply_to.send(report).await;
             }
-            // Il Dispatcher non instrada altri comandi a noi; per robustezza li ignoriamo.
-            other => {
-                tracing::warn!(?other, "GuardianActor: comando inatteso, ignorato");
+            Command::GuardBefore { goal, reply_to } => {
+                let res = self.guardian.guard_before(&goal).await;
+                let _ = reply_to.send(res).await;
             }
+            Command::GuardAfter { reply_to } => {
+                let res = self.guardian.guard_after().await;
+                let _ = reply_to.send(res).await;
+            }
+            Command::GetContextPack { goal, for_ai, reply_to } => {
+                let res = self.guardian.get_context_pack(&goal, for_ai).await;
+                let _ = reply_to.send(res).await;
+            }
+            Command::PrMri { base, head, reply_to } => {
+                let res = self.guardian.pr_mri(&base, &head).await;
+                let _ = reply_to.send(res).await;
+            }
+            Command::Why { expr, reply_to } => {
+                let res = self.guardian.why(&expr).await;
+                let _ = reply_to.send(res).await;
+            }
+            Command::Simulate { expr, reply_to } => {
+                let res = self.guardian.simulate(&expr).await;
+                let _ = reply_to.send(res).await;
+            }
+            _ => {}
         }
     }
 
@@ -163,7 +184,8 @@ impl GuardianActor {
     async fn build_report(&self) -> anyhow::Result<ArchitectureReport> {
         let calibrated = self.guardian.has_history();
         let rules = self.guardian.mine_rules_calibrated().await?;
-        let fossils = self.guardian.fossils().await?;
+        let raw_fossils = self.guardian.fossils().await?;
+        let history_insufficient = self.guardian.check_history_adequacy(&raw_fossils).await.unwrap_or(false);
         let gaps = self.guardian.missing_invariants().await?;
         // Qualità del grafo (P2-7): quanto fidarsi del referto appena costruito.
         let quality = self.guardian.graph_quality().await?;
@@ -184,7 +206,7 @@ impl GuardianActor {
             })
             .collect();
 
-        let fossils = fossils
+        let fossils = raw_fossils
             .into_iter()
             .map(|f| DecisionFossilInfo {
                 upstream: f.upstream,
@@ -211,6 +233,7 @@ impl GuardianActor {
             fossils,
             gaps,
             quality,
+            history_insufficient,
         })
     }
 

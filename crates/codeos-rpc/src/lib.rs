@@ -283,6 +283,205 @@ impl CodeOs for CodeOsService {
                 .map(architectural_gap_to_proto)
                 .collect(),
             quality: Some(graph_quality_to_proto(report.quality)),
+            history_insufficient: report.history_insufficient,
+        }))
+    }
+
+    async fn guard_before(
+        &self,
+        request: Request<proto::GuardBeforeRequest>,
+    ) -> Result<Response<proto::GuardBeforeResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::GuardBefore {
+                goal: req.goal,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let res = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian"))?
+            .map_err(|e| Status::internal(format!("guard_before fallito: {e}")))?;
+
+        Ok(Response::new(proto::GuardBeforeResponse {
+            target_files: res.target_files,
+            boundaries: res.boundaries,
+            blast_radius: res.blast_radius,
+            safe_path: res.safe_path,
+            context_pack: res.context_pack,
+        }))
+    }
+
+    async fn guard_after(
+        &self,
+        _request: Request<proto::GuardAfterRequest>,
+    ) -> Result<Response<proto::GuardAfterResponse>, Status> {
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::GuardAfter { reply_to })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let res = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian"))?
+            .map_err(|e| Status::internal(format!("guard_after fallito: {e}")))?;
+
+        let mut violations = Vec::new();
+        for vio in res.violations {
+            violations.push(proto::ArchitectureViolationEvent {
+                rule_id: vio.rule_id.to_string(),
+                relation_id: vio.relation_id.to_string(),
+                source_id: vio.source_id.to_string(),
+                target_id: vio.target_id.to_string(),
+                message: vio.message,
+                location: vio.location.map(location_to_proto),
+                severity: vio.severity.as_str().to_string(),
+            });
+        }
+
+        Ok(Response::new(proto::GuardAfterResponse {
+            new_relations: res.new_relations,
+            violations,
+            proposed_fixes: res.proposed_fixes,
+        }))
+    }
+
+    async fn get_context_pack(
+        &self,
+        request: Request<proto::GetContextPackRequest>,
+    ) -> Result<Response<proto::GetContextPackResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::GetContextPack {
+                goal: req.goal,
+                for_ai: req.for_ai,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let res = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian"))?
+            .map_err(|e| Status::internal(format!("get_context_pack fallito: {e}")))?;
+
+        Ok(Response::new(proto::GetContextPackResponse {
+            goal_interpretation: res.goal_interpretation,
+            files_to_read: res.files_to_read,
+            relevant_entities: res.relevant_entities,
+            key_dependencies: res.key_dependencies,
+            boundaries_to_preserve: res.boundaries_to_preserve,
+            local_patterns: res.local_patterns,
+            suggested_tests: res.suggested_tests,
+            estimated_risk: res.estimated_risk,
+            formatted_markdown: res.formatted_markdown,
+        }))
+    }
+
+    async fn pr_mri(
+        &self,
+        request: Request<proto::PrMriRequest>,
+    ) -> Result<Response<proto::PrMriResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::PrMri {
+                base: req.base,
+                head: req.head,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let res = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian"))?
+            .map_err(|e| Status::internal(format!("pr_mri fallito: {e}")))?;
+
+        Ok(Response::new(proto::PrMriResponse {
+            new_dependencies: res.new_dependencies,
+            violated_boundaries: res.violated_boundaries,
+            blast_radius_change: res.blast_radius_change,
+            historical_hotspots: res.historical_hotspots,
+            new_external_dependencies: res.new_external_dependencies,
+            impacted_tests: res.impacted_tests,
+            risk_score: res.risk_score,
+            summary: res.summary,
+        }))
+    }
+
+    async fn simulate(
+        &self,
+        request: Request<proto::SimulateRequest>,
+    ) -> Result<Response<proto::SimulateResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::Simulate {
+                expr: req.expr,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let res = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian"))?
+            .map_err(|e| Status::internal(format!("simulate fallito: {e}")))?;
+
+        Ok(Response::new(proto::SimulateResponse {
+            dependencies_to_rewrite: res.dependencies_to_rewrite,
+            changed_boundaries: res.changed_boundaries,
+            risks: res.risks,
+            suggested_tests: res.suggested_tests,
+            recommendation_plan: res.recommendation_plan,
+        }))
+    }
+
+    async fn why(
+        &self,
+        request: Request<proto::WhyRequest>,
+    ) -> Result<Response<proto::WhyResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::Why {
+                expr: req.expr,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let res = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian"))?
+            .map_err(|e| Status::internal(format!("why fallito: {e}")))?;
+
+        Ok(Response::new(proto::WhyResponse {
+            born_commit: res.born_commit,
+            born_date: res.born_date,
+            intent: res.intent,
+            co_changed_files: res.co_changed_files,
+            markdown_decisions: res.markdown_decisions,
+            explanation: res.explanation,
+            history_insufficient: res.history_insufficient,
         }))
     }
 
@@ -426,6 +625,21 @@ fn event_to_proto(event: CodeOsEvent) -> proto::EventMessage {
                 message: violation.message,
                 location: violation.location.map(location_to_proto),
                 severity: violation.severity.as_str().to_string(),
+            })
+        }
+        CodeOsEvent::IndexProgress {
+            total_files,
+            processed_files,
+            current_file,
+            skipped_files,
+            parse_errors,
+        } => {
+            Event::IndexProgress(proto::IndexProgressEvent {
+                total_files,
+                processed_files,
+                current_file,
+                skipped_files,
+                parse_errors,
             })
         }
     };

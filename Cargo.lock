@@ -286,6 +286,7 @@ name = "codeos-guardian"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "codeos-memory",
  "codeos-paleo",
  "codeos-storage",
