@@ -323,7 +323,7 @@ impl<'src> FileWalk<'src> {
             return;
         };
         let target = clean_call_target(&self.text(func));
-        if is_noise_call(&target) || !is_clean_call_path(&target) {
+        if is_noise_call(&target) || !is_clean_call_path(&target) || is_noise_method(&target) {
             return;
         }
         self.relations.push(ParsedRelation {
@@ -437,6 +437,48 @@ fn is_noise_macro(target: &str) -> bool {
 /// architetturale: sono chiamate che non rappresentano una dipendenza tra moduli.
 fn is_noise_call(target: &str) -> bool {
     matches!(target, "Ok" | "Err" | "Some")
+}
+
+/// `true` se il bersaglio è una *method-call* (`receiver.metodo`) il cui metodo è
+/// una conversione / unwrap della libreria standard: `.clone()`, `.to_string()`,
+/// `.into()`, `.unwrap()`… Onnipresenti, non risolvibili senza inferenza di tipo
+/// (resterebbero comunque `Unresolved`) e privi di valore architetturale.
+///
+/// Filtro VOLUTAMENTE stretto e **solo Rust**:
+/// - agisce solo su path con `.` (method-call con receiver), mai su `Tipo::metodo`
+///   con `::`: quello resta compito della risoluzione — gli interni si collegano
+///   (P0-2), gli esterni restano onestamente `Unresolved`;
+/// - l'elenco contiene SOLO nomi che in questo workspace **non** esistono come
+///   metodo interno. È una scelta misurata, non a intuito: `as_str`, `is_empty`,
+///   `len`, `push`, `send`… sono esclusi perché sono metodi *reali* di CodeOS (es.
+///   `ResolutionStrategy::as_str`, `GraphDelta::is_empty`) e scartarli cancellerebbe
+///   un arco vero invece di solo rumore.
+///
+/// Scartare una call non può MAI creare un arco bugiardo, solo ometterne uno: per
+/// questo il drop a livello di parser è sicuro ("un arco mancante è meglio di uno
+/// che mente").
+fn is_noise_method(target: &str) -> bool {
+    let Some((_, method)) = target.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        method,
+        "clone"
+            | "to_string"
+            | "to_string_lossy"
+            | "to_owned"
+            | "to_vec"
+            | "into"
+            | "as_ref"
+            | "as_mut"
+            | "as_slice"
+            | "as_bytes"
+            | "unwrap"
+            | "unwrap_or"
+            | "unwrap_or_else"
+            | "unwrap_or_default"
+            | "expect"
+    )
 }
 
 fn clean_call_target(raw: &str) -> String {
@@ -629,6 +671,27 @@ fn run() {
         assert!(!is_noise_macro("tracing::info"));
     }
 
+    #[test]
+    fn is_noise_method_matches_only_std_conversions_with_receiver() {
+        // Conversioni / unwrap std su un receiver: rumore, da scartare.
+        assert!(is_noise_method("x.clone"));
+        assert!(is_noise_method("self.label.to_string"));
+        assert!(is_noise_method("p.to_string_lossy"));
+        assert!(is_noise_method("opt.unwrap"));
+        assert!(is_noise_method("res.expect"));
+        assert!(is_noise_method("v.into"));
+        // Esclusi perché sono metodi INTERNI reali di CodeOS: un arco vero, non
+        // rumore (verificato sul grafo: as_str/is_empty/len/push esistono).
+        assert!(!is_noise_method("strategy.as_str"));
+        assert!(!is_noise_method("delta.is_empty"));
+        assert!(!is_noise_method("items.len"));
+        assert!(!is_noise_method("buf.push"));
+        assert!(!is_noise_method("self.storage.query_relations"));
+        // Senza receiver via `.` non è una method-call: non lo tocchiamo.
+        assert!(!is_noise_method("clone"));
+        assert!(!is_noise_method("String::from"));
+    }
+
     #[tokio::test]
     async fn enum_constructor_wrappers_are_not_recorded_as_calls() {
         let src = r#"
@@ -648,6 +711,46 @@ fn run() -> Result<i32, String> {
         assert!(
             !calls.iter().any(|c| matches!(*c, "Ok" | "Some" | "Err")),
             "i wrapper Ok/Err/Some non devono comparire fra le call: {calls:?}"
+        );
+        assert!(calls.contains(&"do_work"), "calls = {calls:?}");
+    }
+
+    #[tokio::test]
+    async fn std_conversion_methods_are_not_recorded_as_calls() {
+        // `.clone()` / `.to_string()` sono rumore std (non risolvibili, senza valore
+        // architetturale): vanno scartati. Invece `.as_str()` resta — in CodeOS è un
+        // metodo interno reale (enum converter), un arco potenzialmente vero.
+        let src = r#"
+fn run(&self) {
+    let a = self.name.clone();
+    let b = self.label.to_string();
+    let c = self.kind.as_str();
+    self.storage.query_relations();
+    do_work();
+}
+"#;
+        let result = parse(src).await;
+        let calls: Vec<&str> = result
+            .relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .map(|r| r.target_qualified_name.as_str())
+            .collect();
+        assert!(
+            !calls.iter().any(|c| c.ends_with(".clone")),
+            "le clone() std non devono comparire fra le call: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.ends_with(".to_string")),
+            "le to_string() std non devono comparire fra le call: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"self.kind.as_str"),
+            "as_str (metodo interno) NON è rumore e deve restare: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"self.storage.query_relations"),
+            "il method-call applicativo deve restare: {calls:?}"
         );
         assert!(calls.contains(&"do_work"), "calls = {calls:?}");
     }
