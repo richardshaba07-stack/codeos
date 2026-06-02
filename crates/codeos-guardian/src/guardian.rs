@@ -984,18 +984,35 @@ impl Guardian {
             .arg("diff")
             .arg("--name-only")
             .arg(format!("{}..{}", base, head));
+        // Se il diff non si può ottenere (git assente, ref inesistenti, dir non-git)
+        // NON dobbiamo proseguire: 0 file → 0 violazioni → rischio "low" sarebbe un
+        // referto pulito su un'analisi mai avvenuta. Un ref sbagliato non è un PR
+        // sano. Un diff vuoto ma RIUSCITO (base == head) resta invece legittimo.
+        let output = cmd.output().map_err(|e| {
+            anyhow::anyhow!("PrMri: impossibile eseguire 'git diff {base}..{head}': {e}")
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let details = if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" Dettagli git: {}", stderr.trim())
+            };
+            anyhow::bail!(
+                "PrMri: 'git diff {base}..{head}' fallito ({}). Verifica che i ref \
+                 esistano e che la working dir del server sia un repo git.{details}",
+                output.status
+            );
+        }
+
         let mut files = Vec::new();
-        if let Ok(output) = cmd.output() {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    if !line.trim().is_empty() {
-                        if let Ok(abs_path) = repo_dir.join(line).canonicalize() {
-                            files.push(abs_path.to_string_lossy().to_string());
-                        } else {
-                            files.push(repo_dir.join(line).to_string_lossy().to_string());
-                        }
-                    }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if !line.trim().is_empty() {
+                if let Ok(abs_path) = repo_dir.join(line).canonicalize() {
+                    files.push(abs_path.to_string_lossy().to_string());
+                } else {
+                    files.push(repo_dir.join(line).to_string_lossy().to_string());
                 }
             }
         }
@@ -2465,6 +2482,25 @@ mod tests {
             !sim.dependencies_to_rewrite.is_empty(),
             "uno spostamento reale con un chiamante deve elencare dipendenze: {:?}",
             sim.dependencies_to_rewrite
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_mri_refuses_a_clean_bill_of_health_when_the_diff_fails() {
+        // Ref inesistente → 'git diff' fallisce. Il vecchio codice ingoiava l'errore
+        // e restituiva 0 violazioni e rischio "low": un referto pulito su un'analisi
+        // mai avvenuta. In ogni ambiente (ref errato, git assente, dir non-git) il
+        // diff non si ottiene, quindi mri deve fallire onestamente, non rassicurare.
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let guardian = Guardian::new(storage);
+
+        let result = guardian
+            .pr_mri("codeos_ref_inesistente_per_test_xyz", "HEAD")
+            .await;
+
+        assert!(
+            result.is_err(),
+            "un diff non calcolabile deve produrre un errore, non un falso 'low risk'"
         );
     }
 }
