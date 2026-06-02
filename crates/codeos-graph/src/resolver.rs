@@ -508,6 +508,36 @@ async fn resolve_target(
             {
                 return Ok(Some((id, ResolutionStrategy::Import)));
             }
+
+            // 2.1 — Re-export aware (P0-2): l'import nomina crate + tipo
+            // (`codeos_storage::SqliteStorage`) ma NON il modulo interno dove il tipo
+            // è definito o ri-esportato (`src::sqlite`). Per una call come
+            // `SqliteStorage::in_memory` cerchiamo dunque l'UNICA entità interna del
+            // crate il cui `qualified_name` termina con `::SqliteStorage::in_memory`.
+            // Unicità obbligatoria: 0 o >1 candidati ⇒ Unresolved, mai un arco
+            // arbitrario.
+            if let Some((crate_name, tail)) = candidate.split_once("::") {
+                if is_internal_crate_name(crate_name) {
+                    let crate_prefix = format!("crates::{}::", crate_name.replace('_', "-"));
+                    if let Some(id) = unique_internal_match(&crate_prefix, tail, ctx).await? {
+                        return Ok(Some((id, ResolutionStrategy::Import)));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2.5 — Qualified crate-local (P0-2): un `Tipo::metodo` il cui `Tipo` NON è
+    // importato ma è definito nello *stesso crate* del chiamante (es. `Decision::from_new`
+    // usato dentro `codeos-paleo`). Risolviamo all'UNICA entità del crate corrente il
+    // cui qname termina con `::Tipo::metodo`. Stesso vincolo di unicità del 2.1; niente
+    // match per nomi semplici (serve un path `::`), che resta compito dello Stadio 3.
+    if target.contains("::") {
+        if let Some(caller_prefix) = caller_crate_prefix(ctx.module_prefix) {
+            let colon = target.replace('.', "::");
+            if let Some(id) = unique_internal_match(&caller_prefix, &colon, ctx).await? {
+                return Ok(Some((id, ResolutionStrategy::SameModule)));
+            }
         }
     }
 
@@ -563,6 +593,72 @@ async fn resolve_target(
     // 4 — Nessun match: Unresolved. Stesso principio del batch: niente fallback
     // globale sul DB, che aggancerebbe un omonimo in un altro modulo/crate.
     Ok(None)
+}
+
+/// Cerca l'**unica** entità interna (batch corrente + DB) che vive sotto
+/// `crate_prefix` (es. `crates::codeos-storage::`), nel linguaggio del chiamante, il
+/// cui `qualified_name` termina con `::{tail}` (es. `::SqliteStorage::in_memory`).
+///
+/// È il cuore della risoluzione *re-export aware* (P0-2): l'import e il crate ci
+/// dicono *dove* cercare, ma non il modulo interno; il suffisso `Tipo::metodo` lo
+/// individua senza indovinare il path. L'unicità è il guard anti-arco-bugiardo: se
+/// zero o più d'una entità combaciano restituiamo `None`, perché un `Tipo::metodo`
+/// ambiguo non deve mai diventare un arco arbitrario ("un arco mancante è meglio di
+/// uno che mente").
+async fn unique_internal_match(
+    crate_prefix: &str,
+    tail: &str,
+    ctx: &ResolutionContext<'_>,
+) -> anyhow::Result<Option<EntityId>> {
+    if tail.is_empty() {
+        return Ok(None);
+    }
+    let suffix = format!("::{tail}");
+    let mut hits: HashSet<EntityId> = HashSet::new();
+
+    // Batch corrente: entità appena create, non ancora nel DB.
+    for (qname, id) in ctx.new_by_qname.iter() {
+        if qname.starts_with(crate_prefix) && qname.ends_with(&suffix) {
+            if let Some(t_lang) = ctx.new_by_id_lang.get(id) {
+                if language_matches(ctx.language, t_lang) {
+                    hits.insert(*id);
+                }
+            }
+        }
+    }
+    // DB persistito: pattern `%tail%` (selettivo: include già `Tipo::metodo`), poi
+    // filtrato per crate + suffisso esatto + lingua.
+    for e in ctx.storage.find_entities_by_name_pattern(tail).await? {
+        if e.qualified_name.starts_with(crate_prefix) && e.qualified_name.ends_with(&suffix) {
+            let t_lang = e
+                .metadata
+                .get("language")
+                .cloned()
+                .unwrap_or_else(|| detect_language(&e.location.file_path));
+            if language_matches(ctx.language, &t_lang) {
+                hits.insert(e.id);
+            }
+        }
+    }
+
+    if hits.len() == 1 {
+        Ok(hits.into_iter().next())
+    } else {
+        Ok(None)
+    }
+}
+
+/// Prefisso di crate del chiamante a partire dal suo `module_prefix`.
+/// `crates::codeos-paleo::src::fossil` → `Some("crates::codeos-paleo::")`.
+/// `None` se il file non vive sotto `crates::<crate>::` (non possiamo limitare la
+/// ricerca a un crate, quindi non risolviamo crate-local).
+fn caller_crate_prefix(module_prefix: &str) -> Option<String> {
+    let mut parts = module_prefix.split("::");
+    if parts.next()? != "crates" {
+        return None;
+    }
+    let crate_name = parts.next().filter(|s| !s.is_empty())?;
+    Some(format!("crates::{crate_name}::"))
 }
 
 fn target_candidates(target: &str, module_prefix: &str) -> Vec<String> {
@@ -1077,6 +1173,156 @@ mod tests {
         assert!(delta.added_relations.iter().any(|r| {
             r.kind == RelationKind::Imports && r.source_id == source.id && r.target_id == target.id
         }));
+    }
+
+    /// Trova l'arco `Calls` uscente da `source_id` e ne restituisce
+    /// `(target_id, resolution_strategy)`. Panica se assente.
+    fn call_from(delta: &GraphDelta, source_id: EntityId) -> (EntityId, &str) {
+        let rel = delta
+            .added_relations
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls && r.source_id == source_id)
+            .expect("arco Calls atteso assente");
+        (
+            rel.target_id,
+            rel.metadata
+                .get("resolution_strategy")
+                .map(String::as_str)
+                .unwrap_or(""),
+        )
+    }
+
+    #[tokio::test]
+    async fn resolves_reexported_type_method_via_import() {
+        // P0-2: il tipo vive in un sotto-modulo (`src::sqlite`), l'import nomina solo
+        // crate+tipo (`codeos_storage::SqliteStorage`). La call `SqliteStorage::in_memory`
+        // dev'essere risolta al metodo reale tramite suffisso unico nel crate.
+        let parsed = vec![
+            parse_rust(
+                "/repo/crates/codeos-storage/src/sqlite.rs",
+                "pub struct SqliteStorage;\nimpl SqliteStorage {\n    pub fn in_memory() {}\n}\n",
+            )
+            .await,
+            parse_rust(
+                "/repo/crates/codeos-core/src/lib.rs",
+                "use codeos_storage::SqliteStorage;\npub fn make() {\n    SqliteStorage::in_memory();\n}\n",
+            )
+            .await,
+        ];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+        let make = find(&delta, "crates::codeos-core::src::lib::make");
+        let method = find(
+            &delta,
+            "crates::codeos-storage::src::sqlite::SqliteStorage::in_memory",
+        );
+
+        let (target_id, strategy) = call_from(&delta, make.id);
+        assert_eq!(target_id, method.id, "la call deve puntare al metodo reale");
+        assert_eq!(strategy, "import");
+    }
+
+    #[tokio::test]
+    async fn resolves_crate_local_qualified_call_without_import() {
+        // P0-2: `Decision::from_new` chiamato nello stesso crate dove `Decision` è
+        // definito, SENZA `use`. Risolto via suffisso unico nel crate del chiamante.
+        let parsed = vec![
+            parse_rust(
+                "/repo/crates/codeos-paleo/src/fossil.rs",
+                "pub struct Decision;\nimpl Decision {\n    pub fn from_new() {}\n}\n",
+            )
+            .await,
+            parse_rust(
+                "/repo/crates/codeos-paleo/src/lib.rs",
+                "pub fn build() {\n    Decision::from_new();\n}\n",
+            )
+            .await,
+        ];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+        let build = find(&delta, "crates::codeos-paleo::src::lib::build");
+        let method = find(
+            &delta,
+            "crates::codeos-paleo::src::fossil::Decision::from_new",
+        );
+
+        let (target_id, strategy) = call_from(&delta, build.id);
+        assert_eq!(target_id, method.id);
+        assert_eq!(strategy, "same_module");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_qualified_call_stays_unresolved() {
+        // Anti-arco-bugiardo: due `Repo::open` nello STESSO crate (moduli diversi)
+        // rendono `Repo::open` ambiguo ⇒ nessun arco arbitrario, resta Unresolved.
+        let parsed = vec![
+            parse_rust(
+                "/repo/crates/codeos-storage/src/a.rs",
+                "pub struct Repo;\nimpl Repo {\n    pub fn open() {}\n}\n",
+            )
+            .await,
+            parse_rust(
+                "/repo/crates/codeos-storage/src/b.rs",
+                "pub struct Repo;\nimpl Repo {\n    pub fn open() {}\n}\n",
+            )
+            .await,
+            parse_rust(
+                "/repo/crates/codeos-core/src/lib.rs",
+                "use codeos_storage::Repo;\npub fn go() {\n    Repo::open();\n}\n",
+            )
+            .await,
+        ];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+        let go = find(&delta, "crates::codeos-core::src::lib::go");
+
+        assert!(
+            !delta
+                .added_relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Calls && r.source_id == go.id),
+            "una call ambigua non deve produrre alcun arco risolto"
+        );
+        assert!(
+            delta.added_relations.iter().any(|r| {
+                r.kind == RelationKind::Unresolved
+                    && r.source_id == go.id
+                    && r.metadata.get("unresolved_target").map(String::as_str) == Some("Repo::open")
+            }),
+            "la call ambigua deve restare Unresolved col target grezzo"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_qualified_call_is_not_misresolved() {
+        // `HashMap::new` (std) non deve mai agganciarsi a un'entità interna: il tipo
+        // non è nel grafo, quindi resta Unresolved (niente arco verso un omonimo).
+        let parsed = vec![
+            parse_rust(
+                "/repo/crates/codeos-core/src/lib.rs",
+                "use std::collections::HashMap;\npub fn go() {\n    HashMap::new();\n}\n",
+            )
+            .await,
+        ];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+        let go = find(&delta, "crates::codeos-core::src::lib::go");
+
+        assert!(
+            !delta
+                .added_relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Calls && r.source_id == go.id),
+            "HashMap::new non deve risolvere a un'entità interna"
+        );
     }
 
     #[tokio::test]
