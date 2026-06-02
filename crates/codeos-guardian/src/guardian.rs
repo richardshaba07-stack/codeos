@@ -906,8 +906,11 @@ impl Guardian {
         base: &str,
         head: &str,
     ) -> anyhow::Result<codeos_types::bus::PrMriResponse> {
-        let repo_dir = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("/Users/richard/Desktop/CodeOs 3"));
+        let repo_dir = std::env::current_dir().map_err(|e| {
+            anyhow::anyhow!(
+                "PrMri: working dir del server illeggibile (serve come root del repo git): {e}"
+            )
+        })?;
         let mut cmd = std::process::Command::new("git");
         cmd.arg("-C")
             .arg(&repo_dir)
