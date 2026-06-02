@@ -18,7 +18,7 @@ use codeos_memory::{Decision, DecisionKind, DecisionStore};
 use codeos_paleo::{excavate, occasions, Abstention, CommitHistory, DecisionFossil, Z_95};
 use codeos_storage::{GraphStorage, RelationFilter};
 use codeos_types::bus::{ArchitectureViolation, NewDecision};
-use codeos_types::{EntityId, EntityKind, Relation};
+use codeos_types::{Entity, EntityId, EntityKind, Relation};
 
 use crate::invariant::{
     boundary_entities, layer_of_entity, mine_layering_rules, violations_for, LayerConfig, LayerKey,
@@ -547,22 +547,52 @@ impl Guardian {
         Ok(codeos_paleo::is_history_insufficient(&commits, fossils))
     }
 
-    pub async fn guard_before(
-        &self,
-        goal: &str,
-    ) -> anyhow::Result<codeos_types::bus::GuardBeforeResponse> {
+    /// Seleziona le entità bersaglio per un goal/query in linguaggio
+    /// quasi-naturale. Estrae keyword (≥3 caratteri) e le cerca per sottostringa,
+    /// ma SCARTA quelle non discriminative: una parola presente in più di metà dei
+    /// qualified_name — i prefissi universali del namespace come "codeos", "src",
+    /// "crates" — non localizza nulla, e trattarla come bersaglio gonfierebbe
+    /// l'impatto all'intero grafo (un falso positivo). Le entità sono deduplicate
+    /// per id. Condiviso da `guard_before` e `get_context_pack`.
+    async fn select_target_entities(&self, goal: &str) -> Vec<Entity> {
         let keywords: Vec<String> = goal
             .split(|c: char| !c.is_alphanumeric())
             .filter(|s| s.len() >= 3)
             .map(|s| s.to_lowercase())
             .collect();
 
+        let total_entities = self
+            .storage
+            .graph_quality()
+            .await
+            .map(|q| q.total_entities)
+            .unwrap_or(0);
+
         let mut target_entities = Vec::new();
+        let mut seen_entity_ids = HashSet::new();
         for kw in &keywords {
-            if let Ok(ents) = self.storage.find_entities_by_name_pattern(kw).await {
-                target_entities.extend(ents);
+            let Ok(ents) = self.storage.find_entities_by_name_pattern(kw).await else {
+                continue;
+            };
+            // Soglia 50%: tiene i nomi di crate reali (pochi punti percentuali) e
+            // scarta i prefissi universali che matcherebbero quasi tutto il grafo.
+            if total_entities > 0 && (ents.len() as u64) * 2 > total_entities {
+                continue;
+            }
+            for ent in ents {
+                if seen_entity_ids.insert(ent.id) {
+                    target_entities.push(ent);
+                }
             }
         }
+        target_entities
+    }
+
+    pub async fn guard_before(
+        &self,
+        goal: &str,
+    ) -> anyhow::Result<codeos_types::bus::GuardBeforeResponse> {
+        let target_entities = self.select_target_entities(goal).await;
 
         let mut target_files: Vec<String> = target_entities
             .iter()
@@ -590,8 +620,13 @@ impl Guardian {
             }
         }
 
+        // Blast radius = numero di ENTITÀ distinte che dipendono dal bersaglio
+        // (le `source` delle relazioni entranti), non il numero di archi. Un'entità
+        // che dipende dal bersaglio via più relazioni è un solo impatto. Il vecchio
+        // codice deduplicava per id di relazione: contava gli archi e poteva
+        // superare il totale delle entità del grafo — un numero che mente.
         let mut blast_radius = 0;
-        let mut incoming_visited = HashSet::new();
+        let mut dependent_entities = HashSet::new();
         for ent in &target_entities {
             if let Ok(rels) = self
                 .storage
@@ -602,7 +637,7 @@ impl Guardian {
                 .await
             {
                 for rel in rels {
-                    if incoming_visited.insert(rel.id) {
+                    if dependent_entities.insert(rel.source_id) {
                         blast_radius += 1;
                     }
                 }
@@ -719,18 +754,7 @@ impl Guardian {
         goal: &str,
         _for_ai: bool,
     ) -> anyhow::Result<codeos_types::bus::GetContextPackResponse> {
-        let keywords: Vec<String> = goal
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|s| s.len() >= 3)
-            .map(|s| s.to_lowercase())
-            .collect();
-
-        let mut target_entities = Vec::new();
-        for kw in &keywords {
-            if let Ok(ents) = self.storage.find_entities_by_name_pattern(kw).await {
-                target_entities.extend(ents);
-            }
-        }
+        let target_entities = self.select_target_entities(goal).await;
 
         let mut files_to_read: Vec<String> = target_entities
             .iter()
@@ -2021,5 +2045,81 @@ mod tests {
         let guardian = Guardian::new(storage);
         // Una sola fondazione rispettata da un solo layer: niente convenzione, niente buco.
         assert!(guardian.missing_invariants().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blast_radius_counts_distinct_dependent_entities_not_edges() {
+        // Un solo dipendente, ma collegato al bersaglio via DUE archi (Calls +
+        // Imports). Il blast radius onesto è 1 entità impattata, non 2 archi:
+        // deduplicare per id di relazione (il vecchio comportamento) dava 2.
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let target = entity("app::core::widget::build");
+        let dependent = entity("app::api::caller::run");
+        // Entità di rumore per diluire la frequenza delle keyword.
+        let noise_a = entity("app::core::other_a::xx");
+        let noise_b = entity("app::core::other_b::yy");
+        storage
+            .apply_delta(GraphDelta {
+                added_entities: vec![target.clone(), dependent.clone(), noise_a, noise_b],
+                added_relations: vec![
+                    relation(RelationKind::Calls, dependent.id, target.id),
+                    relation(RelationKind::Imports, dependent.id, target.id),
+                ],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let guardian = Guardian::new(storage);
+
+        let res = guardian.guard_before("build").await.unwrap();
+        assert_eq!(
+            res.blast_radius, 1,
+            "una sola entità dipende dal bersaglio, anche se via due archi (blast={})",
+            res.blast_radius
+        );
+    }
+
+    #[tokio::test]
+    async fn non_discriminative_keyword_does_not_inflate_blast_radius() {
+        // "app" compare in OGNI qualified_name: non localizza nulla e non deve
+        // diventare un bersaglio, altrimenti il blast radius esplode all'intero
+        // grafo. Una keyword specifica invece continua a funzionare.
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let target = entity("app::svc::pay::charge");
+        let callers: Vec<Entity> = (0..3)
+            .map(|i| entity(&format!("app::ui::screen_{i}::run")))
+            .collect();
+        let rels: Vec<Relation> = callers
+            .iter()
+            .map(|c| relation(RelationKind::Calls, c.id, target.id))
+            .collect();
+        storage
+            .apply_delta(GraphDelta {
+                added_entities: std::iter::once(target.clone())
+                    .chain(callers.iter().cloned())
+                    .collect(),
+                added_relations: rels,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let guardian = Guardian::new(storage);
+
+        // Keyword specifica: trova i 3 chiamanti distinti.
+        let specific = guardian.guard_before("charge").await.unwrap();
+        assert_eq!(
+            specific.blast_radius, 3,
+            "il bersaglio 'charge' è dipeso da 3 entità distinte (blast={})",
+            specific.blast_radius
+        );
+
+        // Keyword universale: "app" matcha tutto → scartata → nessun bersaglio,
+        // niente esplosione globale.
+        let vague = guardian.guard_before("app").await.unwrap();
+        assert_eq!(
+            vague.blast_radius, 0,
+            "una keyword che matcha l'intero grafo non deve produrre impatto (blast={})",
+            vague.blast_radius
+        );
     }
 }
