@@ -2,11 +2,11 @@
 //!
 //! Legge `CODEOS_ADDR` per l'indirizzo del server (default: `127.0.0.1:50051`).
 
+use codeos_rpc::proto;
+use proto::code_os_client::CodeOsClient;
 use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::time::Duration;
-use codeos_rpc::proto;
-use proto::code_os_client::CodeOsClient;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -25,17 +25,17 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             let raw_path = &args[2];
-            let absolute_path = Path::new(raw_path)
-                .canonicalize()
-                .map_err(|e| anyhow::anyhow!("Impossibile trovare il percorso '{}': {}", raw_path, e))?;
+            let absolute_path = Path::new(raw_path).canonicalize().map_err(|e| {
+                anyhow::anyhow!("Impossibile trovare il percorso '{}': {}", raw_path, e)
+            })?;
             let project_root = absolute_path.to_string_lossy().to_string();
 
             let mut client = connect_server().await?;
             println!("⚡ Invio richiesta di indicizzazione per: {}", project_root);
-            
+
             let req = proto::IndexProjectRequest { project_root };
             client.index_project(req).await?;
-            
+
             println!("🎉 Indicizzazione completata con successo!");
         }
         "report" => {
@@ -51,7 +51,10 @@ async fn main() -> anyhow::Result<()> {
             let response = client.get_architecture_report(req).await?.into_inner();
 
             if opts.json {
-                println!("{}", serde_json::to_string_pretty(&report_to_json(&response))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report_to_json(&response))?
+                );
             } else {
                 render_terminal_report(response, &opts);
             }
@@ -63,19 +66,23 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             let query_text = &args[2];
-            
+
             let mut client = connect_server().await?;
             println!("⚡ Interrogazione del grafo semantico...");
-            
+
             let req = proto::QueryGraphRequest {
                 natural_language: query_text.clone(),
             };
             let response = client.query_graph(req).await?.into_inner();
-            
+
             println!("\n=== CONTESTO GENERATO PER LLM ===\n");
             println!("{}", response.formatted_context);
             println!("==================================\n");
-            println!("ℹ️  Trovate {} entità e {} relazioni rilevanti.", response.entities.len(), response.relations.len());
+            println!(
+                "ℹ️  Trovate {} entità e {} relazioni rilevanti.",
+                response.entities.len(),
+                response.relations.len()
+            );
         }
         "doctor" => {
             run_doctor().await;
@@ -97,7 +104,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("🛡️  FIREWALL ARCHITETTURALE - GUARD BEFORE");
                 println!("------------------------------------------");
                 println!("🎯 Goal: \"{}\"", goal);
-                println!("📊 Raggio d'impatto (Blast Radius): {} entità", res.blast_radius);
+                println!(
+                    "📊 Raggio d'impatto (Blast Radius): {} entità",
+                    res.blast_radius
+                );
                 println!("🛣️  Percorso sicuro consigliato: {}", res.safe_path);
                 println!("\n📂 File target a rischio:");
                 for f in &res.target_files {
@@ -115,7 +125,10 @@ async fn main() -> anyhow::Result<()> {
                 if res.violations.is_empty() {
                     println!("✅ Nessuna violazione architetturale rilevata! Ottimo lavoro.");
                 } else {
-                    println!("🔴 Rilevate {} violazioni architetturali!", res.violations.len());
+                    println!(
+                        "🔴 Rilevate {} violazioni architetturali!",
+                        res.violations.len()
+                    );
                     for vio in &res.violations {
                         let loc_str = if let Some(loc) = &vio.location {
                             format!("{}:{}", loc.file_path, loc.start_line)
@@ -130,7 +143,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             } else {
-                eprintln!("Errore: flag '{}' sconosciuto. Usa `--before` o `--after`.", args[2]);
+                eprintln!(
+                    "Errore: flag '{}' sconosciuto. Usa `--before` o `--after`.",
+                    args[2]
+                );
                 std::process::exit(1);
             }
         }
@@ -141,7 +157,9 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             let goal = &args[2];
-            let for_ai = args.iter().any(|arg| arg == "--for" || arg == "ai" || arg == "--for=ai");
+            let for_ai = args
+                .iter()
+                .any(|arg| arg == "--for" || arg == "ai" || arg == "--for=ai");
             let mut client = connect_server().await?;
             let req = proto::GetContextPackRequest {
                 goal: goal.clone(),
@@ -267,18 +285,19 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn connect_server() -> anyhow::Result<CodeOsClient<tonic::transport::Channel>> {
-    let mut address = std::env::var("CODEOS_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:50051".to_string());
-    
+    let mut address =
+        std::env::var("CODEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:50051".to_string());
+
     if !address.starts_with("http://") && !address.starts_with("https://") {
         address = format!("http://{}", address);
     }
 
-    CodeOsClient::connect(address)
-        .await
-        .map_err(|e| anyhow::anyhow!(
-            "Impossibile connettersi al server CodeOS. È attivo? Dettaglio: {}", e
-        ))
+    CodeOsClient::connect(address).await.map_err(|e| {
+        anyhow::anyhow!(
+            "Impossibile connettersi al server CodeOS. È attivo? Dettaglio: {}",
+            e
+        )
+    })
 }
 
 /// `codeos doctor` — controlla, senza modificare nulla, che l'ambiente sia pronto:
@@ -290,8 +309,7 @@ async fn run_doctor() {
     let mut problems = 0u32;
 
     // 1) Indirizzo del server.
-    let raw_addr =
-        std::env::var("CODEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:50051".to_string());
+    let raw_addr = std::env::var("CODEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:50051".to_string());
     let source = if std::env::var("CODEOS_ADDR").is_ok() {
         "CODEOS_ADDR"
     } else {
@@ -390,7 +408,9 @@ fn print_usage() {
     println!("Opzioni di `report`:");
     println!("  --verbose, -v     Mostra tutto: anche gli invarianti a bassa confidenza e i fossili per esteso");
     println!("  --only high-risk  Mostra solo gli esiti ad alto rischio");
-    println!("  --json            Stampa il referto come JSON (per CI e agent AI), senza decorazioni");
+    println!(
+        "  --json            Stampa il referto come JSON (per CI e agent AI), senza decorazioni"
+    );
     println!();
     println!("Variabili d'ambiente:");
     println!("  CODEOS_ADDR       Indirizzo del server gRPC (default: 127.0.0.1:50051)");
@@ -569,7 +589,11 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &R
     if upstreams.is_empty() {
         println!("  • Fondazioni: Nessun modulo identificato come fondazione solida.");
     } else {
-        let top_upstreams: Vec<String> = upstreams.iter().take(3).map(|(name, count)| format!("{} (supportato da {} layer)", name, count)).collect();
+        let top_upstreams: Vec<String> = upstreams
+            .iter()
+            .take(3)
+            .map(|(name, count)| format!("{} (supportato da {} layer)", name, count))
+            .collect();
         println!("  • Fondazioni principali: {}", top_upstreams.join(", "));
     }
 
@@ -584,7 +608,11 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &R
     if downstreams.is_empty() {
         println!("  • Dipendenze: Nessun modulo identificato ad alta dipendenza.");
     } else {
-        let top_downstreams: Vec<String> = downstreams.iter().take(3).map(|(name, count)| format!("{} (dipende da {} layer)", name, count)).collect();
+        let top_downstreams: Vec<String> = downstreams
+            .iter()
+            .take(3)
+            .map(|(name, count)| format!("{} (dipende da {} layer)", name, count))
+            .collect();
         println!("  • Layer più dipendenti:  {}", top_downstreams.join(", "));
     }
 
@@ -600,7 +628,10 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &R
     println!("---------------------");
     let mut actions = Vec::new();
     if !report.gaps.is_empty() {
-        actions.push(format!("Risolvi l'accoppiamento ciclico anomalo tra i layer '{}' e '{}'", report.gaps[0].upstream, report.gaps[0].downstream));
+        actions.push(format!(
+            "Risolvi l'accoppiamento ciclico anomalo tra i layer '{}' e '{}'",
+            report.gaps[0].upstream, report.gaps[0].downstream
+        ));
     }
     let uncalibrated = report.invariants.iter().any(|inv| !inv.calibrated);
     if uncalibrated {
@@ -609,7 +640,10 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &R
     if report.invariants.is_empty() {
         actions.push("Indicizza altri file o moduli del progetto per far emergere gli invarianti strutturali latenti".to_string());
     } else {
-        actions.push(format!("Consolida il confine architetturale a difesa di '{}'", report.invariants[0].upstream));
+        actions.push(format!(
+            "Consolida il confine architetturale a difesa di '{}'",
+            report.invariants[0].upstream
+        ));
     }
 
     for (idx, action) in actions.iter().enumerate() {
@@ -649,7 +683,11 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &R
         for inv in &invariants[..cap] {
             let conf_pct = (inv.confidence * 100.0).round();
             if opts.verbose {
-                let source = if inv.calibrated { "tempo / git log" } else { "strutturale / statico" };
+                let source = if inv.calibrated {
+                    "tempo / git log"
+                } else {
+                    "strutturale / statico"
+                };
                 println!(
                     "  • {} '{}' NON deve dipendere da '{}'\n    [Origine: {} | Supporto: {} archi | Confidenza: {}% | Calibrato: {}]",
                     severity_badge(&inv.severity), inv.upstream, inv.downstream, origin_label(&inv.origin), inv.support, conf_pct, source
@@ -657,7 +695,12 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &R
             } else {
                 println!(
                     "  {} '{}' NON deve dipendere da '{}'  [sup {} · conf {}% · {}]",
-                    severity_badge(&inv.severity), inv.upstream, inv.downstream, inv.support, conf_pct, origin_label(&inv.origin)
+                    severity_badge(&inv.severity),
+                    inv.upstream,
+                    inv.downstream,
+                    inv.support,
+                    conf_pct,
+                    origin_label(&inv.origin)
                 );
             }
         }
@@ -674,7 +717,11 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &R
         println!("  (Nessun fossile estratto dalla storia git)");
     } else if opts.verbose {
         for f in &report.fossils {
-            let hash = if f.born_at.len() >= 12 { &f.born_at[..12] } else { &f.born_at };
+            let hash = if f.born_at.len() >= 12 {
+                &f.born_at[..12]
+            } else {
+                &f.born_at
+            };
             println!("  • Confine '{}' → '{}'", f.downstream, f.upstream);
             println!("    Nato nel commit: [{}] «{}»", hash, f.intent);
             if !f.born_structure.is_empty() {
@@ -685,10 +732,18 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &R
         // Compatto: il dettaglio è verboso (2-3 righe a fossile). Qui un solo
         // esempio + il conteggio; la storia completa è dietro --verbose.
         let f = &report.fossils[0];
-        let hash = if f.born_at.len() >= 12 { &f.born_at[..12] } else { &f.born_at };
+        let hash = if f.born_at.len() >= 12 {
+            &f.born_at[..12]
+        } else {
+            &f.born_at
+        };
         println!(
             "  • {} confini datati; es. '{}' → '{}' nato in [{}] «{}»",
-            report.fossils.len(), f.downstream, f.upstream, hash, f.intent
+            report.fossils.len(),
+            f.downstream,
+            f.upstream,
+            hash,
+            f.intent
         );
         println!("    (usa --verbose per la storia completa di ogni confine)");
     }
@@ -717,7 +772,9 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &R
         for gap in &gaps[..cap] {
             println!(
                 "  • {} La fondazione '{}' è violata dall'eccezione '{}'",
-                severity_badge(&gap.severity), gap.upstream, gap.downstream
+                severity_badge(&gap.severity),
+                gap.upstream,
+                gap.downstream
             );
             // Il "perché" della lacuna (roadmap 13): non è un buco arbitrario, è
             // un'eccezione a una convenzione che il resto del codice rispetta.
