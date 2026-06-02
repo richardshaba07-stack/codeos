@@ -1239,9 +1239,36 @@ impl Guardian {
         let mut suggested_tests = Vec::new();
         let mut recommendation_plan = Vec::new();
 
-        if !source.is_empty() && !target.is_empty() {
-            if let Ok(entities) = self.storage.find_entities_by_name_pattern(&source).await {
-                for ent in entities {
+        if source.is_empty() || target.is_empty() {
+            dependencies_to_rewrite.push("Specifica un'espressione nel formato 'move <sorgente> to <destinazione>' per simulare.".to_string());
+            risks.push("Espressione non riconosciuta.".to_string());
+        } else if source == target {
+            // Spostare qualcosa su sé stesso è un no-op: niente confini fusi, niente
+            // piano in 4 passi. Dirlo è meglio che inventare un refactor inesistente.
+            risks.push(format!(
+                "Sorgente e destinazione coincidono ('{}'): non c'è nulla da spostare.",
+                source
+            ));
+        } else {
+            let matched = self
+                .storage
+                .find_entities_by_name_pattern(&source)
+                .await
+                .unwrap_or_default();
+
+            if matched.is_empty() {
+                // Sorgente assente dal grafo. La vecchia versione emetteva comunque
+                // rischi e un piano in 4 passi con dependencies_to_rewrite vuoto — che
+                // un'AI legge come «niente dipende da questo, spostamento facile». Ma
+                // vuoto qui significa «non l'ho trovata», non «spostamento sicuro».
+                risks.push(format!(
+                    "Nessuna entità corrisponde a '{}' nel grafo: non posso simularne lo \
+                     spostamento. Una lista di dipendenze vuota qui significa «sorgente \
+                     sconosciuta», non «spostamento sicuro».",
+                    source
+                ));
+            } else {
+                for ent in matched {
                     if let Ok(outgoing) = self
                         .storage
                         .query_relations(RelationFilter {
@@ -1279,28 +1306,25 @@ impl Guardian {
                         }
                     }
                 }
-            }
 
-            risks.push(format!(
-                "Lo spostamento di '{}' potrebbe rompere l'incapsulamento del layer.",
-                source
-            ));
-            changed_boundaries.push(format!(
-                "Il confine di '{}' verrà fuso con '{}'.",
-                source, target
-            ));
-            recommendation_plan.push(format!("1. Crea il modulo di destinazione '{}'", target));
-            recommendation_plan.push(format!(
-                "2. Sposta le classi/funzioni da '{}' a '{}'",
-                source, target
-            ));
-            recommendation_plan
-                .push("3. Aggiorna i relativi import nel resto del progetto".to_string());
-            recommendation_plan.push("4. Esegui i test di regressione".to_string());
-            suggested_tests.push(format!("Esegui tutti i test nel modulo '{}'", target));
-        } else {
-            dependencies_to_rewrite.push("Specifica un'espressione nel formato 'move <sorgente> to <destinazione>' per simulare.".to_string());
-            risks.push("Espressione non riconosciuta.".to_string());
+                risks.push(format!(
+                    "Lo spostamento di '{}' potrebbe rompere l'incapsulamento del layer.",
+                    source
+                ));
+                changed_boundaries.push(format!(
+                    "Il confine di '{}' verrà fuso con '{}'.",
+                    source, target
+                ));
+                recommendation_plan.push(format!("1. Crea il modulo di destinazione '{}'", target));
+                recommendation_plan.push(format!(
+                    "2. Sposta le classi/funzioni da '{}' a '{}'",
+                    source, target
+                ));
+                recommendation_plan
+                    .push("3. Aggiorna i relativi import nel resto del progetto".to_string());
+                recommendation_plan.push("4. Esegui i test di regressione".to_string());
+                suggested_tests.push(format!("Esegui tutti i test nel modulo '{}'", target));
+            }
         }
 
         Ok(codeos_types::bus::SimulateResponse {
@@ -2340,6 +2364,107 @@ mod tests {
         assert!(
             !precise.relevant_entities.is_empty(),
             "un goal localizzato deve avere entità rilevanti"
+        );
+    }
+
+    #[tokio::test]
+    async fn simulate_does_not_emit_a_plan_for_an_unknown_source() {
+        // La sorgente non esiste nel grafo: la vecchia simulate emetteva comunque
+        // rischi e un piano in 4 passi con dipendenze vuote — letto come «spostamento
+        // facile». Ora dichiara la sorgente sconosciuta e NON propone alcun piano.
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        storage
+            .apply_delta(GraphDelta {
+                added_entities: vec![entity("app::svc::pay::charge")],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let guardian = Guardian::new(storage);
+
+        let sim = guardian
+            .simulate("move ghostmodule to app::svc::billing")
+            .await
+            .unwrap();
+
+        assert!(
+            sim.recommendation_plan.is_empty(),
+            "nessun piano per una sorgente che non esiste: {:?}",
+            sim.recommendation_plan
+        );
+        assert!(
+            sim.dependencies_to_rewrite.is_empty(),
+            "nessuna dipendenza da riscrivere per una sorgente assente: {:?}",
+            sim.dependencies_to_rewrite
+        );
+        assert!(
+            sim.risks
+                .iter()
+                .any(|r| r.contains("Nessuna entità corrisponde")),
+            "deve dichiarare la sorgente sconosciuta, non fingere sicurezza: {:?}",
+            sim.risks
+        );
+    }
+
+    #[tokio::test]
+    async fn simulate_treats_a_self_move_as_a_noop() {
+        // Spostare un modulo su sé stesso non è un refactor: è un no-op. La vecchia
+        // simulate produceva "Il confine di 'pay' verrà fuso con 'pay'" e un piano.
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let guardian = Guardian::new(storage);
+
+        let sim = guardian.simulate("move pay to pay").await.unwrap();
+
+        assert!(
+            sim.changed_boundaries.is_empty(),
+            "un no-op non fonde alcun confine: {:?}",
+            sim.changed_boundaries
+        );
+        assert!(
+            sim.recommendation_plan.is_empty(),
+            "un no-op non richiede un piano: {:?}",
+            sim.recommendation_plan
+        );
+        assert!(
+            sim.risks
+                .iter()
+                .any(|r| r.contains("non c'è nulla da spostare")),
+            "deve riconoscere il no-op: {:?}",
+            sim.risks
+        );
+    }
+
+    #[tokio::test]
+    async fn simulate_still_plans_a_real_move() {
+        // Anti-regressione: sorgente reale e destinazione diversa → la simulate
+        // legittima continua a produrre dipendenze da riscrivere e un piano.
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let target_ent = entity("app::svc::pay::charge");
+        let caller = entity("app::ui::screen::run");
+        let rel = relation(RelationKind::Calls, caller.id, target_ent.id);
+        storage
+            .apply_delta(GraphDelta {
+                added_entities: vec![target_ent.clone(), caller.clone()],
+                added_relations: vec![rel],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let guardian = Guardian::new(storage);
+
+        let sim = guardian
+            .simulate("move charge to app::svc::billing")
+            .await
+            .unwrap();
+
+        assert!(
+            !sim.recommendation_plan.is_empty(),
+            "uno spostamento reale deve avere un piano"
+        );
+        assert!(
+            !sim.dependencies_to_rewrite.is_empty(),
+            "uno spostamento reale con un chiamante deve elencare dipendenze: {:?}",
+            sim.dependencies_to_rewrite
         );
     }
 }
