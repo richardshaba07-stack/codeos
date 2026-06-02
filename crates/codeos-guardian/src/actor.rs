@@ -63,11 +63,13 @@ impl GuardianActor {
     ) -> Self {
         // Regole dichiarate a mano: `<repo>/.codeos/config.yaml` (opzionale). Le
         // carichiamo prima di consumare `repo_root` nel GitLog.
-        let declared = crate::declared::load_declared_rules(
-            &repo_root.join(".codeos").join("config.yaml"),
-        );
+        let declared =
+            crate::declared::load_declared_rules(&repo_root.join(".codeos").join("config.yaml"));
         if !declared.is_empty() {
-            tracing::info!(count = declared.len(), "regole di layering dichiarate caricate da config");
+            tracing::info!(
+                count = declared.len(),
+                "regole di layering dichiarate caricate da config"
+            );
         }
         Self {
             guardian: Guardian::with_memory(storage, decisions)
@@ -156,11 +158,19 @@ impl GuardianActor {
                 let res = self.guardian.guard_after().await;
                 let _ = reply_to.send(res).await;
             }
-            Command::GetContextPack { goal, for_ai, reply_to } => {
+            Command::GetContextPack {
+                goal,
+                for_ai,
+                reply_to,
+            } => {
                 let res = self.guardian.get_context_pack(&goal, for_ai).await;
                 let _ = reply_to.send(res).await;
             }
-            Command::PrMri { base, head, reply_to } => {
+            Command::PrMri {
+                base,
+                head,
+                reply_to,
+            } => {
                 let res = self.guardian.pr_mri(&base, &head).await;
                 let _ = reply_to.send(res).await;
             }
@@ -185,7 +195,11 @@ impl GuardianActor {
         let calibrated = self.guardian.has_history();
         let rules = self.guardian.mine_rules_calibrated().await?;
         let raw_fossils = self.guardian.fossils().await?;
-        let history_insufficient = self.guardian.check_history_adequacy(&raw_fossils).await.unwrap_or(false);
+        let history_insufficient = self
+            .guardian
+            .check_history_adequacy(&raw_fossils)
+            .await
+            .unwrap_or(false);
         let gaps = self.guardian.missing_invariants().await?;
         // Qualità del grafo (P2-7): quanto fidarsi del referto appena costruito.
         let quality = self.guardian.graph_quality().await?;

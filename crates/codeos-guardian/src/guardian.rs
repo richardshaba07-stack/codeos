@@ -547,7 +547,10 @@ impl Guardian {
         Ok(codeos_paleo::is_history_insufficient(&commits, fossils))
     }
 
-    pub async fn guard_before(&self, goal: &str) -> anyhow::Result<codeos_types::bus::GuardBeforeResponse> {
+    pub async fn guard_before(
+        &self,
+        goal: &str,
+    ) -> anyhow::Result<codeos_types::bus::GuardBeforeResponse> {
         let keywords: Vec<String> = goal
             .split(|c: char| !c.is_alphanumeric())
             .filter(|s| s.len() >= 3)
@@ -561,7 +564,10 @@ impl Guardian {
             }
         }
 
-        let mut target_files: Vec<String> = target_entities.iter().map(|e| e.location.file_path.clone()).collect();
+        let mut target_files: Vec<String> = target_entities
+            .iter()
+            .map(|e| e.location.file_path.clone())
+            .collect();
         target_files.sort();
         target_files.dedup();
 
@@ -574,18 +580,27 @@ impl Guardian {
 
         let mut boundaries = Vec::new();
         for rule in &rules {
-            if target_layers.contains(&rule.upstream.0) || target_layers.contains(&rule.downstream.0) {
-                boundaries.push(format!("'{}' non deve dipendere da '{}' (confidenza: {:.2})", rule.downstream.0, rule.upstream.0, rule.confidence));
+            if target_layers.contains(&rule.upstream.0)
+                || target_layers.contains(&rule.downstream.0)
+            {
+                boundaries.push(format!(
+                    "'{}' non deve dipendere da '{}' (confidenza: {:.2})",
+                    rule.downstream.0, rule.upstream.0, rule.confidence
+                ));
             }
         }
 
         let mut blast_radius = 0;
         let mut incoming_visited = HashSet::new();
         for ent in &target_entities {
-            if let Ok(rels) = self.storage.query_relations(RelationFilter {
-                target_id: Some(ent.id),
-                ..Default::default()
-            }).await {
+            if let Ok(rels) = self
+                .storage
+                .query_relations(RelationFilter {
+                    target_id: Some(ent.id),
+                    ..Default::default()
+                })
+                .await
+            {
                 for rel in rels {
                     if incoming_visited.insert(rel.id) {
                         blast_radius += 1;
@@ -597,11 +612,16 @@ impl Guardian {
         let safe_path = if target_entities.is_empty() {
             "Nessun modulo a rischio rilevato. Procedi con cautela.".to_string()
         } else {
-            format!("Per modificare i file in sicurezza, mantieni separati i layer: {}", 
-                target_layers.into_iter().collect::<Vec<_>>().join(", "))
+            format!(
+                "Per modificare i file in sicurezza, mantieni separati i layer: {}",
+                target_layers.into_iter().collect::<Vec<_>>().join(", ")
+            )
         };
 
-        let mut context_pack = format!("# AI Architecture Firewall - Guard Before\n\n**Goal:** \"{}\"\n\n", goal);
+        let mut context_pack = format!(
+            "# AI Architecture Firewall - Guard Before\n\n**Goal:** \"{}\"\n\n",
+            goal
+        );
         context_pack.push_str("## Target Files a rischio:\n");
         for f in &target_files {
             context_pack.push_str(&format!("- {}\n", f));
@@ -610,7 +630,10 @@ impl Guardian {
         for b in &boundaries {
             context_pack.push_str(&format!("- {}\n", b));
         }
-        context_pack.push_str(&format!("\n**Raggio d'impatto (Blast Radius):** {} entità dipendenti.\n", blast_radius));
+        context_pack.push_str(&format!(
+            "\n**Raggio d'impatto (Blast Radius):** {} entità dipendenti.\n",
+            blast_radius
+        ));
 
         Ok(codeos_types::bus::GuardBeforeResponse {
             target_files,
@@ -629,10 +652,14 @@ impl Guardian {
                     for file_path in &latest_commit.changed_files {
                         if let Ok(entities) = self.storage.get_entities_by_file(file_path).await {
                             for ent in entities {
-                                if let Ok(rels) = self.storage.query_relations(RelationFilter {
-                                    source_id: Some(ent.id),
-                                    ..Default::default()
-                                }).await {
+                                if let Ok(rels) = self
+                                    .storage
+                                    .query_relations(RelationFilter {
+                                        source_id: Some(ent.id),
+                                        ..Default::default()
+                                    })
+                                    .await
+                                {
                                     latest_relations.extend(rels);
                                 }
                             }
@@ -644,7 +671,11 @@ impl Guardian {
 
         let mut candidate_relations = latest_relations;
         if candidate_relations.is_empty() {
-            if let Ok(all_rels) = self.storage.query_relations(RelationFilter::default()).await {
+            if let Ok(all_rels) = self
+                .storage
+                .query_relations(RelationFilter::default())
+                .await
+            {
                 candidate_relations = all_rels;
             }
         }
@@ -653,15 +684,24 @@ impl Guardian {
 
         let mut new_relations = Vec::new();
         for rel in &candidate_relations {
-            if let (Ok(Some(src)), Ok(Some(tgt))) = (self.storage.get_entity_by_id(&rel.source_id).await, self.storage.get_entity_by_id(&rel.target_id).await) {
-                new_relations.push(format!("'{}' -> '{}' ({:?})", src.qualified_name, tgt.qualified_name, rel.kind));
+            if let (Ok(Some(src)), Ok(Some(tgt))) = (
+                self.storage.get_entity_by_id(&rel.source_id).await,
+                self.storage.get_entity_by_id(&rel.target_id).await,
+            ) {
+                new_relations.push(format!(
+                    "'{}' -> '{}' ({:?})",
+                    src.qualified_name, tgt.qualified_name, rel.kind
+                ));
             }
         }
 
         let mut proposed_fixes = Vec::new();
         for vio in &violations {
             if let Some(loc) = &vio.location {
-                proposed_fixes.push(format!("Riferimento illegale in {}:{}. Dettaglio: {}", loc.file_path, loc.start_line, vio.message));
+                proposed_fixes.push(format!(
+                    "Riferimento illegale in {}:{}. Dettaglio: {}",
+                    loc.file_path, loc.start_line, vio.message
+                ));
             } else {
                 proposed_fixes.push(format!("Riferimento illegale. Dettaglio: {}", vio.message));
             }
@@ -674,7 +714,11 @@ impl Guardian {
         })
     }
 
-    pub async fn get_context_pack(&self, goal: &str, _for_ai: bool) -> anyhow::Result<codeos_types::bus::GetContextPackResponse> {
+    pub async fn get_context_pack(
+        &self,
+        goal: &str,
+        _for_ai: bool,
+    ) -> anyhow::Result<codeos_types::bus::GetContextPackResponse> {
         let keywords: Vec<String> = goal
             .split(|c: char| !c.is_alphanumeric())
             .filter(|s| s.len() >= 3)
@@ -688,25 +732,41 @@ impl Guardian {
             }
         }
 
-        let mut files_to_read: Vec<String> = target_entities.iter().map(|e| e.location.file_path.clone()).collect();
+        let mut files_to_read: Vec<String> = target_entities
+            .iter()
+            .map(|e| e.location.file_path.clone())
+            .collect();
         files_to_read.sort();
         files_to_read.dedup();
 
-        let mut relevant_entities: Vec<String> = target_entities.iter().map(|e| e.qualified_name.clone()).collect();
+        let mut relevant_entities: Vec<String> = target_entities
+            .iter()
+            .map(|e| e.qualified_name.clone())
+            .collect();
         relevant_entities.sort();
         relevant_entities.dedup();
 
         let mut key_dependencies = Vec::new();
         let selected_ids: HashSet<EntityId> = target_entities.iter().map(|e| e.id).collect();
         for ent in &target_entities {
-            if let Ok(rels) = self.storage.query_relations(RelationFilter {
-                source_id: Some(ent.id),
-                ..Default::default()
-            }).await {
+            if let Ok(rels) = self
+                .storage
+                .query_relations(RelationFilter {
+                    source_id: Some(ent.id),
+                    ..Default::default()
+                })
+                .await
+            {
                 for rel in rels {
                     if selected_ids.contains(&rel.target_id) {
-                        if let (Ok(Some(src)), Ok(Some(tgt))) = (self.storage.get_entity_by_id(&rel.source_id).await, self.storage.get_entity_by_id(&rel.target_id).await) {
-                            key_dependencies.push(format!("{} -> {} ({:?})", src.qualified_name, tgt.qualified_name, rel.kind));
+                        if let (Ok(Some(src)), Ok(Some(tgt))) = (
+                            self.storage.get_entity_by_id(&rel.source_id).await,
+                            self.storage.get_entity_by_id(&rel.target_id).await,
+                        ) {
+                            key_dependencies.push(format!(
+                                "{} -> {} ({:?})",
+                                src.qualified_name, tgt.qualified_name, rel.kind
+                            ));
                         }
                     }
                 }
@@ -722,14 +782,22 @@ impl Guardian {
 
         let mut boundaries_to_preserve = Vec::new();
         for rule in &rules {
-            if target_layers.contains(&rule.upstream.0) || target_layers.contains(&rule.downstream.0) {
-                boundaries_to_preserve.push(format!("'{}' non deve dipendere da '{}' (confidenza: {:.2})", rule.downstream.0, rule.upstream.0, rule.confidence));
+            if target_layers.contains(&rule.upstream.0)
+                || target_layers.contains(&rule.downstream.0)
+            {
+                boundaries_to_preserve.push(format!(
+                    "'{}' non deve dipendere da '{}' (confidenza: {:.2})",
+                    rule.downstream.0, rule.upstream.0, rule.confidence
+                ));
             }
         }
 
         let mut local_patterns = Vec::new();
         for rule in rules.iter().take(3) {
-            local_patterns.push(format!("Convenzione: '{}' dipende da '{}' a senso unico.", rule.downstream.0, rule.upstream.0));
+            local_patterns.push(format!(
+                "Convenzione: '{}' dipende da '{}' a senso unico.",
+                rule.downstream.0, rule.upstream.0
+            ));
         }
         if local_patterns.is_empty() {
             local_patterns.push("Nessun pattern strutturale specifico rilevato.".to_string());
@@ -737,28 +805,41 @@ impl Guardian {
 
         let mut suggested_tests = Vec::new();
         for ent in &target_entities {
-            if let Ok(rels) = self.storage.query_relations(RelationFilter {
-                target_id: Some(ent.id),
-                kind: Some(codeos_types::RelationKind::Tests),
-                ..Default::default()
-            }).await {
+            if let Ok(rels) = self
+                .storage
+                .query_relations(RelationFilter {
+                    target_id: Some(ent.id),
+                    kind: Some(codeos_types::RelationKind::Tests),
+                    ..Default::default()
+                })
+                .await
+            {
                 for rel in rels {
-                    if let Ok(Some(test_ent)) = self.storage.get_entity_by_id(&rel.source_id).await {
-                        suggested_tests.push(format!("Esegui il test: {} ({})", test_ent.qualified_name, test_ent.location.file_path));
+                    if let Ok(Some(test_ent)) = self.storage.get_entity_by_id(&rel.source_id).await
+                    {
+                        suggested_tests.push(format!(
+                            "Esegui il test: {} ({})",
+                            test_ent.qualified_name, test_ent.location.file_path
+                        ));
                     }
                 }
             }
         }
         if suggested_tests.is_empty() {
-            suggested_tests.push("Scrivi nuovi test unitari per coprire le modifiche apportate.".to_string());
+            suggested_tests
+                .push("Scrivi nuovi test unitari per coprire le modifiche apportate.".to_string());
         }
 
         let mut blast_count = 0;
         for ent in &target_entities {
-            if let Ok(rels) = self.storage.query_relations(RelationFilter {
-                target_id: Some(ent.id),
-                ..Default::default()
-            }).await {
+            if let Ok(rels) = self
+                .storage
+                .query_relations(RelationFilter {
+                    target_id: Some(ent.id),
+                    ..Default::default()
+                })
+                .await
+            {
                 blast_count += rels.len();
             }
         }
@@ -770,10 +851,16 @@ impl Guardian {
             "low".to_string()
         };
 
-        let goal_interpretation = format!("Analisi e preparazione del contesto per raggiungere il goal: \"{}\"", goal);
+        let goal_interpretation = format!(
+            "Analisi e preparazione del contesto per raggiungere il goal: \"{}\"",
+            goal
+        );
 
         let mut markdown = format!("# AI Context Pack - goal: \"{}\"\n\n", goal);
-        markdown.push_str(&format!("**Stima del rischio:** {}\n\n", estimated_risk.to_uppercase()));
+        markdown.push_str(&format!(
+            "**Stima del rischio:** {}\n\n",
+            estimated_risk.to_uppercase()
+        ));
         markdown.push_str("## 1. Interpretazione del Goal\n");
         markdown.push_str(&format!("{}\n\n", goal_interpretation));
         markdown.push_str("## 2. File da Leggere / Modificare\n");
@@ -814,10 +901,19 @@ impl Guardian {
         })
     }
 
-    pub async fn pr_mri(&self, base: &str, head: &str) -> anyhow::Result<codeos_types::bus::PrMriResponse> {
-        let repo_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/Users/richard/Desktop/CodeOs 3"));
+    pub async fn pr_mri(
+        &self,
+        base: &str,
+        head: &str,
+    ) -> anyhow::Result<codeos_types::bus::PrMriResponse> {
+        let repo_dir = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/Users/richard/Desktop/CodeOs 3"));
         let mut cmd = std::process::Command::new("git");
-        cmd.arg("-C").arg(&repo_dir).arg("diff").arg("--name-only").arg(format!("{}..{}", base, head));
+        cmd.arg("-C")
+            .arg(&repo_dir)
+            .arg("diff")
+            .arg("--name-only")
+            .arg(format!("{}..{}", base, head));
         let mut files = Vec::new();
         if let Ok(output) = cmd.output() {
             if output.status.success() {
@@ -843,18 +939,28 @@ impl Guardian {
 
         let mut relations = Vec::new();
         for ent in &target_entities {
-            if let Ok(rels) = self.storage.query_relations(RelationFilter {
-                source_id: Some(ent.id),
-                ..Default::default()
-            }).await {
+            if let Ok(rels) = self
+                .storage
+                .query_relations(RelationFilter {
+                    source_id: Some(ent.id),
+                    ..Default::default()
+                })
+                .await
+            {
                 relations.extend(rels);
             }
         }
 
         let mut new_dependencies = Vec::new();
         for rel in &relations {
-            if let (Ok(Some(src)), Ok(Some(tgt))) = (self.storage.get_entity_by_id(&rel.source_id).await, self.storage.get_entity_by_id(&rel.target_id).await) {
-                new_dependencies.push(format!("'{}' -> '{}'", src.qualified_name, tgt.qualified_name));
+            if let (Ok(Some(src)), Ok(Some(tgt))) = (
+                self.storage.get_entity_by_id(&rel.source_id).await,
+                self.storage.get_entity_by_id(&rel.target_id).await,
+            ) {
+                new_dependencies.push(format!(
+                    "'{}' -> '{}'",
+                    src.qualified_name, tgt.qualified_name
+                ));
             }
         }
 
@@ -887,7 +993,8 @@ impl Guardian {
                 for file in &files {
                     if let Some(&count) = file_counts.get(file) {
                         if count > 2 {
-                            historical_hotspots.push(format!("{} (modificato {} volte)", file, count));
+                            historical_hotspots
+                                .push(format!("{} (modificato {} volte)", file, count));
                         }
                     }
                 }
@@ -896,11 +1003,15 @@ impl Guardian {
 
         let mut impacted_tests = Vec::new();
         for ent in &target_entities {
-            if let Ok(rels) = self.storage.query_relations(RelationFilter {
-                target_id: Some(ent.id),
-                kind: Some(codeos_types::RelationKind::Tests),
-                ..Default::default()
-            }).await {
+            if let Ok(rels) = self
+                .storage
+                .query_relations(RelationFilter {
+                    target_id: Some(ent.id),
+                    kind: Some(codeos_types::RelationKind::Tests),
+                    ..Default::default()
+                })
+                .await
+            {
                 for r in rels {
                     if let Ok(Some(test_ent)) = self.storage.get_entity_by_id(&r.source_id).await {
                         impacted_tests.push(test_ent.qualified_name.clone());
@@ -952,8 +1063,8 @@ impl Guardian {
 
         let fossils = self.fossils().await.unwrap_or_default();
         let matching_fossil = fossils.into_iter().find(|f| {
-            (f.upstream == upstream && f.downstream == downstream) || 
-            (f.upstream == downstream && f.downstream == upstream)
+            (f.upstream == upstream && f.downstream == downstream)
+                || (f.upstream == downstream && f.downstream == upstream)
         });
 
         let mut born_commit = String::new();
@@ -976,9 +1087,16 @@ impl Guardian {
         if let Some(store) = &self.decisions {
             if let Ok(all_decisions) = store.all().await {
                 for dec in all_decisions {
-                    if (dec.title.contains(&upstream) && dec.title.contains(&downstream)) ||
-                       dec.tags.iter().any(|t| t.contains(&upstream) || t.contains(&downstream)) {
-                        markdown_decisions.push(format!("### {}\n\n**Autore:** {}\n\n**Razionale:** {}\n\n**Contesto:** {}", dec.title, dec.author, dec.rationale, dec.context));
+                    if (dec.title.contains(&upstream) && dec.title.contains(&downstream))
+                        || dec
+                            .tags
+                            .iter()
+                            .any(|t| t.contains(&upstream) || t.contains(&downstream))
+                    {
+                        markdown_decisions.push(format!(
+                            "### {}\n\n**Autore:** {}\n\n**Razionale:** {}\n\n**Contesto:** {}",
+                            dec.title, dec.author, dec.rationale, dec.context
+                        ));
                     }
                 }
             }
@@ -1000,7 +1118,10 @@ impl Guardian {
         })
     }
 
-    pub async fn simulate(&self, expr: &str) -> anyhow::Result<codeos_types::bus::SimulateResponse> {
+    pub async fn simulate(
+        &self,
+        expr: &str,
+    ) -> anyhow::Result<codeos_types::bus::SimulateResponse> {
         let mut source = String::new();
         let mut target = String::new();
         if expr.to_lowercase().contains("move") && expr.to_lowercase().contains("to") {
@@ -1008,8 +1129,8 @@ impl Guardian {
             if let Some(pos) = parts.iter().position(|&w| w.to_lowercase() == "move") {
                 if let Some(to_pos) = parts.iter().position(|&w| w.to_lowercase() == "to") {
                     if to_pos > pos + 1 && parts.len() > to_pos + 1 {
-                        source = parts[pos+1..to_pos].join(" ");
-                        target = parts[to_pos+1..].join(" ");
+                        source = parts[pos + 1..to_pos].join(" ");
+                        target = parts[to_pos + 1..].join(" ");
                     }
                 }
             }
@@ -1024,34 +1145,60 @@ impl Guardian {
         if !source.is_empty() && !target.is_empty() {
             if let Ok(entities) = self.storage.find_entities_by_name_pattern(&source).await {
                 for ent in entities {
-                    if let Ok(outgoing) = self.storage.query_relations(RelationFilter {
-                        source_id: Some(ent.id),
-                        ..Default::default()
-                    }).await {
+                    if let Ok(outgoing) = self
+                        .storage
+                        .query_relations(RelationFilter {
+                            source_id: Some(ent.id),
+                            ..Default::default()
+                        })
+                        .await
+                    {
                         for r in outgoing {
-                            if let Ok(Some(tgt)) = self.storage.get_entity_by_id(&r.target_id).await {
-                                dependencies_to_rewrite.push(format!("Modifica chiamata da '{}' a '{}'", ent.qualified_name, tgt.qualified_name));
+                            if let Ok(Some(tgt)) = self.storage.get_entity_by_id(&r.target_id).await
+                            {
+                                dependencies_to_rewrite.push(format!(
+                                    "Modifica chiamata da '{}' a '{}'",
+                                    ent.qualified_name, tgt.qualified_name
+                                ));
                             }
                         }
                     }
-                    if let Ok(incoming) = self.storage.query_relations(RelationFilter {
-                        target_id: Some(ent.id),
-                        ..Default::default()
-                    }).await {
+                    if let Ok(incoming) = self
+                        .storage
+                        .query_relations(RelationFilter {
+                            target_id: Some(ent.id),
+                            ..Default::default()
+                        })
+                        .await
+                    {
                         for r in incoming {
-                            if let Ok(Some(src)) = self.storage.get_entity_by_id(&r.source_id).await {
-                                dependencies_to_rewrite.push(format!("Aggiorna chiamata da '{}' a '{}' (nuova destinazione: {})", src.qualified_name, ent.qualified_name, target));
+                            if let Ok(Some(src)) = self.storage.get_entity_by_id(&r.source_id).await
+                            {
+                                dependencies_to_rewrite.push(format!(
+                                    "Aggiorna chiamata da '{}' a '{}' (nuova destinazione: {})",
+                                    src.qualified_name, ent.qualified_name, target
+                                ));
                             }
                         }
                     }
                 }
             }
 
-            risks.push(format!("Lo spostamento di '{}' potrebbe rompere l'incapsulamento del layer.", source));
-            changed_boundaries.push(format!("Il confine di '{}' verrà fuso con '{}'.", source, target));
+            risks.push(format!(
+                "Lo spostamento di '{}' potrebbe rompere l'incapsulamento del layer.",
+                source
+            ));
+            changed_boundaries.push(format!(
+                "Il confine di '{}' verrà fuso con '{}'.",
+                source, target
+            ));
             recommendation_plan.push(format!("1. Crea il modulo di destinazione '{}'", target));
-            recommendation_plan.push(format!("2. Sposta le classi/funzioni da '{}' a '{}'", source, target));
-            recommendation_plan.push("3. Aggiorna i relativi import nel resto del progetto".to_string());
+            recommendation_plan.push(format!(
+                "2. Sposta le classi/funzioni da '{}' a '{}'",
+                source, target
+            ));
+            recommendation_plan
+                .push("3. Aggiorna i relativi import nel resto del progetto".to_string());
             recommendation_plan.push("4. Esegui i test di regressione".to_string());
             suggested_tests.push(format!("Esegui tutti i test nel modulo '{}'", target));
         } else {
@@ -1328,11 +1475,14 @@ mod tests {
 
         // Solo l'invariante reale (app::core ← app::api). Nessuna regola che nomini
         // un layer esterno, in nessuno dei due versi.
-        assert_eq!(rules.len(), 1, "atteso solo l'invariante interno: {rules:?}");
+        assert_eq!(
+            rules.len(),
+            1,
+            "atteso solo l'invariante interno: {rules:?}"
+        );
         assert!(
             !rules.iter().any(|r| {
-                r.upstream.0.starts_with("external")
-                    || r.downstream.0.starts_with("external")
+                r.upstream.0.starts_with("external") || r.downstream.0.starts_with("external")
             }),
             "nessun invariante deve nominare una dipendenza esterna: {rules:?}"
         );
@@ -1737,8 +1887,14 @@ mod tests {
         assert_eq!(f.upstream, "app::core");
         assert_eq!(f.downstream, "app::api");
         let common_prefix = find_common_prefix([&api_file, &core_file].into_iter());
-        let api_rel = api_file.strip_prefix(&common_prefix).unwrap_or(&api_file).to_string();
-        let core_rel = core_file.strip_prefix(&common_prefix).unwrap_or(&core_file).to_string();
+        let api_rel = api_file
+            .strip_prefix(&common_prefix)
+            .unwrap_or(&api_file)
+            .to_string();
+        let core_rel = core_file
+            .strip_prefix(&common_prefix)
+            .unwrap_or(&core_file)
+            .to_string();
         assert!(f.born_structure.contains(&api_rel));
         assert!(f.born_structure.contains(&core_rel));
     }
