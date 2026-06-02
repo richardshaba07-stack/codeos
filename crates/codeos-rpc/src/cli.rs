@@ -392,28 +392,76 @@ async fn run_doctor() {
     }
 }
 
-fn print_usage() {
-    println!("🏛️  CodeOS — Architectural Intelligence Layer CLI");
-    println!();
-    println!("Uso:");
-    println!("  codeos <comando> [argomenti]");
-    println!();
-    println!("Comandi:");
-    println!("  index <path>      Indicizza il progetto all'interno del percorso fornito");
-    println!("  report [opzioni]  Mostra il referto architetturale dello spazio negativo (compatto di default)");
-    println!("  query \"<text>\"    Interroga il grafo semantico per generare il contesto minimo per l'LLM");
-    println!("  doctor            Diagnostica la configurazione (server, porta, indirizzo) prima dell'uso");
-    println!("  help              Mostra questo aiuto");
-    println!();
-    println!("Opzioni di `report`:");
-    println!("  --verbose, -v     Mostra tutto: anche gli invarianti a bassa confidenza e i fossili per esteso");
-    println!("  --only high-risk  Mostra solo gli esiti ad alto rischio");
-    println!(
-        "  --json            Stampa il referto come JSON (per CI e agent AI), senza decorazioni"
+/// Catalogo dei comandi della CLI: `(sintassi, descrizione)`. **Unica fonte di
+/// verità** per l'help. Ogni `arm` del dispatcher in `main` deve avere qui la sua
+/// voce: un comando che funziona ma non è documentato è invisibile all'utente — il
+/// tool mente per omissione su ciò che sa fare. Il test
+/// `usage_documents_every_implemented_command` blinda questo invariante.
+const COMMANDS: &[(&str, &str)] = &[
+    (
+        "index <path>",
+        "Indicizza il progetto nel percorso indicato (popola il grafo semantico).",
+    ),
+    (
+        "report [opzioni]",
+        "Mostra il referto architetturale dello spazio negativo (compatto di default).",
+    ),
+    (
+        "query \"<text>\"",
+        "Interroga il grafo in linguaggio naturale e genera il contesto minimo per un LLM.",
+    ),
+    (
+        "doctor",
+        "Diagnostica l'ambiente (indirizzo, porta, server gRPC) prima dell'uso.",
+    ),
+    (
+        "guard --before \"<goal>\" | --after",
+        "Firewall architetturale: stima l'impatto di una modifica (--before) o rileva le violazioni introdotte (--after).",
+    ),
+    (
+        "context \"<goal>\" [--for ai]",
+        "Genera un \"context pack\" in Markdown per un obiettivo (--for ai per il formato pensato per agent AI).",
+    ),
+    (
+        "mri [--base <ref>] [--head <ref>]",
+        "\"MRI\" architetturale di un PR: confronta due ref git (default: main..HEAD) e misura il rischio.",
+    ),
+    (
+        "why \"<a>|<b>\"",
+        "Time machine: perché esiste il confine tra due elementi (nascita, intento, decisioni correlate).",
+    ),
+    (
+        "simulate \"move <src> to <dst>\"",
+        "What-if di refactoring: cosa cambierebbe spostando un elemento da <src> a <dst>.",
+    ),
+    ("help", "Mostra questo aiuto."),
+];
+
+/// Costruisce il testo completo dell'help. Separato da [`print_usage`] così è
+/// verificabile da unit test senza dover catturare lo stdout.
+fn usage_text() -> String {
+    let mut out = String::new();
+    out.push_str("🏛️  CodeOS — Architectural Intelligence Layer CLI\n\n");
+    out.push_str("Uso:\n  codeos <comando> [argomenti]\n\n");
+    out.push_str("Comandi:\n");
+    for (syntax, desc) in COMMANDS {
+        out.push_str(&format!("  {syntax}\n      {desc}\n"));
+    }
+    out.push_str("\nOpzioni di `report`:\n");
+    out.push_str(
+        "  --verbose, -v     Mostra tutto: anche gli invarianti a bassa confidenza e i fossili per esteso\n",
     );
-    println!();
-    println!("Variabili d'ambiente:");
-    println!("  CODEOS_ADDR       Indirizzo del server gRPC (default: 127.0.0.1:50051)");
+    out.push_str("  --only high-risk  Mostra solo gli esiti ad alto rischio\n");
+    out.push_str(
+        "  --json            Stampa il referto come JSON (per CI e agent AI), senza decorazioni\n",
+    );
+    out.push_str("\nVariabili d'ambiente:\n");
+    out.push_str("  CODEOS_ADDR       Indirizzo del server gRPC (default: 127.0.0.1:50051)\n");
+    out
+}
+
+fn print_usage() {
+    print!("{}", usage_text());
 }
 
 /// Opzioni del comando `report`, derivate dai flag CLI.
@@ -823,5 +871,30 @@ fn severity_rank(severity: &str) -> u8 {
         "warning" => 2,
         "info" => 1,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::usage_text;
+
+    /// Ogni comando gestito dal dispatcher in `main` deve comparire nell'help.
+    /// È il guard-rail contro la regressione «comando aggiunto al `match`, scordato
+    /// nell'usage»: un comando funzionante ma non documentato è invisibile, cioè il
+    /// tool mente per omissione su ciò che sa fare. La lista attesa è volutamente
+    /// hard-coded (non derivata da `COMMANDS`) così rimuovere una voce dal catalogo
+    /// fa fallire il test invece di passare in silenzio.
+    #[test]
+    fn usage_documents_every_implemented_command() {
+        let usage = usage_text();
+        for cmd in [
+            "index", "report", "query", "doctor", "guard", "context", "mri", "why", "simulate",
+            "help",
+        ] {
+            assert!(
+                usage.contains(cmd),
+                "comando '{cmd}' gestito da main ma assente dall'help (usage_text)"
+            );
+        }
     }
 }
