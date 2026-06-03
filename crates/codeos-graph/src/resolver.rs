@@ -51,6 +51,11 @@ impl GraphResolver {
         // alla canonicalizzazione dei tipi (Passo 1.5) quando conosciamo ancora il
         // nome nudo e la natura (`struct`/`enum`/`impl_target`) di ogni entità.
         let mut entity_aux: Vec<EntityAux> = Vec::new();
+        // Foglie dei moduli LOCALI del progetto (es. `eval` per `src/eval.rs`):
+        // servono nel Passo 3 a NON esternalizzare una call il cui root è un modulo
+        // nostro (`eval::matches_comparator`), che sarebbe sia un arco bugiardo verso
+        // un `external::eval` inesistente sia una mancata risoluzione del fratello.
+        let mut local_modules: HashSet<String> = HashSet::new();
 
         for (file_idx, file) in results.iter().enumerate() {
             let module_prefix = self.module_prefix(&file.file_path);
@@ -105,6 +110,12 @@ impl GraphResolver {
                         .unwrap_or_default(),
                     file_idx,
                 });
+
+                if parsed.kind == codeos_types::EntityKind::Module {
+                    if let Some(leaf) = last_segment(&qname) {
+                        local_modules.insert(leaf.to_string());
+                    }
+                }
 
                 delta.added_entities.push(Entity {
                     id,
@@ -244,12 +255,27 @@ impl GraphResolver {
                         // react, @scope/pkg…). Se il target è un pacchetto fuori
                         // dal progetto, lo aggancio a un'entità sintetica stabile
                         // invece di buttarlo in un Unresolved con target nullo.
-                        match external_dependency_root(
-                            &target,
-                            &ctx.language,
-                            &ctx.namespace,
-                            parsed.kind == RelationKind::Imports,
-                        ) {
+                        // Guardia anti-bugia (a2): una CALL il cui root è un modulo
+                        // NOSTRO (`eval::matches_comparator`, con `src/eval.rs`
+                        // indicizzato) NON va esternalizzata — sarebbe un arco verso un
+                        // `external::eval` inesistente (bugia) e insieme una mancata
+                        // risoluzione del fratello. La lasciamo cadere a Unresolved
+                        // (onesto) invece di inventare una dipendenza. Gli Imports invece
+                        // possono avere legittimamente root = modulo locale E crate
+                        // esterno omonimo (es. `serde`), quindi restano esternalizzabili.
+                        let root_is_local_module = parsed.kind != RelationKind::Imports
+                            && first_segment(&target).is_some_and(|r| local_modules.contains(r));
+                        let ext = if root_is_local_module {
+                            None
+                        } else {
+                            external_dependency_root(
+                                &target,
+                                &ctx.language,
+                                &ctx.namespace,
+                                parsed.kind == RelationKind::Imports,
+                            )
+                        };
+                        match ext {
                             Some(root) => {
                                 let target_id = external_entity_id(
                                     &root,
@@ -1647,6 +1673,62 @@ mod tests {
                 .iter()
                 .any(|e| e.qualified_name == "external::missing_local"),
             "una call locale mancata non è una dipendenza esterna"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_through_local_module_is_not_externalized() {
+        // Anti-bugia (a2), misurato su semver: il corpo di `Comparator::matches` è
+        // `eval::matches_comparator(...)`, dove `eval` è il modulo LOCALE di semver
+        // (`src/eval.rs`, e `eval::matches_comparator` ESISTE come entità). Il
+        // resolver coniava un `external::eval` e ci puntava la call: una dipendenza
+        // esterna INVENTATA (bugia) e insieme una mancata risoluzione del fratello.
+        // Ora una call il cui path-root è un modulo nostro NON si esternalizza: resta
+        // Unresolved (onesto). La risoluzione vera al fratello cross-module è un
+        // recall-win separato (layout non-`crates::`), qui basta non mentire.
+        //
+        // NB: layout senza prefisso `crates::` (project_root=None) → lo Stadio 2.5
+        // (`caller_crate_prefix`) si astiene, quindi la call cade fino al fallback
+        // esterno, esattamente come nel layout fisico di semver (`private::tmp::…`).
+        let parsed = vec![
+            parse_rust(
+                "/myproj/src/eval.rs",
+                "pub fn matches_comparator() -> bool {\n    true\n}\n",
+            )
+            .await,
+            parse_rust(
+                "/myproj/src/lib.rs",
+                "pub fn matches() -> bool {\n    eval::matches_comparator()\n}\n",
+            )
+            .await,
+        ];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None);
+
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+
+        // `eval` è un modulo locale: nessuna entità esterna inventata.
+        assert!(
+            !delta
+                .added_entities
+                .iter()
+                .any(|e| e.qualified_name == "external::eval"),
+            "una call attraverso un modulo locale non deve coniare external::eval"
+        );
+
+        // E l'astensione è onesta: la call resta Unresolved col target grezzo che
+        // nomina il modulo locale (non risolta, ma nemmeno bugiarda).
+        let caller = find(&delta, "myproj::src::lib::matches");
+        assert!(
+            delta.added_relations.iter().any(|r| {
+                r.kind == RelationKind::Unresolved
+                    && r.source_id == caller.id
+                    && r.metadata
+                        .get("unresolved_target")
+                        .map(String::as_str)
+                        .is_some_and(|t| t.contains("eval") && t.ends_with("matches_comparator"))
+            }),
+            "la call verso il modulo locale deve restare Unresolved, non external"
         );
     }
 
