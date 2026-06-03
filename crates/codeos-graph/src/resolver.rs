@@ -684,37 +684,41 @@ async fn resolve_target(
         }
     }
 
-    // 3 — Scope-local match: per nome semplice, SOLO nello stesso modulo.
+    // 3 — Scope-local match: per nome semplice, SOLO nello stesso modulo e SOLO se
+    // il candidato è UNICO. Il match per nome semplice non vede il tipo del receiver
+    // (`self.identifier.as_str()` arriva come bare `as_str`); se nel modulo del
+    // chiamante vivono più omonimi (es. `Prerelease::as_str` e `BuildMetadata::as_str`,
+    // entrambi figli del modulo `lib`), sceglierne uno è un arco che *indovina* — il
+    // falso positivo che la tesi vieta. Con ≥2 candidati ci asteniamo (⇒ Unresolved):
+    // un arco mancante batte un arco bugiardo, la fiducia nel grafo vale più della
+    // copertura. NIENTE `.first()`/`.find()` globale (P0-1) né scelta arbitraria tra
+    // omonimi (misurato su semver: l'euristica risolveva `BuildMetadata::as_str` a
+    // `Prerelease::as_str`). Stessa disciplina anti-omonimi del Passo 1.5.
     let bare = last_segment(target).unwrap_or(target);
     if let Some(candidates) = ctx.new_by_name.get(bare) {
-        let lang_candidates: Vec<(EntityId, String)> = candidates
+        let same_module: Vec<EntityId> = candidates
             .iter()
             .filter(|(id, _)| {
-                if let Some(t_lang) = ctx.new_by_id_lang.get(id) {
-                    language_matches(ctx.language, t_lang)
-                } else {
-                    false
-                }
+                ctx.new_by_id_lang
+                    .get(id)
+                    .is_some_and(|t_lang| language_matches(ctx.language, t_lang))
             })
-            .cloned()
+            .filter(|(_, qname)| qname.starts_with(ctx.module_prefix))
+            .map(|(id, _)| *id)
             .collect();
-
-        // SOLO lo stesso modulo. Il match per nome semplice è sicuro soltanto se il
-        // candidato vive nel modulo del chiamante. NIENTE fallback globale `.first()`
-        // (P0-1): sceglierebbe un'entità arbitraria con lo stesso nome in un crate
-        // qualunque — la causa dei falsi positivi tipo `handle_import CALLS
-        // GraphDelta::is_empty`. Un arco mancante (Unresolved) è preferibile a un
-        // arco che mente: la fiducia nel grafo vale più della copertura.
-        if let Some((id, _)) = lang_candidates
-            .iter()
-            .find(|(_, qname)| qname.starts_with(ctx.module_prefix))
-        {
-            return Ok(Some((*id, ResolutionStrategy::SameModule)));
+        match same_module.as_slice() {
+            [unico] => return Ok(Some((*unico, ResolutionStrategy::SameModule))),
+            // ≥2 omonimi nel modulo: ambiguo senza inferenza di tipo. Astieniti, e
+            // non interrogare nemmeno il DB (aggiungerebbe solo altri omonimi).
+            [_, _, ..] => return Ok(None),
+            [] => {}
         }
     }
+    // Batch privo del nome in questo modulo: stesso vincolo di unicità sul DB (utile
+    // nel re-index incrementale, dove i fratelli sono già nello storage).
     let suffix = format!("::{bare}");
     let db_hits = ctx.storage.find_entities_by_name_pattern(bare).await?;
-    let exact: Vec<&Entity> = db_hits
+    let same_module_db: Vec<&Entity> = db_hits
         .iter()
         .filter(|e| e.qualified_name == bare || e.qualified_name.ends_with(&suffix))
         .filter(|e| {
@@ -725,16 +729,14 @@ async fn resolve_target(
                 .unwrap_or_else(|| detect_language(&e.location.file_path));
             language_matches(ctx.language, &t_lang)
         })
+        .filter(|e| e.qualified_name.starts_with(ctx.module_prefix))
         .collect();
-    if let Some(e) = exact
-        .iter()
-        .find(|e| e.qualified_name.starts_with(ctx.module_prefix))
-    {
-        return Ok(Some((e.id, ResolutionStrategy::SameModule)));
+    if let [unico] = same_module_db.as_slice() {
+        return Ok(Some((unico.id, ResolutionStrategy::SameModule)));
     }
 
-    // 4 — Nessun match: Unresolved. Stesso principio del batch: niente fallback
-    // globale sul DB, che aggancerebbe un omonimo in un altro modulo/crate.
+    // 4 — Nessun match (o omonimi ambigui): Unresolved. Niente fallback globale sul
+    // DB, che aggancerebbe un omonimo in un altro modulo/crate.
     Ok(None)
 }
 
@@ -1439,6 +1441,53 @@ mod tests {
                     && r.metadata.get("unresolved_target").map(String::as_str) == Some("Repo::open")
             }),
             "la call ambigua deve restare Unresolved col target grezzo"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_module_homonym_method_call_stays_unresolved() {
+        // Anti-arco-bugiardo (misurato su semver): `BuildMetadata::as_str` e
+        // `Prerelease::as_str` vivono entrambi nel modulo `lib`. Una call per nome
+        // semplice (`self.inner.val()` → bare `val`) non vede il tipo del receiver:
+        // con DUE `val` omonimi nello stesso modulo l'euristica `same_module` NON
+        // deve sceglierne uno (prima lo faceva: `BuildMetadata::as_str` →
+        // `Prerelease::as_str`). Un arco mancante batte un arco che indovina.
+        let parsed = vec![
+            parse_rust(
+                "/repo/crates/codeos-x/src/lib.rs",
+                "pub struct A {\n    inner: B,\n}\npub struct B;\nimpl A {\n    pub fn val(&self) -> u8 {\n        self.inner.val()\n    }\n}\nimpl B {\n    pub fn val(&self) -> u8 {\n        0\n    }\n}\n",
+            )
+            .await,
+        ];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+        let a_val = find(&delta, "crates::codeos-x::src::lib::A::val");
+        let b_val = find(&delta, "crates::codeos-x::src::lib::B::val");
+
+        // Nessun arco Calls verso un `val` omonimo (né B::val né A::val stesso): è
+        // indecidibile senza inferenza di tipo sul receiver.
+        let bogus = delta.added_relations.iter().any(|r| {
+            r.kind == RelationKind::Calls
+                && r.source_id == a_val.id
+                && (r.target_id == b_val.id || r.target_id == a_val.id)
+        });
+        assert!(
+            !bogus,
+            "una call per nome semplice tra omonimi dello stesso modulo non deve risolvere"
+        );
+        // E l'astensione è onesta: resta un Unresolved col target grezzo `val`.
+        assert!(
+            delta.added_relations.iter().any(|r| {
+                r.kind == RelationKind::Unresolved
+                    && r.source_id == a_val.id
+                    && r.metadata
+                        .get("unresolved_target")
+                        .map(String::as_str)
+                        .is_some_and(|t| t.ends_with("val"))
+            }),
+            "la call omonima ambigua deve restare Unresolved"
         );
     }
 
