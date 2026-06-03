@@ -47,8 +47,12 @@ impl GraphResolver {
         // Contesto per-file da rielaborare nel Passo 3 (dopo aver indicizzato
         // TUTTE le entità del batch).
         let mut file_ctxs: Vec<FileContext> = Vec::new();
+        // Info ausiliarie (id, nome, rust_kind, file) raccolte nel Passo 1: servono
+        // alla canonicalizzazione dei tipi (Passo 1.5) quando conosciamo ancora il
+        // nome nudo e la natura (`struct`/`enum`/`impl_target`) di ogni entità.
+        let mut entity_aux: Vec<EntityAux> = Vec::new();
 
-        for file in results {
+        for (file_idx, file) in results.iter().enumerate() {
             let module_prefix = self.module_prefix(&file.file_path);
             // Natura del file (test vs prod) dedotta una sola volta dal path: la
             // ereditano tutte le entità del file e gli archi che ne escono.
@@ -90,6 +94,17 @@ impl GraphResolver {
                     .unwrap_or_else(|| file_source_kind.to_string());
                 metadata.insert("source_kind".to_string(), source_kind.clone());
                 new_by_id_source_kind.insert(id, source_kind);
+
+                entity_aux.push(EntityAux {
+                    id,
+                    name: parsed.name.clone(),
+                    rust_kind: parsed
+                        .metadata
+                        .get("rust_kind")
+                        .cloned()
+                        .unwrap_or_default(),
+                    file_idx,
+                });
 
                 delta.added_entities.push(Entity {
                     id,
@@ -136,6 +151,24 @@ impl GraphResolver {
                 namespace,
                 relations: file.relations.clone(),
             });
+        }
+
+        // Passo 1.5 — Canonicalizzazione anti-frammentazione: fonde i placeholder
+        // `impl_target` nell'unica definizione reale omonima del batch, PRIMA della
+        // name resolution (così ogni target risolve all'entità canonica, non a una
+        // copia per-file).
+        let merged_fragments = canonicalize_type_fragments(
+            &mut delta,
+            &mut new_by_qname,
+            &mut new_by_name,
+            &entity_aux,
+            &file_ctxs,
+        );
+        if merged_fragments > 0 {
+            tracing::debug!(
+                merged = merged_fragments,
+                "canonicalizzati frammenti di tipo (un tipo = un'entità)"
+            );
         }
 
         // Cache delle entità sintetiche per dipendenze esterne create in questo
@@ -385,6 +418,116 @@ struct FileContext {
     local_map: HashMap<String, EntityId>,
     namespace: HashMap<String, String>,
     relations: Vec<codeos_types::ParsedRelation>,
+}
+
+/// Info ausiliarie per la canonicalizzazione dei tipi (Passo 1.5), raccolte nel
+/// Passo 1 quando ancora conosciamo `name`, `rust_kind` e il file di origine.
+struct EntityAux {
+    id: EntityId,
+    name: String,
+    rust_kind: String,
+    file_idx: usize,
+}
+
+/// Passo 1.5 — Canonicalizzazione dell'identità di tipo (anti-frammentazione).
+///
+/// Il parser è per-file: un `impl Foo` in `parse.rs` che non vede la definizione
+/// `struct Foo` crea un *placeholder* `parse::Foo` (`rust_kind=impl_target`). Lo
+/// stesso tipo finisce così spezzato in N entità, una per file con un impl (su
+/// semver `VersionReq` ×5). Qui fondiamo ogni placeholder nell'UNICA definizione
+/// reale omonima del batch e ridirigiamo i suoi archi (i metodi diventano figli
+/// del canonico).
+///
+/// Regola conservativa — tesi anti-falso-positivo, *un merge mancante batte un
+/// merge bugiardo*:
+/// - si fonde solo se esiste **esattamente una** definizione nominale
+///   (`struct`/`enum`/`trait`) con quel nome nel batch; 0 o ≥2 ⇒ non si indovina;
+/// - si salta se il file del placeholder **importa quel nome da un crate esterno**
+///   (allora `impl … for Nome` riguarda il tipo esterno, non l'omonimo locale).
+///
+/// Limite noto (follow-up): il merge è *batch-local*. Nel re-index di un singolo
+/// file la definizione canonica può non essere nel batch; servirà un lookup su
+/// storage. L'indicizzazione full-project (caso normale) passa tutti i file in un
+/// solo batch, quindi qui funziona.
+///
+/// Ritorna il numero di placeholder fusi.
+fn canonicalize_type_fragments(
+    delta: &mut GraphDelta,
+    new_by_qname: &mut HashMap<String, EntityId>,
+    new_by_name: &mut HashMap<String, Vec<(EntityId, String)>>,
+    aux: &[EntityAux],
+    file_ctxs: &[FileContext],
+) -> usize {
+    // 1. Definizioni nominali reali per nome (i candidati canonici): mai i
+    //    placeholder (`impl_target`) né gli alias/associati (`type`).
+    let mut canon_by_name: HashMap<&str, Vec<EntityId>> = HashMap::new();
+    for a in aux {
+        if matches!(a.rust_kind.as_str(), "struct" | "enum" | "trait") {
+            canon_by_name.entry(a.name.as_str()).or_default().push(a.id);
+        }
+    }
+    // 2. Decidi i merge: placeholder → canonico (unico e non importato da esterno).
+    let mut merge: HashMap<EntityId, EntityId> = HashMap::new();
+    for a in aux {
+        if a.rust_kind != "impl_target" {
+            continue;
+        }
+        let Some(cands) = canon_by_name.get(a.name.as_str()) else {
+            continue; // 0 definizioni locali omonime: tipo esterno/sconosciuto
+        };
+        if cands.len() != 1 {
+            continue; // ≥2 omonimi nel progetto: ambiguo, non fondere
+        }
+        let canonical = cands[0];
+        if canonical == a.id {
+            continue;
+        }
+        let ctx = &file_ctxs[a.file_idx];
+        if let Some(target) = ctx.namespace.get(&a.name) {
+            if external_dependency_root(target, &ctx.language, &ctx.namespace, true).is_some() {
+                continue; // il nome è importato da un crate esterno
+            }
+        }
+        merge.insert(a.id, canonical);
+    }
+    if merge.is_empty() {
+        return 0;
+    }
+    // 3. Redirige gli indici di risoluzione (id placeholder → id canonico): un
+    //    riferimento al tipo da QUALSIASI modulo risolve ora all'unico canonico.
+    for id in new_by_qname.values_mut() {
+        if let Some(c) = merge.get(id) {
+            *id = *c;
+        }
+    }
+    for cands in new_by_name.values_mut() {
+        for (id, _q) in cands.iter_mut() {
+            if let Some(c) = merge.get(id) {
+                *id = *c;
+            }
+        }
+    }
+    // 4. Elimina le entità placeholder fuse.
+    delta.added_entities.retain(|e| !merge.contains_key(&e.id));
+    // 5. Aggiusta le relazioni. L'unico arco USCENTE di un placeholder sintetico è
+    //    il suo BelongsTo→modulo: il canonico ha già il proprio genitore, quindi lo
+    //    scartiamo (niente doppio genitore). Gli archi ENTRANTI (metodo→placeholder)
+    //    vengono ridiretti al canonico, così tutti i metodi diventano suoi figli.
+    let mut fixed = Vec::with_capacity(delta.added_relations.len());
+    for mut r in std::mem::take(&mut delta.added_relations) {
+        if let Some(c) = merge.get(&r.source_id).copied() {
+            if r.kind == RelationKind::BelongsTo {
+                continue;
+            }
+            r.source_id = c;
+        }
+        if let Some(c) = merge.get(&r.target_id).copied() {
+            r.target_id = c;
+        }
+        fixed.push(r);
+    }
+    delta.added_relations = fixed;
+    merge.len()
 }
 
 /// Come un target è stato risolto a un `EntityId`. Determina la **confidenza** della
@@ -1742,6 +1885,145 @@ class Cache extends BaseCache {
         assert_eq!(
             test_call.metadata.get("source_kind").map(String::as_str),
             Some("test")
+        );
+    }
+
+    #[tokio::test]
+    async fn type_fragments_collapse_into_one_canonical() {
+        // Anti-frammentazione (Passo 1.5): lo stesso tipo con `impl` sparsi su più
+        // file non deve diventare N entità. `Version` è definito in lib.rs e
+        // ri-implementato in display.rs (che lo importa con `use crate::Version`):
+        // il placeholder `impl_target` di display.rs va fuso nell'UNICA definizione
+        // canonica, e i suoi metodi diventano figli del canonico.
+        let parsed = vec![
+            parse_rust(
+                "/repo/src/lib.rs",
+                "pub struct Version;\nimpl Version {\n    pub fn new() {}\n}\n",
+            )
+            .await,
+            parse_rust(
+                "/repo/src/display.rs",
+                "use crate::Version;\nimpl Version {\n    pub fn show(&self) {}\n}\n",
+            )
+            .await,
+        ];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+
+        // Una sola entità-tipo `Version`: il canonico di lib.rs.
+        let canonical = find(&delta, "src::lib::Version");
+        assert_eq!(canonical.kind, EntityKind::Struct);
+        let version_entities = delta
+            .added_entities
+            .iter()
+            .filter(|e| e.qualified_name.ends_with("::Version"))
+            .count();
+        assert_eq!(
+            version_entities, 1,
+            "il placeholder display::Version dev'essere stato fuso nel canonico"
+        );
+        // Il frammento per-file è sparito.
+        assert!(
+            !delta
+                .added_entities
+                .iter()
+                .any(|e| e.qualified_name == "src::display::Version"),
+            "nessun frammento per-file deve sopravvivere"
+        );
+
+        // Il metodo definito nell'impl sparso (display.rs) ora appartiene al canonico.
+        let show = find(&delta, "src::display::Version::show");
+        assert!(
+            delta.added_relations.iter().any(|r| {
+                r.kind == RelationKind::BelongsTo
+                    && r.source_id == show.id
+                    && r.target_id == canonical.id
+            }),
+            "il metodo dell'impl sparso dev'essere figlio del tipo canonico"
+        );
+        // E il metodo della definizione vera resta figlio dello stesso canonico.
+        let new = find(&delta, "src::lib::Version::new");
+        assert!(
+            delta.added_relations.iter().any(|r| {
+                r.kind == RelationKind::BelongsTo
+                    && r.source_id == new.id
+                    && r.target_id == canonical.id
+            }),
+            "anche il metodo della definizione vera resta figlio del canonico"
+        );
+        // Nessun placeholder lascia un BelongsTo orfano verso il suo modulo.
+        assert!(
+            !delta.added_relations.iter().any(|r| {
+                r.kind == RelationKind::BelongsTo && r.source_id == show.id && {
+                    let m = find(&delta, "src::display");
+                    r.target_id == m.id
+                }
+            }),
+            "il BelongsTo del metodo non deve puntare al modulo del frammento"
+        );
+    }
+
+    #[tokio::test]
+    async fn homonym_types_block_canonicalization() {
+        // Guardia anti-merge-bugiardo: due tipi `Error` distinti (moduli diversi)
+        // rendono ambiguo a quale appartenga un `impl Error` di un terzo file. Con
+        // ≥2 candidati canonici NON si fonde: un merge mancante batte uno bugiardo.
+        let parsed = vec![
+            parse_rust("/repo/src/a.rs", "pub struct Error;\n").await,
+            parse_rust("/repo/src/b.rs", "pub struct Error;\n").await,
+            parse_rust(
+                "/repo/src/c.rs",
+                "impl Error {\n    pub fn code(&self) {}\n}\n",
+            )
+            .await,
+        ];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+
+        // Le due definizioni reali restano distinte...
+        find(&delta, "src::a::Error");
+        find(&delta, "src::b::Error");
+        // ...e il placeholder ambiguo di c.rs NON viene fuso (resta dov'è).
+        assert!(
+            delta
+                .added_entities
+                .iter()
+                .any(|e| e.qualified_name == "src::c::Error"),
+            "con omonimi ambigui il placeholder non va fuso"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_imported_type_blocks_canonicalization() {
+        // Guardia import-esterno: se il file che fa `impl Error` ha importato `Error`
+        // da un CRATE ESTERNO (`use other_crate::Error`), quell'impl riguarda il tipo
+        // esterno, non l'omonimo locale: non va fuso nel `struct Error` del progetto.
+        let parsed = vec![
+            parse_rust("/repo/src/lib.rs", "pub struct Error;\n").await,
+            parse_rust(
+                "/repo/src/b.rs",
+                "use other_crate::Error;\nimpl Error {\n    pub fn foo(&self) {}\n}\n",
+            )
+            .await,
+        ];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+
+        // La definizione locale resta...
+        find(&delta, "src::lib::Error");
+        // ...e il placeholder di b.rs NON viene fuso (l'impl è sul tipo esterno).
+        assert!(
+            delta
+                .added_entities
+                .iter()
+                .any(|e| e.qualified_name == "src::b::Error"),
+            "un impl su un tipo importato da crate esterno non va fuso nell'omonimo locale"
         );
     }
 }
