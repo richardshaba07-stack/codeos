@@ -819,17 +819,27 @@ async fn unique_internal_match(
     }
 }
 
-/// Prefisso di crate del chiamante a partire dal suo `module_prefix`.
-/// `crates::codeos-paleo::src::fossil` → `Some("crates::codeos-paleo::")`.
-/// `None` se il file non vive sotto `crates::<crate>::` (non possiamo limitare la
-/// ricerca a un crate, quindi non risolviamo crate-local).
+/// Prefisso che delimita il **crate del chiamante** a partire dal suo
+/// `module_prefix`, per limitare la ricerca crate-local (Stadi 2.1/2.5) senza
+/// sconfinare in altri crate dello stesso DB.
+/// - Monorepo `crates::<name>::…` → `Some("crates::<name>::")` (il crate).
+/// - Layout generico con una radice sorgenti `…::src::…` → `Some("…::src::")`,
+///   così una call `modulo::fn` risolve a un modulo *fratello* sotto lo stesso
+///   `src` (es. semver `…::semver::src::lib` cerca solo dentro `…::semver::src::`,
+///   trovando `…::semver::src::eval::matches_comparator`). Il prefisso include il
+///   nome-cartella del crate che precede `src`, quindi due crate fratelli
+///   (`…::foo::src`, `…::bar::src`) non si agganciano a vicenda.
+/// - Nessuno dei due ⇒ `None`: non sappiamo dove finisce il crate, quindi non
+///   risolviamo crate-local (conservativo, anti-falso-positivo).
 fn caller_crate_prefix(module_prefix: &str) -> Option<String> {
-    let mut parts = module_prefix.split("::");
-    if parts.next()? != "crates" {
-        return None;
+    let segs: Vec<&str> = module_prefix.split("::").collect();
+    if segs.first() == Some(&"crates") {
+        let crate_name = segs.get(1).filter(|s| !s.is_empty())?;
+        return Some(format!("crates::{crate_name}::"));
     }
-    let crate_name = parts.next().filter(|s| !s.is_empty())?;
-    Some(format!("crates::{crate_name}::"))
+    // Tronca al primo `src` (il più esterno → il crate root dei sorgenti).
+    let src_pos = segs.iter().position(|s| *s == "src")?;
+    Some(format!("{}::", segs[..=src_pos].join("::")))
 }
 
 fn target_candidates(target: &str, module_prefix: &str) -> Vec<String> {
@@ -1678,18 +1688,17 @@ mod tests {
 
     #[tokio::test]
     async fn call_through_local_module_is_not_externalized() {
-        // Anti-bugia (a2), misurato su semver: il corpo di `Comparator::matches` è
-        // `eval::matches_comparator(...)`, dove `eval` è il modulo LOCALE di semver
-        // (`src/eval.rs`, e `eval::matches_comparator` ESISTE come entità). Il
-        // resolver coniava un `external::eval` e ci puntava la call: una dipendenza
-        // esterna INVENTATA (bugia) e insieme una mancata risoluzione del fratello.
-        // Ora una call il cui path-root è un modulo nostro NON si esternalizza: resta
-        // Unresolved (onesto). La risoluzione vera al fratello cross-module è un
-        // recall-win separato (layout non-`crates::`), qui basta non mentire.
+        // Anti-bugia (a2), misurato su semver: una call il cui path-root è un modulo
+        // NOSTRO non va esternalizzata (il resolver coniava un `external::eval`
+        // inesistente per `eval::matches_comparator`). Qui la funzione chiamata NON
+        // esiste nel modulo `eval` (`eval::missing_fn`): non c'è nessun fratello da
+        // risolvere, quindi il caso esercita esattamente il fallback esterno — e la
+        // guardia (a2) lo fa cadere a Unresolved (onesto) invece di inventare
+        // `external::eval`. Il caso risolvibile è coperto da
+        // `call_through_local_module_resolves_to_sibling`.
         //
-        // NB: layout senza prefisso `crates::` (project_root=None) → lo Stadio 2.5
-        // (`caller_crate_prefix`) si astiene, quindi la call cade fino al fallback
-        // esterno, esattamente come nel layout fisico di semver (`private::tmp::…`).
+        // NB: layout senza prefisso `crates::` (project_root=None) → `caller_crate_prefix`
+        // usa la radice `src`, come nel layout fisico di semver (`private::tmp::…`).
         let parsed = vec![
             parse_rust(
                 "/myproj/src/eval.rs",
@@ -1698,7 +1707,7 @@ mod tests {
             .await,
             parse_rust(
                 "/myproj/src/lib.rs",
-                "pub fn matches() -> bool {\n    eval::matches_comparator()\n}\n",
+                "pub fn matches() -> bool {\n    eval::missing_fn()\n}\n",
             )
             .await,
         ];
@@ -1726,9 +1735,68 @@ mod tests {
                     && r.metadata
                         .get("unresolved_target")
                         .map(String::as_str)
-                        .is_some_and(|t| t.contains("eval") && t.ends_with("matches_comparator"))
+                        .is_some_and(|t| t.contains("eval") && t.ends_with("missing_fn"))
             }),
-            "la call verso il modulo locale deve restare Unresolved, non external"
+            "la call verso una fn inesistente del modulo locale deve restare Unresolved, non external"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_through_local_module_resolves_to_sibling() {
+        // Recall (a2-recall), misurato su semver: il corpo di `Comparator::matches` è
+        // `eval::matches_comparator(...)`, dove `eval` è un modulo fratello
+        // (`src/eval.rs`) e `matches_comparator` esiste ed è UNICO nel crate. Lo
+        // Stadio 2.5 (`caller_crate_prefix` esteso alla radice `src` nei layout
+        // non-`crates::`) lo risolve all'unica entità interna `…::eval::matches_comparator`,
+        // senza indovinare: l'unicità è il guard anti-falso-positivo (≥2 omonimi ⇒
+        // astensione, come negli Stadi 2.1/2.5 e nella canonicalizzazione).
+        let parsed = vec![
+            parse_rust(
+                "/myproj/src/eval.rs",
+                "pub fn matches_comparator() -> bool {\n    true\n}\n",
+            )
+            .await,
+            parse_rust(
+                "/myproj/src/lib.rs",
+                "pub fn matches() -> bool {\n    eval::matches_comparator()\n}\n",
+            )
+            .await,
+        ];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None);
+
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+
+        let caller = find(&delta, "myproj::src::lib::matches");
+        let sibling = find(&delta, "myproj::src::eval::matches_comparator");
+
+        // La call risolve al fratello GIUSTO (non a un omonimo, non a external).
+        assert!(
+            delta.added_relations.iter().any(|r| {
+                r.kind == RelationKind::Calls
+                    && r.source_id == caller.id
+                    && r.target_id == sibling.id
+            }),
+            "la call verso un modulo fratello unico deve risolvere all'entità locale"
+        );
+        // Nessun fantasma esterno e nessun Unresolved residuo per quel target.
+        assert!(
+            !delta
+                .added_entities
+                .iter()
+                .any(|e| e.qualified_name == "external::eval"),
+            "una call risolta al fratello non deve coniare external::eval"
+        );
+        assert!(
+            !delta.added_relations.iter().any(|r| {
+                r.kind == RelationKind::Unresolved
+                    && r.source_id == caller.id
+                    && r.metadata
+                        .get("unresolved_target")
+                        .map(String::as_str)
+                        .is_some_and(|t| t.ends_with("matches_comparator"))
+            }),
+            "la call risolta non deve lasciare un Unresolved residuo"
         );
     }
 
