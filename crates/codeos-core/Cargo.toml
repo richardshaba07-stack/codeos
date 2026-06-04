@@ -11,6 +11,7 @@ codeos-parser = { workspace = true }
 codeos-storage = { workspace = true }
 codeos-graph = { workspace = true }
 codeos-guardian = { workspace = true }
+codeos-paleo = { workspace = true }
 codeos-memory = { workspace = true }
 codeos-query = { workspace = true }
 tokio = { workspace = true }

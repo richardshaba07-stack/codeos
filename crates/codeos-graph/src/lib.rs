@@ -11,5 +11,5 @@
 mod actor;
 mod resolver;
 
-pub use actor::GraphActor;
+pub use actor::{CommitProvider, GraphActor};
 pub use resolver::GraphResolver;

@@ -260,6 +260,7 @@ dependencies = [
  "codeos-graph",
  "codeos-guardian",
  "codeos-memory",
+ "codeos-paleo",
  "codeos-parser",
  "codeos-query",
  "codeos-storage",

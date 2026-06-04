@@ -176,6 +176,24 @@ pub fn spawn_with_storage_decisions_and_repo(
     // solo comandi). La sottoscrizione avviene qui, prima che il Dispatcher
     // possa inoltrare comandi, così nessun `FilesIndexed` va perso.
     let graph = GraphActor::new(storage.clone(), events.raw_sender(), project_root);
+    // Grafo temporale (vision step 2): se conosciamo la root del repo, il GraphActor
+    // timbra la nascita dei nodi con l'HEAD corrente. Iniettiamo qui — il
+    // compositore — la lettura di git (`codeos_paleo::head_commit`), così il crate
+    // del grafo resta magro e ignaro della storia git. È letto **fresco a ogni
+    // indicizzazione** (gli attori sono long-lived, HEAD si muove); `head_commit`
+    // torna `None` fuori da un repo / su HEAD non nato ⇒ nessun timbro inventato.
+    let graph = match repo_root.clone() {
+        Some(root) => {
+            let provider: codeos_graph::CommitProvider = Arc::new(move || {
+                codeos_paleo::head_commit(&root).map(|c| codeos_types::CommitContext {
+                    commit: c.hash,
+                    ts: c.timestamp,
+                })
+            });
+            graph.with_commit_provider(provider)
+        }
+        None => graph,
+    };
     tokio::spawn(graph.run(events.subscribe()));
 
     // Il GuardianActor (sistema immunitario) è event-driven E command-driven:
