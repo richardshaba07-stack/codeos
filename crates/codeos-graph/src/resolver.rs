@@ -174,7 +174,9 @@ impl GraphResolver {
             &mut new_by_name,
             &entity_aux,
             &file_ctxs,
-        );
+            storage,
+        )
+        .await?;
         if merged_fragments > 0 {
             tracing::debug!(
                 merged = merged_fragments,
@@ -471,19 +473,21 @@ struct EntityAux {
 /// - si salta se il file del placeholder **importa quel nome da un crate esterno**
 ///   (allora `impl … for Nome` riguarda il tipo esterno, non l'omonimo locale).
 ///
-/// Limite noto (follow-up): il merge è *batch-local*. Nel re-index di un singolo
-/// file la definizione canonica può non essere nel batch; servirà un lookup su
-/// storage. L'indicizzazione full-project (caso normale) passa tutti i file in un
-/// solo batch, quindi qui funziona.
+/// Re-index di un singolo file: la definizione canonica spesso NON è nel batch (vive
+/// in un altro file, già persistito). In quel caso la cerchiamo nello storage con la
+/// stessa unicità anti-bugia (vedi [`db_canonical_for`]), limitata al crate del
+/// chiamante. L'indicizzazione full-project (caso normale) trova invece il canonico
+/// direttamente nel batch.
 ///
 /// Ritorna il numero di placeholder fusi.
-fn canonicalize_type_fragments(
+async fn canonicalize_type_fragments(
     delta: &mut GraphDelta,
     new_by_qname: &mut HashMap<String, EntityId>,
     new_by_name: &mut HashMap<String, Vec<(EntityId, String)>>,
     aux: &[EntityAux],
     file_ctxs: &[FileContext],
-) -> usize {
+    storage: &dyn GraphStorage,
+) -> anyhow::Result<usize> {
     // 1. Definizioni nominali reali per nome (i candidati canonici): mai i
     //    placeholder (`impl_target`) né gli alias/associati (`type`).
     let mut canon_by_name: HashMap<&str, Vec<EntityId>> = HashMap::new();
@@ -498,26 +502,38 @@ fn canonicalize_type_fragments(
         if a.rust_kind != "impl_target" {
             continue;
         }
-        let Some(cands) = canon_by_name.get(a.name.as_str()) else {
-            continue; // 0 definizioni locali omonime: tipo esterno/sconosciuto
-        };
-        if cands.len() != 1 {
-            continue; // ≥2 omonimi nel progetto: ambiguo, non fondere
-        }
-        let canonical = cands[0];
-        if canonical == a.id {
-            continue;
-        }
         let ctx = &file_ctxs[a.file_idx];
+        // Guardia import-esterno: se il file importa il nome da un crate esterno,
+        // l'`impl … for Nome` riguarda il tipo esterno, non l'omonimo locale. Vale
+        // sia per il canonico nel batch sia per quello cercato nel DB.
         if let Some(target) = ctx.namespace.get(&a.name) {
             if external_dependency_root(target, &ctx.language, &ctx.namespace, true).is_some() {
                 continue; // il nome è importato da un crate esterno
             }
         }
+        let canonical = match canon_by_name.get(a.name.as_str()) {
+            // Canonico nel batch (indicizzazione full-project): unico o si abdica.
+            Some(cands) => {
+                if cands.len() != 1 {
+                    continue; // ≥2 omonimi nel progetto: ambiguo, non fondere
+                }
+                cands[0]
+            }
+            // Nessun canonico nel batch: nel re-index di un singolo file la
+            // definizione vive già nello storage. La cerchiamo lì, limitata al crate
+            // del chiamante e con la stessa unicità anti-bugia.
+            None => match db_canonical_for(&a.name, ctx, storage).await? {
+                Some(id) => id,
+                None => continue, // 0 o ≥2 candidati nel DB: non si indovina
+            },
+        };
+        if canonical == a.id {
+            continue;
+        }
         merge.insert(a.id, canonical);
     }
     if merge.is_empty() {
-        return 0;
+        return Ok(0);
     }
     // 3. Redirige gli indici di risoluzione (id placeholder → id canonico): un
     //    riferimento al tipo da QUALSIASI modulo risolve ora all'unico canonico.
@@ -553,7 +569,61 @@ fn canonicalize_type_fragments(
         fixed.push(r);
     }
     delta.added_relations = fixed;
-    merge.len()
+    Ok(merge.len())
+}
+
+/// Cerca nello storage l'UNICA definizione nominale (`struct`/`enum`/`trait`)
+/// omonima a un placeholder `impl_target`, limitata al crate del chiamante. Serve al
+/// re-index di un singolo file: la definizione canonica non è nel batch ma già
+/// persistita da un'indicizzazione precedente. Stessa disciplina anti-bugia della via
+/// batch (un merge mancante batte uno bugiardo):
+/// - senza un confine di crate (`caller_crate_prefix`) non sappiamo dove cercare ⇒
+///   `None` (conservativo);
+/// - solo definizioni reali (`rust_kind` struct/enum/trait), mai placeholder/alias;
+/// - foglia esatta (`qname == name` o `…::name`), lingua coerente, dentro il crate;
+/// - 0 o ≥2 candidati ⇒ `None` (non si indovina fra omonimi).
+async fn db_canonical_for(
+    name: &str,
+    ctx: &FileContext,
+    storage: &dyn GraphStorage,
+) -> anyhow::Result<Option<EntityId>> {
+    let Some(crate_prefix) = caller_crate_prefix(&ctx.module_prefix) else {
+        return Ok(None);
+    };
+    let suffix = format!("::{name}");
+    let mut hits: HashSet<EntityId> = HashSet::new();
+    for e in storage.find_entities_by_name_pattern(name).await? {
+        // Foglia esatta, non un match parziale (`name` come sottostringa altrove).
+        if e.qualified_name != name && !e.qualified_name.ends_with(&suffix) {
+            continue;
+        }
+        // Solo definizioni reali: esclude i placeholder `impl_target` e gli alias.
+        if !matches!(
+            e.metadata.get("rust_kind").map(String::as_str),
+            Some("struct" | "enum" | "trait")
+        ) {
+            continue;
+        }
+        // Stesso crate del chiamante: niente sconfinamento cross-crate.
+        if !e.qualified_name.starts_with(&crate_prefix) {
+            continue;
+        }
+        // Lingua coerente col file del placeholder.
+        let t_lang = e
+            .metadata
+            .get("language")
+            .cloned()
+            .unwrap_or_else(|| detect_language(&e.location.file_path));
+        if !language_matches(&ctx.language, &t_lang) {
+            continue;
+        }
+        hits.insert(e.id);
+    }
+    if hits.len() == 1 {
+        Ok(hits.into_iter().next())
+    } else {
+        Ok(None)
+    }
 }
 
 /// Come un target è stato risolto a un `EntityId`. Determina la **confidenza** della
@@ -2223,6 +2293,145 @@ class Cache extends BaseCache {
                 .iter()
                 .any(|e| e.qualified_name == "src::b::Error"),
             "un impl su un tipo importato da crate esterno non va fuso nell'omonimo locale"
+        );
+    }
+
+    #[tokio::test]
+    async fn type_fragment_merges_with_db_canonical_on_single_file_reindex() {
+        // Re-index di un SINGOLO file (follow-up del Fix #3): la definizione canonica
+        // non è nel batch — vive in un altro file, già indicizzato e persistito. Senza
+        // il lookup su storage il placeholder `impl_target` ri-frammenterebbe il tipo a
+        // ogni re-index incrementale (il bug che questo test blinda). Scenario: prima
+        // si indicizza tutto (lib.rs definisce `Version`, display.rs lo ri-implementa),
+        // si persiste, poi si re-indicizza il SOLO display.rs.
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        // 1. Indicizzazione full-project + persistenza nello storage.
+        let full = vec![
+            parse_rust(
+                "/repo/src/lib.rs",
+                "pub struct Version;\nimpl Version {\n    pub fn new() {}\n}\n",
+            )
+            .await,
+            parse_rust(
+                "/repo/src/display.rs",
+                "use crate::Version;\nimpl Version {\n    pub fn show(&self) {}\n}\n",
+            )
+            .await,
+        ];
+        let delta_full = resolver.resolve(&full, &storage).await.unwrap();
+        storage.apply_delta(delta_full).await.unwrap();
+
+        // Il canonico persistito è uno solo: `src::lib::Version`.
+        let canonical = storage
+            .get_entity_by_qname("src::lib::Version")
+            .await
+            .unwrap()
+            .expect("il tipo canonico dev'essere persistito dopo l'indice full");
+
+        // 2. Re-index del SOLO display.rs: la def canonica resta nel DB, non nel batch.
+        let reindex = vec![
+            parse_rust(
+                "/repo/src/display.rs",
+                "use crate::Version;\nimpl Version {\n    pub fn show(&self) {}\n}\n",
+            )
+            .await,
+        ];
+        let delta = resolver.resolve(&reindex, &storage).await.unwrap();
+
+        // Nessun frammento per-file ricompare: il placeholder è stato fuso col canonico
+        // trovato nello storage (la via batch qui non vedrebbe alcuna definizione).
+        assert!(
+            !delta
+                .added_entities
+                .iter()
+                .any(|e| e.qualified_name == "src::display::Version"),
+            "il re-index di un singolo file NON deve ri-frammentare il tipo: \
+             il placeholder va fuso col canonico nello storage"
+        );
+
+        // Il metodo ri-creato appartiene al canonico DB, non a un frammento locale.
+        let show = find(&delta, "src::display::Version::show");
+        let show_id = show.id;
+        assert!(
+            delta.added_relations.iter().any(|r| {
+                r.kind == RelationKind::BelongsTo
+                    && r.source_id == show_id
+                    && r.target_id == canonical.id
+            }),
+            "il metodo dell'impl re-indicizzato dev'essere figlio del tipo canonico DB"
+        );
+
+        // 3. Integrità end-to-end: applicato il delta del re-index, il grafo resta
+        //    consistente — il canonico DB sopravvive (non era nel file re-indicizzato),
+        //    il frammento non esiste, e l'arco del metodo punta a un'entità reale.
+        storage.apply_delta(delta).await.unwrap();
+        assert!(
+            storage
+                .get_entity_by_qname("src::lib::Version")
+                .await
+                .unwrap()
+                .is_some(),
+            "il tipo canonico (altro file) non dev'essere toccato dal re-index"
+        );
+        assert!(
+            storage
+                .get_entity_by_qname("src::display::Version")
+                .await
+                .unwrap()
+                .is_none(),
+            "nessun frammento per-file deve persistere nel grafo dopo il re-index"
+        );
+        let belongs = storage
+            .query_relations(RelationFilter {
+                source_id: Some(show_id),
+                kind: Some(RelationKind::BelongsTo),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            belongs.iter().any(|r| r.target_id == canonical.id),
+            "dopo l'apply, l'arco BelongsTo del metodo punta al canonico DB (nessun arco pendente)"
+        );
+    }
+
+    #[tokio::test]
+    async fn db_canonical_lookup_abstains_on_homonyms() {
+        // Guardia anti-merge-bugiardo per la NUOVA via DB (re-index singolo file):
+        // se nello storage esistono ≥2 definizioni omonime, a quale apparterrebbe un
+        // `impl` di un terzo file è ambiguo ⇒ non si fonde (un merge mancante batte uno
+        // bugiardo). È l'analogo di `homonym_types_block_canonicalization` ma quando i
+        // candidati vivono nel DB, non nel batch.
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        // 1. Persisti due `Item` distinti (moduli diversi dello stesso crate).
+        let full = vec![
+            parse_rust("/repo/src/a.rs", "pub struct Item;\n").await,
+            parse_rust("/repo/src/b.rs", "pub struct Item;\n").await,
+        ];
+        let delta_full = resolver.resolve(&full, &storage).await.unwrap();
+        storage.apply_delta(delta_full).await.unwrap();
+
+        // 2. Re-index del solo c.rs con un `impl Item`: i canonici sono nel DB, ≥2.
+        let reindex = vec![
+            parse_rust(
+                "/repo/src/c.rs",
+                "impl Item {\n    pub fn code(&self) {}\n}\n",
+            )
+            .await,
+        ];
+        let delta = resolver.resolve(&reindex, &storage).await.unwrap();
+
+        // Con omonimi ambigui nel DB il placeholder NON viene fuso: resta dov'è.
+        assert!(
+            delta
+                .added_entities
+                .iter()
+                .any(|e| e.qualified_name == "src::c::Item"),
+            "con ≥2 canonici omonimi nel DB il lookup dev'astenersi (niente merge indovinato)"
         );
     }
 }
