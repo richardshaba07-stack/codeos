@@ -54,11 +54,20 @@ impl GraphResolver {
         let mut new_by_qname: HashMap<String, EntityId> = HashMap::new();
         let mut new_by_name: HashMap<String, Vec<(EntityId, String)>> = HashMap::new();
         let mut new_by_id_lang: HashMap<EntityId, String> = HashMap::new();
+        // Reverse del batch (id→qname): nel Passo 3 dà il `qualified_name` del
+        // TARGET appena risolto senza una query, per timbrare l'identità stabile
+        // dell'arco (`source_qname`/`target_qname`) e conservarne la nascita.
+        let mut new_id_to_qname: HashMap<EntityId, String> = HashMap::new();
         // Mappa id→source_kind ("test"/"prod"): nel Passo 3 la consultiamo per
         // timbrare ogni arco di dipendenza con la natura del file SORGENTE, così il
         // Guardian può escludere dal mining gli archi nati nei test (vedi
         // `cross_layer`).
         let mut new_by_id_source_kind: HashMap<EntityId, String> = HashMap::new();
+        // Nascita degli ARCHI risolti, raccolta nel Passo 0 dal re-index e
+        // conservata fino al Passo 3 (invece di resettarla al commit corrente).
+        // Chiave = identità stabile dell'arco `(source_qname, kind, target_qname)`,
+        // l'unica che sopravvive al delete+recreate (gli `EntityId` si rigenerano).
+        let mut edge_born: EdgeBornMap = HashMap::new();
 
         // Contesto per-file da rielaborare nel Passo 3 (dopo aver indicizzato
         // TUTTE le entità del batch).
@@ -84,9 +93,10 @@ impl GraphResolver {
             // presenti per questo file, così non si accumulano dati stantii.
             // `born_map`: la nascita (commit+istante) delle entità preesistenti del
             // file, per conservarla nel re-index invece di resettarla (vedi Passo 1).
-            let born_map = self
+            let (born_map, file_edge_born) = self
                 .collect_removals(&file.file_path, storage, &mut delta)
                 .await?;
+            edge_born.extend(file_edge_born);
 
             // Passo 1 — Creazione entità + costruzione della mappa local_id→EntityId.
             let mut local_map: HashMap<String, EntityId> = HashMap::new();
@@ -103,6 +113,7 @@ impl GraphResolver {
                 local_map.insert(parsed.local_id.clone(), id);
                 local_qname.insert(parsed.local_id.clone(), qname.clone());
                 new_by_qname.insert(qname.clone(), id);
+                new_id_to_qname.insert(id, qname.clone());
                 new_by_name
                     .entry(parsed.name.clone())
                     .or_default()
@@ -192,6 +203,7 @@ impl GraphResolver {
                 module_prefix,
                 language: detect_language(&file.file_path),
                 local_map,
+                local_qname,
                 namespace,
                 relations: file.relations.clone(),
             });
@@ -276,6 +288,36 @@ impl GraphResolver {
                             "resolution_confidence".to_string(),
                             strategy.confidence().to_string(),
                         );
+
+                        // Grafo temporale (vision step 2) — identità STABILE + nascita
+                        // dell'arco, SOLO per gli archi risolti. La coppia di
+                        // `qualified_name` è l'identità che sopravvive al re-index (gli
+                        // `EntityId` si rigenerano): la timbriamo nei metadata sia
+                        // perché è il riferimento mostrabile da CLI/Memory Engine, sia
+                        // perché è la chiave con cui CONSERVIAMO la nascita invece di
+                        // resettarla. Unresolved (target nil) ed esterni restano fuori:
+                        // una nascita mancante è meglio di una su rumore (trappola #3).
+                        let source_qname = ctx.local_qname.get(&parsed.source_local_id).cloned();
+                        let target_qname = match new_id_to_qname.get(&target_id) {
+                            Some(q) => Some(q.clone()),
+                            None => storage
+                                .get_entity_by_id(&target_id)
+                                .await?
+                                .map(|e| e.qualified_name),
+                        };
+                        if let (Some(sq), Some(tq)) = (source_qname, target_qname) {
+                            if let Some(cc) = &self.commit_context {
+                                let (born_commit, born_ts) = edge_born
+                                    .get(&(sq.clone(), parsed.kind, tq.clone()))
+                                    .cloned()
+                                    .unwrap_or_else(|| (cc.commit.clone(), cc.ts));
+                                metadata.insert("born_commit".to_string(), born_commit);
+                                metadata.insert("born_ts".to_string(), born_ts.to_string());
+                            }
+                            metadata.insert("source_qname".to_string(), sq);
+                            metadata.insert("target_qname".to_string(), tq);
+                        }
+
                         Relation {
                             id: EntityId::new(),
                             kind: parsed.kind,
@@ -390,23 +432,27 @@ impl GraphResolver {
     }
 
     /// Passo 0: raccoglie le entità e relazioni esistenti del file nel delta di
-    /// rimozione e, già che le ha sotto mano, ne **raccoglie la nascita** (mappa
-    /// `qualified_name → (born_commit, born_ts)`) per conservarla nel re-index.
+    /// rimozione e, già che le ha sotto mano, ne **raccoglie la nascita** per
+    /// conservarla nel re-index — sia dei NODI (`qualified_name → (commit, ts)`)
+    /// sia degli ARCHI risolti (identità `(source_qname, kind, target_qname) →
+    /// (commit, ts)`, letta dai metadata che il Passo 3 vi ha timbrato).
     ///
     /// Il re-index sostituisce un file cancellando+ricreando le sue entità (con un
     /// `EntityId` nuovo): senza questa raccolta la nascita verrebbe resettata al
     /// commit corrente a ogni passaggio (rumore temporale). Raccogliendola dalle
-    /// entità che stiamo già leggendo per la rimozione, la conservazione costa
-    /// **zero query aggiuntive**.
+    /// entità e relazioni che stiamo già leggendo per la rimozione, la
+    /// conservazione costa **zero query aggiuntive**.
     async fn collect_removals(
         &self,
         file_path: &str,
         storage: &dyn GraphStorage,
         delta: &mut GraphDelta,
-    ) -> anyhow::Result<HashMap<String, (String, i64)>> {
+    ) -> anyhow::Result<BornHarvest> {
         let existing = storage.get_entities_by_file(file_path).await?;
-        let mut relation_ids: HashSet<EntityId> = HashSet::new();
         let mut born: HashMap<String, (String, i64)> = HashMap::new();
+        // Relazioni da rimuovere, deduplicate per id: una stessa relazione può
+        // toccare due entità del file (come sorgente e come destinazione).
+        let mut rels: HashMap<EntityId, Relation> = HashMap::new();
         for entity in &existing {
             for rel in storage
                 .query_relations(RelationFilter {
@@ -415,7 +461,7 @@ impl GraphResolver {
                 })
                 .await?
             {
-                relation_ids.insert(rel.id);
+                rels.insert(rel.id, rel);
             }
             for rel in storage
                 .query_relations(RelationFilter {
@@ -424,15 +470,31 @@ impl GraphResolver {
                 })
                 .await?
             {
-                relation_ids.insert(rel.id);
+                rels.insert(rel.id, rel);
             }
             if let Some(b) = born_stamp(&entity.metadata) {
                 born.insert(entity.qualified_name.clone(), b);
             }
             delta.removed_entity_ids.push(entity.id);
         }
-        delta.removed_relation_ids.extend(relation_ids);
-        Ok(born)
+
+        // Nascita degli archi RISOLTI: il Passo 3 ha timbrato `source_qname`/
+        // `target_qname` sull'arco; con la sua stessa nascita formano l'identità
+        // stabile che conserviamo. Gli archi privi di quella coppia (Unresolved,
+        // esterni, o nati prima di questo schema) non contribuiscono — onesto: una
+        // nascita mancante è meglio di una agganciata a un'identità che non c'è.
+        let mut edge_born: EdgeBornMap = HashMap::new();
+        for (id, rel) in &rels {
+            delta.removed_relation_ids.push(*id);
+            if let (Some(sq), Some(tq), Some(b)) = (
+                rel.metadata.get("source_qname"),
+                rel.metadata.get("target_qname"),
+                born_stamp(&rel.metadata),
+            ) {
+                edge_born.insert((sq.clone(), rel.kind, tq.clone()), b);
+            }
+        }
+        Ok((born, edge_born))
     }
 
     /// Passo 1: costruisce il `qualified_name` di un'entità.
@@ -488,6 +550,9 @@ struct FileContext {
     module_prefix: String,
     language: String,
     local_map: HashMap<String, EntityId>,
+    /// `local_id → qualified_name` delle entità del file: nel Passo 3 dà il
+    /// `source_qname` dell'arco (identità stabile lato sorgente) senza ricostruirlo.
+    local_qname: HashMap<String, String>,
     namespace: HashMap<String, String>,
     relations: Vec<codeos_types::ParsedRelation>,
 }
@@ -1192,6 +1257,14 @@ fn first_segment(target: &str) -> Option<&str> {
 fn last_segment(target: &str) -> Option<&str> {
     target.rsplit(['.', ':']).find(|s| !s.is_empty())
 }
+
+/// Identità stabile di un arco risolto → la sua nascita. La coppia di
+/// `qualified_name` (più il `kind`) sopravvive al re-index; gli `EntityId` no.
+type EdgeBornMap = HashMap<(String, RelationKind, String), (String, i64)>;
+
+/// Nascita raccolta da `collect_removals` nel re-index: nodi (`qname → (commit,
+/// ts)`) e archi risolti (vedi [`EdgeBornMap`]).
+type BornHarvest = (HashMap<String, (String, i64)>, EdgeBornMap);
 
 /// Estrae la nascita (`born_commit`, `born_ts`) dai metadata di un'entità, se
 /// presente e ben formata. Serve a CONSERVARE la nascita nel re-index: un
@@ -2230,6 +2303,170 @@ class Cache extends BaseCache {
                 e.qualified_name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn stamps_birth_and_identity_on_resolved_edges() {
+        // Grafo temporale (vision step 2), archi: una call RISOLTA nasce timbrata
+        // col commit corrente e porta l'identità stabile (`source_qname`/`target_qname`).
+        let cc = CommitContext {
+            commit: "edge0001".to_string(),
+            ts: 1_700_000_001,
+        };
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None).with_commit_context(Some(cc));
+
+        let src = "def helper():\n    pass\n\ndef top_level():\n    helper()\n";
+        let delta = resolver
+            .resolve(&[parse("m.py", src).await], &storage)
+            .await
+            .unwrap();
+
+        let call = delta
+            .added_relations
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("la call risolta a 'helper' è assente");
+        assert_eq!(
+            call.metadata.get("source_qname").map(String::as_str),
+            Some("m::top_level"),
+            "source_qname dell'arco assente/errato"
+        );
+        assert_eq!(
+            call.metadata.get("target_qname").map(String::as_str),
+            Some("m::helper"),
+            "target_qname dell'arco assente/errato"
+        );
+        assert_eq!(
+            call.metadata.get("born_commit").map(String::as_str),
+            Some("edge0001"),
+            "born_commit dell'arco assente/errato"
+        );
+        assert_eq!(
+            call.metadata.get("born_ts").map(String::as_str),
+            Some("1700000001"),
+            "born_ts dell'arco assente/errato"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_preserves_resolved_edge_birth() {
+        // Anti-rumore temporale (trap #3) sugli ARCHI: re-indicizzare un file non
+        // deve far sembrare "nato adesso" un arco che esiste da commit precedenti.
+        // La nascita si conserva attraverso il delete+recreate, agganciata
+        // all'identità stabile `(source_qname, kind, target_qname)`.
+        let storage = SqliteStorage::in_memory().unwrap();
+        let src = "def helper():\n    pass\n\ndef top_level():\n    helper()\n";
+
+        let r1 = GraphResolver::new(None).with_commit_context(Some(CommitContext {
+            commit: "aaa".to_string(),
+            ts: 1000,
+        }));
+        let d1 = r1
+            .resolve(&[parse("m.py", src).await], &storage)
+            .await
+            .unwrap();
+        storage.apply_delta(d1).await.unwrap();
+
+        // Re-index dello STESSO file a un commit DIVERSO "bbb".
+        let r2 = GraphResolver::new(None).with_commit_context(Some(CommitContext {
+            commit: "bbb".to_string(),
+            ts: 2000,
+        }));
+        let d2 = r2
+            .resolve(&[parse("m.py", src).await], &storage)
+            .await
+            .unwrap();
+        storage.apply_delta(d2).await.unwrap();
+
+        let calls = storage
+            .query_relations(RelationFilter {
+                kind: Some(RelationKind::Calls),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.len(), 1, "atteso un solo arco Calls dopo il re-index");
+        // Non-vacuo: una logica che timbra sempre il commit corrente darebbe "bbb"/2000.
+        assert_eq!(
+            calls[0].metadata.get("born_commit").map(String::as_str),
+            Some("aaa"),
+            "born_commit dell'arco resettato al commit corrente: rumore temporale!"
+        );
+        assert_eq!(
+            calls[0].metadata.get("born_ts").map(String::as_str),
+            Some("1000"),
+            "born_ts dell'arco resettato al commit corrente: rumore temporale!"
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_edge_carries_no_birth_nor_identity() {
+        // Trappola #3 sul tempo: un arco che NON risolve (target nil, nessuna
+        // identità) non deve ricevere una nascita — sarebbe un timestamp sul rumore.
+        let cc = CommitContext {
+            commit: "edge0002".to_string(),
+            ts: 1_700_000_002,
+        };
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None).with_commit_context(Some(cc));
+
+        // `self.thing.mystery_method()` arriva come bare `mystery_method`, che non
+        // esiste nel modulo: il resolver si astiene (⇒ Unresolved), niente arco bugiardo.
+        let src = "class C:\n    def run(self):\n        self.thing.mystery_method()\n";
+        let delta = resolver
+            .resolve(&[parse("m.py", src).await], &storage)
+            .await
+            .unwrap();
+
+        let unresolved = delta
+            .added_relations
+            .iter()
+            .find(|r| r.kind == RelationKind::Unresolved)
+            .expect("atteso un arco Unresolved per 'mystery_method'");
+        assert!(
+            !unresolved.metadata.contains_key("born_commit")
+                && !unresolved.metadata.contains_key("born_ts"),
+            "un arco Unresolved non deve avere una nascita (rumore temporale)"
+        );
+        assert!(
+            !unresolved.metadata.contains_key("source_qname")
+                && !unresolved.metadata.contains_key("target_qname"),
+            "un arco Unresolved non ha un'identità stabile da timbrare"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_commit_context_stamps_no_edge_birth() {
+        // Senza commit noto non si inventa la nascita nemmeno sugli archi (retro-
+        // compatibilità + anti-falso-positivo sul tempo). L'identità (`*_qname`),
+        // indipendente dal tempo, resta comunque presente.
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None); // nessun with_commit_context
+        let src = "def helper():\n    pass\n\ndef top_level():\n    helper()\n";
+        let delta = resolver
+            .resolve(&[parse("m.py", src).await], &storage)
+            .await
+            .unwrap();
+
+        let call = delta
+            .added_relations
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("la call risolta a 'helper' è assente");
+        assert!(
+            !call.metadata.contains_key("born_commit") && !call.metadata.contains_key("born_ts"),
+            "arco timbrato con una nascita senza commit noto"
+        );
+        assert_eq!(
+            call.metadata.get("source_qname").map(String::as_str),
+            Some("m::top_level"),
+            "l'identità dell'arco non dipende dal tempo: deve esserci comunque"
+        );
+        assert_eq!(
+            call.metadata.get("target_qname").map(String::as_str),
+            Some("m::helper")
+        );
     }
 
     #[test]
