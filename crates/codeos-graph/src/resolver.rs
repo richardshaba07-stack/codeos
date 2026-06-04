@@ -9,7 +9,8 @@ use std::collections::{HashMap, HashSet};
 
 use codeos_storage::{GraphStorage, RelationFilter};
 use codeos_types::{
-    Entity, EntityId, GraphDelta, ParsedEntity, ParsedFileResult, Relation, RelationKind,
+    CommitContext, Entity, EntityId, GraphDelta, ParsedEntity, ParsedFileResult, Relation,
+    RelationKind,
 };
 
 /// Risolve i risultati grezzi del parser in un delta del grafo.
@@ -17,11 +18,26 @@ pub struct GraphResolver {
     /// Prefisso da rimuovere dai path per costruire i `qualified_name` relativi.
     /// `None` ⇒ il path viene usato così com'è (normalizzato).
     project_root: Option<String>,
+    /// Commit con cui timbrare la *nascita* dei nodi (grafo temporale, vision step
+    /// 2). `None` ⇒ niente timbro (nessun repo git, o non lo conosciamo): meglio un
+    /// istante mancante che uno inventato.
+    commit_context: Option<CommitContext>,
 }
 
 impl GraphResolver {
     pub fn new(project_root: Option<String>) -> Self {
-        Self { project_root }
+        Self {
+            project_root,
+            commit_context: None,
+        }
+    }
+
+    /// Imposta il commit con cui timbrare la nascita dei nodi creati in questo
+    /// resolve. Builder additivo: chi non lo chiama (test, percorsi senza git)
+    /// continua a non timbrare nulla, comportamento identico a prima.
+    pub fn with_commit_context(mut self, commit_context: Option<CommitContext>) -> Self {
+        self.commit_context = commit_context;
+        self
     }
 
     /// Esegue i 5 passi del briefing su tutti i file del batch e restituisce un
@@ -66,7 +82,10 @@ impl GraphResolver {
 
             // Passo 0 — Pulizia: rimuovi dal grafo le entità (e relazioni) già
             // presenti per questo file, così non si accumulano dati stantii.
-            self.collect_removals(&file.file_path, storage, &mut delta)
+            // `born_map`: la nascita (commit+istante) delle entità preesistenti del
+            // file, per conservarla nel re-index invece di resettarla (vedi Passo 1).
+            let born_map = self
+                .collect_removals(&file.file_path, storage, &mut delta)
                 .await?;
 
             // Passo 1 — Creazione entità + costruzione della mappa local_id→EntityId.
@@ -99,6 +118,20 @@ impl GraphResolver {
                     .unwrap_or_else(|| file_source_kind.to_string());
                 metadata.insert("source_kind".to_string(), source_kind.clone());
                 new_by_id_source_kind.insert(id, source_kind);
+
+                // Nascita (grafo temporale, vision step 2): timbra commit+istante
+                // SOLO se conosciamo il commit corrente. Su re-index conserva la
+                // nascita preesistente di questa identità (`qname`) — non la resetta
+                // al commit di adesso: un tipo che esiste da 100 commit non deve
+                // sembrare "nuovo" dopo una re-indicizzazione (anti-rumore temporale).
+                if let Some(cc) = &self.commit_context {
+                    let (born_commit, born_ts) = born_map
+                        .get(&qname)
+                        .cloned()
+                        .unwrap_or_else(|| (cc.commit.clone(), cc.ts));
+                    metadata.insert("born_commit".to_string(), born_commit);
+                    metadata.insert("born_ts".to_string(), born_ts.to_string());
+                }
 
                 entity_aux.push(EntityAux {
                     id,
@@ -357,15 +390,23 @@ impl GraphResolver {
     }
 
     /// Passo 0: raccoglie le entità e relazioni esistenti del file nel delta di
-    /// rimozione.
+    /// rimozione e, già che le ha sotto mano, ne **raccoglie la nascita** (mappa
+    /// `qualified_name → (born_commit, born_ts)`) per conservarla nel re-index.
+    ///
+    /// Il re-index sostituisce un file cancellando+ricreando le sue entità (con un
+    /// `EntityId` nuovo): senza questa raccolta la nascita verrebbe resettata al
+    /// commit corrente a ogni passaggio (rumore temporale). Raccogliendola dalle
+    /// entità che stiamo già leggendo per la rimozione, la conservazione costa
+    /// **zero query aggiuntive**.
     async fn collect_removals(
         &self,
         file_path: &str,
         storage: &dyn GraphStorage,
         delta: &mut GraphDelta,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<HashMap<String, (String, i64)>> {
         let existing = storage.get_entities_by_file(file_path).await?;
         let mut relation_ids: HashSet<EntityId> = HashSet::new();
+        let mut born: HashMap<String, (String, i64)> = HashMap::new();
         for entity in &existing {
             for rel in storage
                 .query_relations(RelationFilter {
@@ -385,10 +426,13 @@ impl GraphResolver {
             {
                 relation_ids.insert(rel.id);
             }
+            if let Some(b) = born_stamp(&entity.metadata) {
+                born.insert(entity.qualified_name.clone(), b);
+            }
             delta.removed_entity_ids.push(entity.id);
         }
         delta.removed_relation_ids.extend(relation_ids);
-        Ok(())
+        Ok(born)
     }
 
     /// Passo 1: costruisce il `qualified_name` di un'entità.
@@ -1147,6 +1191,16 @@ fn first_segment(target: &str) -> Option<&str> {
 
 fn last_segment(target: &str) -> Option<&str> {
     target.rsplit(['.', ':']).find(|s| !s.is_empty())
+}
+
+/// Estrae la nascita (`born_commit`, `born_ts`) dai metadata di un'entità, se
+/// presente e ben formata. Serve a CONSERVARE la nascita nel re-index: un
+/// `born_ts` non numerico (corruzione/manomissione) è ignorato (`None`) invece di
+/// propagare un dato fasullo — meglio ri-timbrare che fidarsi di un istante rotto.
+fn born_stamp(metadata: &HashMap<String, String>) -> Option<(String, i64)> {
+    let commit = metadata.get("born_commit")?;
+    let ts: i64 = metadata.get("born_ts")?.parse().ok()?;
+    Some((commit.clone(), ts))
 }
 
 /// Normalizza un `target_qualified_name` grezzo emesso dal parser. I simboli del
@@ -2065,6 +2119,117 @@ class Cache extends BaseCache {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn stamps_birth_when_commit_context_is_known() {
+        // Grafo temporale (vision step 2): con un commit noto, ogni nodo creato
+        // nasce timbrato con quel commit+istante.
+        let cc = CommitContext {
+            commit: "deadbeef".to_string(),
+            ts: 1_700_000_000,
+        };
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None).with_commit_context(Some(cc.clone()));
+
+        let delta = resolver
+            .resolve(
+                &[parse("m.py", "class Foo:\n    def bar(self):\n        pass\n").await],
+                &storage,
+            )
+            .await
+            .unwrap();
+
+        // È la prima volta che vediamo questi nodi: nascono tutti al commit corrente.
+        for qname in ["m", "m::Foo", "m::Foo::bar"] {
+            let e = find(&delta, qname);
+            assert_eq!(
+                e.metadata.get("born_commit").map(String::as_str),
+                Some("deadbeef"),
+                "{qname}: born_commit assente/errato"
+            );
+            assert_eq!(
+                e.metadata.get("born_ts").map(String::as_str),
+                Some("1700000000"),
+                "{qname}: born_ts assente/errato"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reindex_preserves_birth_does_not_reset_to_current_commit() {
+        // Anti-rumore temporale (trap #3): re-indicizzare un file NON deve far
+        // sembrare "nato adesso" un nodo che esiste da commit precedenti. La nascita
+        // si conserva attraverso il delete+recreate del re-index, agganciata
+        // all'identità (`qualified_name`).
+        let storage = SqliteStorage::in_memory().unwrap();
+        let src = "class Foo:\n    def bar(self):\n        pass\n";
+
+        // Indicizzazione al commit "aaa".
+        let r1 = GraphResolver::new(None).with_commit_context(Some(CommitContext {
+            commit: "aaa".to_string(),
+            ts: 1000,
+        }));
+        let d1 = r1
+            .resolve(&[parse("m.py", src).await], &storage)
+            .await
+            .unwrap();
+        storage.apply_delta(d1).await.unwrap();
+
+        // Re-indicizzazione dello STESSO file a un commit DIVERSO "bbb".
+        let r2 = GraphResolver::new(None).with_commit_context(Some(CommitContext {
+            commit: "bbb".to_string(),
+            ts: 2000,
+        }));
+        let d2 = r2
+            .resolve(&[parse("m.py", src).await], &storage)
+            .await
+            .unwrap();
+        storage.apply_delta(d2).await.unwrap();
+
+        // L'entità sopravvissuta conserva la nascita ORIGINALE (non "bbb"/2000).
+        // Non-vacuo: una logica che timbra sempre il commit corrente fallirebbe qui.
+        let foo = storage
+            .get_entity_by_qname("m::Foo")
+            .await
+            .unwrap()
+            .expect("Foo deve esistere dopo il re-index");
+        assert_eq!(
+            foo.metadata.get("born_commit").map(String::as_str),
+            Some("aaa"),
+            "born_commit resettato al commit corrente: rumore temporale!"
+        );
+        assert_eq!(
+            foo.metadata.get("born_ts").map(String::as_str),
+            Some("1000"),
+            "born_ts resettato al commit corrente: rumore temporale!"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_commit_context_stamps_no_birth() {
+        // Retro-compatibilità + anti-falso-positivo sul tempo: senza commit noto NON
+        // si inventa alcuna nascita. I percorsi e i test esistenti restano identici.
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None); // nessun with_commit_context
+
+        let delta = resolver
+            .resolve(&[parse("m.py", "class Foo:\n    pass\n").await], &storage)
+            .await
+            .unwrap();
+
+        for e in &delta.added_entities {
+            assert!(
+                !e.metadata.contains_key("born_commit"),
+                "{}: born_commit timbrato senza commit noto",
+                e.qualified_name
+            );
+            assert!(
+                !e.metadata.contains_key("born_ts"),
+                "{}: born_ts timbrato senza commit noto",
+                e.qualified_name
+            );
+        }
     }
 
     #[test]

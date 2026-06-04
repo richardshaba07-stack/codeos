@@ -128,6 +128,25 @@ pub struct Relation {
     pub metadata: HashMap<String, String>,
 }
 
+/// Il commit con cui un'indicizzazione **timbra la nascita** dei nodi nel grafo
+/// temporale (vision step 2): l'hash di `HEAD` e il suo istante (committer date,
+/// secondi Unix).
+///
+/// È **opzionale** in tutta la pipeline: se il progetto non è un repository git (o
+/// `git` non è disponibile) resta `None` e NON si timbra nulla. Un dato di nascita
+/// mancante è meglio di un timestamp inventato — è la tesi anti-falso-positivo
+/// applicata al tempo: «meglio un istante mancante che uno che mente». Inoltre, su
+/// re-index la nascita di un'entità con identità (`qualified_name`) già nota viene
+/// **conservata**, non resettata: il grafo temporale non deve datare come "nuovo"
+/// ciò che esiste da molti commit (anti-rumore temporale).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommitContext {
+    /// Hash completo del commit indicizzato (`HEAD`).
+    pub commit: String,
+    /// Istante del commit (committer date, secondi Unix).
+    pub ts: i64,
+}
+
 // ---------------------------------------------------------------------------
 // Dati grezzi del parser
 //

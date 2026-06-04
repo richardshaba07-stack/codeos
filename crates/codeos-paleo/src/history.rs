@@ -5,7 +5,7 @@
 //! matematica testabile in isolamento (con [`InMemoryHistory`]) e isoliamo l'unico
 //! pezzo di I/O — la lettura di `git` — in [`GitLog`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Un commit ridotto all'essenziale per le due analisi del Paleontologo:
@@ -192,6 +192,47 @@ fn parse_git_log(stdout: &str) -> Vec<Commit> {
     commits
 }
 
+/// Legge il commit di `HEAD` del repository in `repo_root`, se esiste.
+///
+/// Serve a **timbrare la nascita** dei nodi del grafo temporale (vision step 2):
+/// chi indicizza chiede a questo lettore «su quale commit sto guardando il
+/// codice?» e passa l'hash+istante al `GraphResolver`.
+///
+/// **Best-effort e onesto.** Restituisce `None` — *mai* un hash o un istante
+/// inventato — se:
+/// - `repo_root` non è un repository git;
+/// - `git` non è installato (lo spawn fallisce);
+/// - `HEAD` non esiste ancora (repo appena inizializzato, zero commit).
+///
+/// È la tesi anti-falso-positivo applicata al tempo: **meglio una nascita mancante
+/// che una che mente**. Un fallimento qui non deve mai rompere l'indicizzazione —
+/// il timbro temporale è metadato opzionale, non un prerequisito. Per questo NON
+/// è un `Result`: l'unico esito possibile è «ho un commit» o «non ce l'ho».
+///
+/// Niente `--no-merges` (a differenza di [`GitLog::commits`]): vogliamo *esattamente*
+/// `HEAD`, anche se è un commit di merge. Niente `--name-only`: per il timbro non
+/// servono i file toccati, quindi `changed_files` resta vuoto.
+pub fn head_commit(repo_root: impl AsRef<Path>) -> Option<Commit> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root.as_ref())
+        .arg("log")
+        .arg("-1")
+        .arg(format!(
+            "--pretty=format:{COMMIT_MARKER}%H{FIELD_SEP}%ct{FIELD_SEP}%s"
+        ))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        // `not a git repository`, `HEAD` non nato, ecc. → nessun timbro, non un errore.
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // `-1` produce esattamente un commit (o zero righe se HEAD non esiste).
+    // Riusiamo il parser puro così la forma dell'header è una sola in tutto il crate.
+    parse_git_log(&stdout).into_iter().next()
+}
+
 /// Sorgente in memoria: la storia è data esplicitamente. Serve ai test (e a
 /// chiunque voglia alimentare l'analisi da un'altra origine, es. una API di host git).
 pub struct InMemoryHistory {
@@ -246,6 +287,70 @@ app/api/handler.py
     #[test]
     fn empty_log_yields_no_commits() {
         assert!(parse_git_log("").is_empty());
+    }
+
+    /// Esegue un comando git nel repo di test, fallendo con un messaggio chiaro
+    /// se git non è disponibile o il comando non riesce (così un ambiente senza
+    /// git dà un errore leggibile invece di un panic opaco).
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git deve essere disponibile per questo test");
+        assert!(
+            out.status.success(),
+            "git {args:?} fallito: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Inizializza un repo git ermetico e isolato dalla config globale dell'utente
+    /// (identità locale, niente firma gpg): un commit di test non deve dipendere
+    /// dall'ambiente né fallire per una firma mancante.
+    fn init_repo(dir: &Path) {
+        run_git(dir, &["init", "-q"]);
+        run_git(dir, &["config", "user.email", "test@codeos.local"]);
+        run_git(dir, &["config", "user.name", "CodeOS Test"]);
+        run_git(dir, &["config", "commit.gpgsign", "false"]);
+    }
+
+    #[test]
+    fn head_commit_reads_real_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        std::fs::write(tmp.path().join("a.txt"), "ciao").unwrap();
+        run_git(tmp.path(), &["add", "a.txt"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "primo commit"]);
+
+        let head = head_commit(tmp.path()).expect("HEAD esiste dopo un commit");
+        // Hash reale (40 hex per sha1), istante reale (>0), soggetto reale.
+        assert_eq!(head.hash.len(), 40, "hash completo, non inventato");
+        assert!(head.hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(head.timestamp > 0, "istante reale del commit, non 0/finto");
+        assert_eq!(head.subject, "primo commit");
+    }
+
+    #[test]
+    fn head_commit_is_none_outside_a_repo() {
+        // Cartella che esiste ma NON è un repo git → nessun timbro, non un errore.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            head_commit(tmp.path()).is_none(),
+            "fuori da un repo non si inventa una nascita"
+        );
+    }
+
+    #[test]
+    fn head_commit_is_none_on_unborn_head() {
+        // Repo inizializzato ma SENZA commit: HEAD non esiste ancora.
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        assert!(
+            head_commit(tmp.path()).is_none(),
+            "HEAD non nato ⇒ None, mai un hash finto"
+        );
     }
 
     #[test]
