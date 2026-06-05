@@ -33,3 +33,49 @@ pub enum Evidence {
     /// Un'altra decisione del ledger. Provato da: il ledger la contiene.
     PriorDecision(EntityId),
 }
+
+impl std::fmt::Display for Evidence {
+    /// Forma **concisa e leggibile** di una citazione: quella che il Query Engine
+    /// porta nel contesto accanto al *perché*, così l'LLM vede la prova e non solo
+    /// l'affermazione. È una vista di presentazione, distinta dalla serializzazione
+    /// round-trip del Markdown store (che antepone tag con `: ` per riparsarsi).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Evidence::Commit(hash) => write!(f, "commit {hash}"),
+            Evidence::Edge {
+                source,
+                kind,
+                target,
+            } => write!(f, "{source} --{}--> {target}", kind.as_str()),
+            Evidence::Entity(qname) => write!(f, "entità {qname}"),
+            Evidence::Test(name) => write!(f, "test {name}"),
+            Evidence::PriorDecision(id) => write!(f, "decisione {id}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_renders_each_citation_concisely() {
+        assert_eq!(
+            Evidence::Commit("abc123".into()).to_string(),
+            "commit abc123"
+        );
+        assert_eq!(
+            Evidence::Edge {
+                source: "app::api::run".into(),
+                kind: RelationKind::Calls,
+                target: "app::core::do_it".into(),
+            }
+            .to_string(),
+            "app::api::run --Calls--> app::core::do_it"
+        );
+        assert_eq!(
+            Evidence::Test("test_login".into()).to_string(),
+            "test test_login"
+        );
+    }
+}

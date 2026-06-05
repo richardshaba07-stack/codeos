@@ -436,6 +436,13 @@ fn format_context(
                 out.push_str(&format!(": {}", one_line(rationale)));
             }
             out.push_str(&format!(" (autore: {})\n", decision.author));
+            // Le prove a sostegno del perché: l'LLM vede la citazione verificabile
+            // (commit, arco, test), non solo l'affermazione. Mostrate solo quando
+            // ci sono — una decisione scritta a mano può legittimamente non averne.
+            if !decision.evidence.is_empty() {
+                let proofs: Vec<String> = decision.evidence.iter().map(|e| e.to_string()).collect();
+                out.push_str(&format!("  prove: {}\n", proofs.join("; ")));
+            }
         }
     }
 
@@ -641,6 +648,55 @@ mod tests {
         assert!(
             !ctx.contains("localStorage"),
             "il perché superato non deve entrare nel contesto:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_shows_the_evidence_behind_the_why() {
+        // Il contesto non porta solo l'affermazione, ma la PROVA: l'LLM vede la
+        // citazione verificabile (qui un commit) accanto al razionale.
+        use codeos_memory::{DecisionKind, Evidence};
+        use codeos_types::bus::NewDecision;
+
+        let storage = graph_from(
+            "auth/login_service.py",
+            "class LoginService:\n    def authenticate(self):\n        pass\n",
+        )
+        .await;
+        let target = storage
+            .find_entities_by_name_pattern("login")
+            .await
+            .unwrap()
+            .first()
+            .expect("entità login attesa")
+            .id;
+
+        let decisions = Arc::new(InMemoryDecisionStore::new());
+        let mut decision = Decision::from_new(
+            NewDecision {
+                author: "ai:ArchitectureGuardian".to_string(),
+                title: "Login lato server".to_string(),
+                context: String::new(),
+                rationale: "Non esporre i segreti al client.".to_string(),
+                related_entity_ids: vec![target],
+                related_decision_ids: Vec::new(),
+                tags: Vec::new(),
+            },
+            DecisionKind::ArchitectureRule,
+        );
+        decision.evidence = vec![Evidence::Commit("birth01".to_string())];
+        decisions.record(&decision).await.unwrap();
+
+        let engine = QueryEngine::with_decisions(storage, decisions);
+        let ctx = engine
+            .query(&nl("voglio sistemare il login"))
+            .await
+            .unwrap()
+            .formatted_context;
+
+        assert!(
+            ctx.contains("prove: commit birth01"),
+            "manca la prova accanto al perché:\n{ctx}"
         );
     }
 
