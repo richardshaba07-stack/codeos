@@ -116,6 +116,7 @@ fn render(d: &Decision) -> String {
         join_ids(&d.related_decision_ids)
     ));
     s.push_str(&format!("supersedes: {}\n", join_ids(&d.supersedes)));
+    s.push_str(&format!("deprecates: {}\n", join_ids(&d.deprecates)));
     s.push_str(&format!("tags: {}\n", d.tags.join(", ")));
     s.push_str(FRONT_MATTER_DELIM);
     s.push('\n');
@@ -168,6 +169,7 @@ fn parse(content: &str) -> anyhow::Result<Decision> {
         related_decision_ids: parse_ids(&get("related_decisions"))
             .context("campo 'related_decisions' non valido")?,
         supersedes: parse_ids(&get("supersedes")).context("campo 'supersedes' non valido")?,
+        deprecates: parse_ids(&get("deprecates")).context("campo 'deprecates' non valido")?,
         tags: parse_list(&get("tags")),
         timestamp: get("timestamp"),
     })
@@ -270,6 +272,7 @@ mod tests {
             related_entity_ids: vec![EntityId::new(), EntityId::new()],
             related_decision_ids: vec![EntityId::new()],
             supersedes: vec![EntityId::new()],
+            deprecates: vec![EntityId::new()],
             tags: vec!["sicurezza".to_string(), "login".to_string()],
             timestamp: "2026-05-31T10:00:00+00:00".to_string(),
         }
@@ -288,6 +291,7 @@ mod tests {
         assert_eq!(parsed.related_entity_ids, original.related_entity_ids);
         assert_eq!(parsed.related_decision_ids, original.related_decision_ids);
         assert_eq!(parsed.supersedes, original.supersedes);
+        assert_eq!(parsed.deprecates, original.deprecates);
         assert_eq!(parsed.tags, original.tags);
         assert_eq!(parsed.timestamp, original.timestamp); // contiene ':' → idem
                                                           // Il contesto multilinea è normalizzato (trim) ma preservato nel contenuto.

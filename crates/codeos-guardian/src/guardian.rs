@@ -1499,7 +1499,12 @@ fn retraction_decision(
             STATUS_RETIRED.to_string(),
         ],
     };
-    Decision::from_new(new, DecisionKind::Decision)
+    // Cabla il ritiro nel ledger: la promozione risulterà `Deprecated` (stato
+    // derivato), non solo etichettata `status:retired`. Così un consumatore del
+    // Memory Engine vede l'invariante decaduto senza conoscere i tag del Guardian.
+    let mut decision = Decision::from_new(new, DecisionKind::Decision);
+    decision.deprecates = vec![promotion_id];
+    decision
 }
 
 #[cfg(test)]
@@ -1694,7 +1699,7 @@ mod tests {
 
     #[tokio::test]
     async fn retires_a_stale_invariant_when_the_asymmetry_breaks() {
-        use codeos_memory::InMemoryDecisionStore;
+        use codeos_memory::{DecisionStatus, InMemoryDecisionStore};
 
         let (storage, api, core) = seeded_two_layer_graph().await;
         let store = Arc::new(InMemoryDecisionStore::new());
@@ -1737,6 +1742,20 @@ mod tests {
         // Il ritiro referenzia la promozione e ne eredita le entità di confine.
         assert!(retraction.related_decision_ids.contains(&promotion.id));
         assert_eq!(retraction.related_entity_ids, promotion.related_entity_ids);
+
+        // Il ritiro cabla il ledger: la promozione è `Deprecated` (stato derivato,
+        // non scritto su di essa) e sparisce dalle decisioni correnti, mentre il
+        // ritiro stesso resta corrente. È il primo produttore reale dello stato.
+        assert_eq!(retraction.deprecates, vec![promotion.id]);
+        let ledger = store.ledger().await.unwrap();
+        let promotion_status = ledger
+            .iter()
+            .find(|(d, _)| d.id == promotion.id)
+            .map(|(_, s)| *s);
+        assert_eq!(promotion_status, Some(DecisionStatus::Deprecated));
+        let current = store.current_decisions().await.unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, retraction.id);
 
         // Idempotente: a grafo invariato, un'altra learn non aggiunge nulla.
         assert!(guardian.learn().await.unwrap().is_empty());
@@ -2293,6 +2312,7 @@ mod tests {
                 related_entity_ids: vec![],
                 related_decision_ids: vec![],
                 supersedes: vec![],
+                deprecates: vec![],
                 tags: vec!["payments".to_string()],
                 timestamp: "2024-01-01T00:00:00Z".to_string(),
             })

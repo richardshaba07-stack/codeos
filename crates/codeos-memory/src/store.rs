@@ -49,12 +49,16 @@ pub trait DecisionStore: Send + Sync {
     /// [`all`](DecisionStore::all).
     async fn ledger(&self) -> anyhow::Result<Vec<(Decision, DecisionStatus)>> {
         let all = self.all().await?;
-        let superseded = superseded_ids(&all);
+        let superseded = collect_ids(&all, |d| &d.supersedes);
+        let deprecated = collect_ids(&all, |d| &d.deprecates);
         Ok(all
             .into_iter()
             .map(|d| {
+                // Precedenza: Superseded > Deprecated > Accepted.
                 let status = if superseded.contains(&d.id) {
                     DecisionStatus::Superseded
+                } else if deprecated.contains(&d.id) {
+                    DecisionStatus::Deprecated
                 } else {
                     DecisionStatus::Accepted
                 };
@@ -79,13 +83,16 @@ pub trait DecisionStore: Send + Sync {
     }
 }
 
-/// L'insieme degli id rimpiazzati: ogni id che compare nel `supersedes` di una
-/// qualunque decisione del log. Calcolato in un colpo solo così che derivare lo
-/// stato sia O(1) per decisione.
-fn superseded_ids(decisions: &[Decision]) -> HashSet<EntityId> {
+/// L'insieme degli id puntati da un certo campo (`supersedes` o `deprecates`)
+/// attraverso tutto il log. Calcolato in un colpo solo così che derivare lo stato
+/// di una decisione sia O(1).
+fn collect_ids(
+    decisions: &[Decision],
+    pick: impl Fn(&Decision) -> &[EntityId],
+) -> HashSet<EntityId> {
     decisions
         .iter()
-        .flat_map(|d| d.supersedes.iter().copied())
+        .flat_map(|d| pick(d).iter().copied())
         .collect()
 }
 
@@ -138,6 +145,7 @@ mod tests {
             related_entity_ids: related,
             related_decision_ids: Vec::new(),
             supersedes: Vec::new(),
+            deprecates: Vec::new(),
             tags: Vec::new(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         }
@@ -203,5 +211,47 @@ mod tests {
         store.record(&decision("due", vec![])).await.unwrap();
         // Nessun `supersedes` ⇒ nessuna è rimpiazzata: il corrente è tutto il log.
         assert_eq!(store.current_decisions().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn deprecation_marks_status_and_drops_from_current() {
+        let store = InMemoryDecisionStore::new();
+        let retired = decision("invariante stantio", vec![]);
+        let mut retirement = decision("ritiro dell'invariante", vec![]);
+        retirement.deprecates = vec![retired.id];
+        store.record(&retired).await.unwrap();
+        store.record(&retirement).await.unwrap();
+
+        let ledger = store.ledger().await.unwrap();
+        let status_of = |id| ledger.iter().find(|(d, _)| d.id == id).map(|(_, s)| *s);
+        assert_eq!(status_of(retired.id), Some(DecisionStatus::Deprecated));
+        assert_eq!(status_of(retirement.id), Some(DecisionStatus::Accepted));
+
+        // Deprecated non è corrente: resta solo il ritiro (esso stesso Accepted).
+        let current = store.current_decisions().await.unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, retirement.id);
+    }
+
+    #[tokio::test]
+    async fn supersession_wins_over_deprecation_for_the_same_decision() {
+        // Se una decisione è sia rimpiazzata che deprecata, vince Superseded
+        // (un rimpiazzo nominato dice più di un semplice ritiro).
+        let store = InMemoryDecisionStore::new();
+        let target = decision("scelta contesa", vec![]);
+        let mut replacer = decision("rimpiazzo", vec![]);
+        replacer.supersedes = vec![target.id];
+        let mut deprecator = decision("nota di ritiro", vec![]);
+        deprecator.deprecates = vec![target.id];
+        store.record(&target).await.unwrap();
+        store.record(&replacer).await.unwrap();
+        store.record(&deprecator).await.unwrap();
+
+        let ledger = store.ledger().await.unwrap();
+        let status = ledger
+            .iter()
+            .find(|(d, _)| d.id == target.id)
+            .map(|(_, s)| *s);
+        assert_eq!(status, Some(DecisionStatus::Superseded));
     }
 }

@@ -45,17 +45,26 @@ impl DecisionKind {
 /// Lo stato *derivato* di una [`Decision`] nel ledger architetturale.
 ///
 /// Non è un campo memorizzato: si calcola dal log additivo, mai scritto su una
-/// vecchia decisione. Una decisione è [`Superseded`](DecisionStatus::Superseded)
-/// se e solo se un'altra la elenca nel proprio `supersedes`. Poiché si può
-/// rimpiazzare solo una decisione che già esiste, chi rimpiazza arriva sempre
-/// *dopo*: la freccia della supersessione è anche quella del tempo, e lo stato
+/// vecchia decisione. Una decisione cambia stato solo perché un'**altra** la
+/// punta — [`Superseded`](DecisionStatus::Superseded) se elencata in un
+/// `supersedes` (rimpiazzata da una scelta nominata), [`Deprecated`](DecisionStatus::Deprecated)
+/// se elencata in un `deprecates` (ritirata, senza un sostituto puntuale).
+/// Poiché si può puntare solo una decisione che già esiste, chi la obsoleta
+/// arriva sempre *dopo*: la freccia è anche quella del tempo, e lo stato
 /// corrente resta una proiezione del passato dimostrato — mai un'invenzione.
+///
+/// Precedenza quando entrambe valgono: `Superseded` > `Deprecated` > `Accepted`
+/// (essere rimpiazzati da qualcosa di nominato dice più che essere solo ritirati).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionStatus {
-    /// Nessuna decisione l'ha rimpiazzata: è la verità corrente.
+    /// Nessuna decisione l'ha obsoletata: è la verità corrente.
     Accepted,
     /// Una decisione successiva la elenca nel proprio `supersedes`.
     Superseded,
+    /// Una decisione successiva la elenca nel proprio `deprecates`: non più in
+    /// vigore (es. il Guardian ritira un invariante che il grafo non sostiene
+    /// più), ma senza un rimpiazzo puntuale.
+    Deprecated,
 }
 
 /// Una memoria storica completa, con identità e timestamp assegnati dal Memory
@@ -81,6 +90,11 @@ pub struct Decision {
     /// riscrive), aggiunge solo questo puntatore nella nuova. Da qui si deriva
     /// lo stato [`DecisionStatus::Superseded`].
     pub supersedes: Vec<EntityId>,
+    /// Le decisioni che questa **ritira** senza rimpiazzarle con una scelta
+    /// puntuale (additivo e direzionale come `supersedes`). Da qui si deriva lo
+    /// stato [`DecisionStatus::Deprecated`]. È il gancio per il ritiro di un
+    /// invariante da parte del Guardian.
+    pub deprecates: Vec<EntityId>,
     pub tags: Vec<String>,
     /// Istante di registrazione, in formato RFC 3339.
     pub timestamp: String,
@@ -99,9 +113,11 @@ impl Decision {
             rationale: new.rationale,
             related_entity_ids: new.related_entity_ids,
             related_decision_ids: new.related_decision_ids,
-            // Il bus (`NewDecision`) non esprime ancora la supersessione: campo
-            // vuoto, onesto. Il cablaggio è una slice successiva.
+            // Il bus (`NewDecision`) non esprime ancora supersessione/deprecazione:
+            // campi vuoti, onesto. I produttori in-process (es. il Guardian) li
+            // popolano direttamente; il cablaggio sul bus è una slice successiva.
             supersedes: Vec::new(),
+            deprecates: Vec::new(),
             tags: new.tags,
             timestamp: chrono::Utc::now().to_rfc3339(),
         }
