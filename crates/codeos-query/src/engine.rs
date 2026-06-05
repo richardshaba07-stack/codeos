@@ -114,8 +114,10 @@ impl QueryEngine {
         // Passo 3 — Il *perché*: le decisioni del Memory Engine agganciate alle
         // entità selezionate. Lo facciamo dopo la selezione (e i test) così da
         // chiedere allo store solo le entità che entreranno davvero nel contesto.
+        // Solo le decisioni CORRENTI: una scelta già rimpiazzata o ritirata non è
+        // il perché di oggi e portarla nel contesto sarebbe un arco che mente.
         let selected_id_list: Vec<EntityId> = selected.iter().map(|e| e.id).collect();
-        let decisions = self.decisions.related_to(&selected_id_list).await?;
+        let decisions = self.decisions.current_related_to(&selected_id_list).await?;
 
         // Tieni solo le relazioni i cui due estremi sono nel set selezionato.
         let mut relations: Vec<Relation> = expansion
@@ -575,6 +577,70 @@ mod tests {
                 .contains("Non esporre i segreti al client"),
             "manca il razionale:\n{}",
             response.formatted_context
+        );
+    }
+
+    #[tokio::test]
+    async fn context_carries_the_current_why_not_the_retired_one() {
+        // Una scelta superata non è il perché di oggi: il contesto deve mostrare la
+        // decisione corrente, mai quella già rimpiazzata (un perché stale mente).
+        use codeos_memory::DecisionKind;
+        use codeos_types::bus::NewDecision;
+
+        let storage = graph_from(
+            "auth/login_service.py",
+            "class LoginService:\n    def authenticate(self):\n        pass\n",
+        )
+        .await;
+        let target = storage
+            .find_entities_by_name_pattern("login")
+            .await
+            .unwrap()
+            .first()
+            .expect("entità login attesa")
+            .id;
+
+        let new = |title: &str, rationale: &str| NewDecision {
+            author: "ai:ArchitectureGuardian".to_string(),
+            title: title.to_string(),
+            context: String::new(),
+            rationale: rationale.to_string(),
+            related_entity_ids: vec![target],
+            related_decision_ids: Vec::new(),
+            tags: Vec::new(),
+        };
+
+        let decisions = Arc::new(InMemoryDecisionStore::new());
+        let old = Decision::from_new(
+            new("Sessioni lato client", "Token JWT nel localStorage."),
+            DecisionKind::ArchitectureRule,
+        );
+        // La nuova scelta rimpiazza la vecchia, agganciata alla STESSA entità.
+        let mut newer = Decision::from_new(
+            new(
+                "Sessioni lato server",
+                "Cookie httpOnly, niente token nel client.",
+            ),
+            DecisionKind::ArchitectureRule,
+        );
+        newer.supersedes = vec![old.id];
+        decisions.record(&old).await.unwrap();
+        decisions.record(&newer).await.unwrap();
+
+        let engine = QueryEngine::with_decisions(storage, decisions);
+        let ctx = engine
+            .query(&nl("voglio sistemare il login"))
+            .await
+            .unwrap()
+            .formatted_context;
+
+        assert!(
+            ctx.contains("Cookie httpOnly"),
+            "manca il perché corrente:\n{ctx}"
+        );
+        assert!(
+            !ctx.contains("localStorage"),
+            "il perché superato non deve entrare nel contesto:\n{ctx}"
         );
     }
 

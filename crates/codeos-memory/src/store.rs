@@ -81,6 +81,32 @@ pub trait DecisionStore: Send + Sync {
             .map(|(d, _)| d)
             .collect())
     }
+
+    /// Le decisioni **correnti** agganciate ad almeno una delle entità indicate:
+    /// l'intersezione di [`related_to`](DecisionStore::related_to) (rilevanza) e
+    /// [`current_decisions`](DecisionStore::current_decisions) (verità di oggi).
+    ///
+    /// È ciò che il Query Engine deve davvero portare nel contesto: il *perché*
+    /// **ancora valido** per il sottografo, mai una scelta già rimpiazzata o
+    /// ritirata. Lo status è derivato dall'INTERO log (una decisione è superata da
+    /// un'altra che potrebbe non toccare queste entità), quindi si filtra sul
+    /// [`ledger`](DecisionStore::ledger), non sul sottoinsieme rilevante — un solo
+    /// passaggio. Un *perché* stale nel contesto sarebbe un arco che mente
+    /// (tesi anti-falso-positivo applicata alla memoria).
+    async fn current_related_to(&self, entity_ids: &[EntityId]) -> anyhow::Result<Vec<Decision>> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: HashSet<EntityId> = entity_ids.iter().copied().collect();
+        Ok(self
+            .ledger()
+            .await?
+            .into_iter()
+            .filter(|(_, status)| *status == DecisionStatus::Accepted)
+            .map(|(d, _)| d)
+            .filter(|d| d.related_entity_ids.iter().any(|e| wanted.contains(e)))
+            .collect())
+    }
 }
 
 /// L'insieme degli id puntati da un certo campo (`supersedes` o `deprecates`)
@@ -179,6 +205,36 @@ mod tests {
 
         // Lista di entità vuota ⇒ nessuna decisione (non "tutte").
         assert!(store.related_to(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn current_related_to_hides_the_stale_why() {
+        // Scenario reale del Guardian: una promozione (P) agganciata a un'entità di
+        // confine, poi una ritrattazione (R) che la deprecata RIUSANDO la stessa
+        // entità. `related_to` le vede entrambe; ma il contesto deve mostrare solo
+        // il perché ANCORA valido — R, non la P ormai decaduta.
+        let store = InMemoryDecisionStore::new();
+        let boundary = EntityId::new();
+        let promotion = decision("invariante promosso", vec![boundary]);
+        let mut retraction = decision("invariante ritirato", vec![boundary]);
+        retraction.deprecates = vec![promotion.id];
+        store.record(&promotion).await.unwrap();
+        store.record(&retraction).await.unwrap();
+
+        // `related_to` (grezza) le restituisce entrambe: rilevanza, non validità.
+        assert_eq!(store.related_to(&[boundary]).await.unwrap().len(), 2);
+
+        // `current_related_to` tiene solo il perché corrente: la ritrattazione.
+        let current = store.current_related_to(&[boundary]).await.unwrap();
+        assert_eq!(
+            current.len(),
+            1,
+            "atteso solo il perché corrente: {current:?}"
+        );
+        assert_eq!(current[0].id, retraction.id);
+
+        // Lista vuota ⇒ nessuna decisione (non "tutte"), come `related_to`.
+        assert!(store.current_related_to(&[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]
