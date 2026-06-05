@@ -285,6 +285,8 @@ mod tests {
                     rationale: String::new(),
                     related_entity_ids: Vec::new(),
                     related_decision_ids: Vec::new(),
+                    supersedes: Vec::new(),
+                    deprecates: Vec::new(),
                     tags: Vec::new(),
                 },
                 reply_to,

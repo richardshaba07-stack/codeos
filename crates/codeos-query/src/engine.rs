@@ -558,6 +558,8 @@ mod tests {
                     rationale: "Non esporre i segreti al client.".to_string(),
                     related_entity_ids: vec![target],
                     related_decision_ids: Vec::new(),
+                    supersedes: Vec::new(),
+                    deprecates: Vec::new(),
                     tags: vec!["sicurezza".to_string()],
                 },
                 DecisionKind::ArchitectureRule,
@@ -614,6 +616,8 @@ mod tests {
             rationale: rationale.to_string(),
             related_entity_ids: vec![target],
             related_decision_ids: Vec::new(),
+            supersedes: Vec::new(),
+            deprecates: Vec::new(),
             tags: Vec::new(),
         };
 
@@ -680,6 +684,8 @@ mod tests {
                 rationale: "Non esporre i segreti al client.".to_string(),
                 related_entity_ids: vec![target],
                 related_decision_ids: Vec::new(),
+                supersedes: Vec::new(),
+                deprecates: Vec::new(),
                 tags: Vec::new(),
             },
             DecisionKind::ArchitectureRule,

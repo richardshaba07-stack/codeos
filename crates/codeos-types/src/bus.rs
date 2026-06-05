@@ -154,6 +154,16 @@ pub struct NewDecision {
     pub rationale: String,
     pub related_entity_ids: Vec<EntityId>,
     pub related_decision_ids: Vec<EntityId>,
+    /// Le decisioni che questa **rimpiazza**: ne erediterà lo stato derivato
+    /// `Superseded` nel ledger (la storia non si riscrive, si stratifica). Vuoto
+    /// per una decisione che non sostituisce nulla. Permette a un umano (via
+    /// CLI/RPC) di rimpiazzare una scelta passata — non solo ai produttori
+    /// in-process.
+    pub supersedes: Vec<EntityId>,
+    /// Le decisioni che questa **ritira** senza un rimpiazzo nominato: ne deriva lo
+    /// stato `Deprecated`. Distinto da [`supersedes`](Self::supersedes): un ritiro
+    /// puro dice meno di un rimpiazzo (per questo `Superseded` ha precedenza).
+    pub deprecates: Vec<EntityId>,
     pub tags: Vec<String>,
 }
 

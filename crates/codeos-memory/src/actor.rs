@@ -82,6 +82,8 @@ mod tests {
                     rationale: "razionale".to_string(),
                     related_entity_ids: vec![EntityId::new()],
                     related_decision_ids: Vec::new(),
+                    supersedes: Vec::new(),
+                    deprecates: Vec::new(),
                     tags: vec!["test".to_string()],
                 },
                 reply_to,

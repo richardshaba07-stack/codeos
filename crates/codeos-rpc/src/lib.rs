@@ -202,6 +202,16 @@ impl CodeOs for CodeOsService {
             .iter()
             .map(|s| parse_entity_id(s))
             .collect::<Result<Vec<_>, _>>()?;
+        let supersedes = req
+            .supersedes
+            .iter()
+            .map(|s| parse_entity_id(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        let deprecates = req
+            .deprecates
+            .iter()
+            .map(|s| parse_entity_id(s))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let (reply_to, mut reply_rx) = mpsc::channel(1);
         self.dispatcher
@@ -214,6 +224,8 @@ impl CodeOs for CodeOsService {
                     rationale: req.rationale,
                     related_entity_ids,
                     related_decision_ids,
+                    supersedes,
+                    deprecates,
                     tags: req.tags,
                 },
                 reply_to,
@@ -774,6 +786,8 @@ mod tests {
                 rationale: "perché sì".to_string(),
                 related_entity_ids: vec![],
                 related_decision_ids: vec![],
+                supersedes: vec![],
+                deprecates: vec![],
                 tags: vec!["test".to_string()],
             })
             .await
@@ -813,6 +827,8 @@ mod tests {
                 rationale: String::new(),
                 related_entity_ids: vec!["non-un-uuid".to_string()],
                 related_decision_ids: vec![],
+                supersedes: vec![],
+                deprecates: vec![],
                 tags: vec![],
             })
             .await

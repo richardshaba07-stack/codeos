@@ -121,11 +121,12 @@ impl Decision {
             rationale: new.rationale,
             related_entity_ids: new.related_entity_ids,
             related_decision_ids: new.related_decision_ids,
-            // Il bus (`NewDecision`) non esprime ancora supersessione/deprecazione:
-            // campi vuoti, onesto. I produttori in-process (es. il Guardian) li
-            // popolano direttamente; il cablaggio sul bus è una slice successiva.
-            supersedes: Vec::new(),
-            deprecates: Vec::new(),
+            // Il bus (`NewDecision`) ora esprime supersessione/deprecazione: un umano
+            // via CLI/RPC può rimpiazzare o ritirare una scelta passata, non solo i
+            // produttori in-process. Lo stato resta DERIVATO (vedi `DecisionStatus`):
+            // qui si registra solo il puntamento additivo, mai un'etichetta scritta.
+            supersedes: new.supersedes,
+            deprecates: new.deprecates,
             // `NewDecision` (il bus) è autorità umana: nessuna evidenza richiesta.
             // Le Proposal generate dal sistema passano invece da `Proposal::confirm`,
             // che inietta qui l'evidenza citata (trap #1).
@@ -133,5 +134,35 @@ impl Decision {
             tags: new.tags,
             timestamp: chrono::Utc::now().to_rfc3339(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_new_carries_supersedes_and_deprecates_from_the_bus() {
+        // Il bus è ora il canale per rimpiazzare/ritirare una scelta passata: i
+        // due puntatori devono sopravvivere a `from_new`, altrimenti un umano che
+        // supera una decisione via RPC non riuscirebbe a derivarne lo stato.
+        let replaced = EntityId::new();
+        let retired = EntityId::new();
+        let new = NewDecision {
+            author: "human:test".to_string(),
+            title: "Nuova scelta".to_string(),
+            context: String::new(),
+            rationale: "razionale".to_string(),
+            related_entity_ids: Vec::new(),
+            related_decision_ids: Vec::new(),
+            supersedes: vec![replaced],
+            deprecates: vec![retired],
+            tags: Vec::new(),
+        };
+
+        let decision = Decision::from_new(new, DecisionKind::Decision);
+
+        assert_eq!(decision.supersedes, vec![replaced]);
+        assert_eq!(decision.deprecates, vec![retired]);
     }
 }

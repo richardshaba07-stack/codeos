@@ -65,6 +65,8 @@ message RecordDecisionRequest {
   repeated string related_entity_ids = 5;   // UUID stringa
   repeated string related_decision_ids = 6;  // UUID stringa
   repeated string tags = 7;
+  repeated string supersedes = 8;   // UUID stringa: decisioni rimpiazzate
+  repeated string deprecates = 9;   // UUID stringa: decisioni ritirate
 }
 
 message RecordDecisionResponse {

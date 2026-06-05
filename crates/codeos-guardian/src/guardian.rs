@@ -1462,6 +1462,9 @@ fn promotion_decision(
         ),
         related_entity_ids,
         related_decision_ids: Vec::new(),
+        // Una promozione nasce nuova: non rimpiazza né ritira altre decisioni.
+        supersedes: Vec::new(),
+        deprecates: Vec::new(),
         tags,
     };
     // Trappola #1 resa esecutiva: se il grafo (e la storia) provano qualcosa di
@@ -1541,6 +1544,13 @@ fn retraction_decision(
         ),
         related_entity_ids,
         related_decision_ids: vec![promotion_id],
+        // Cabla il ritiro nel ledger: la promozione risulterà `Deprecated` (stato
+        // derivato), non solo etichettata `status:retired`. Così un consumatore del
+        // Memory Engine vede l'invariante decaduto senza conoscere i tag del Guardian.
+        // Ora che il bus porta `deprecates`, lo esprimiamo nel `NewDecision` invece
+        // di mutare la `Decision` dopo `from_new`.
+        supersedes: Vec::new(),
+        deprecates: vec![promotion_id],
         tags: vec![
             "layering".to_string(),
             "invariante".to_string(),
@@ -1548,12 +1558,7 @@ fn retraction_decision(
             STATUS_RETIRED.to_string(),
         ],
     };
-    // Cabla il ritiro nel ledger: la promozione risulterà `Deprecated` (stato
-    // derivato), non solo etichettata `status:retired`. Così un consumatore del
-    // Memory Engine vede l'invariante decaduto senza conoscere i tag del Guardian.
-    let mut decision = Decision::from_new(new, DecisionKind::Decision);
-    decision.deprecates = vec![promotion_id];
-    decision
+    Decision::from_new(new, DecisionKind::Decision)
 }
 
 #[cfg(test)]

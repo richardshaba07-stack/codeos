@@ -79,6 +79,8 @@ mod tests {
             rationale: "Il grafo mostra zero archi dominio → infra.".to_string(),
             related_entity_ids: Vec::new(),
             related_decision_ids: Vec::new(),
+            supersedes: Vec::new(),
+            deprecates: Vec::new(),
             tags: Vec::new(),
         }
     }
