@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use codeos_types::EntityId;
 
-use crate::decision::Decision;
+use crate::decision::{Decision, DecisionStatus};
 
 /// Persistenza delle [`Decision`].
 #[async_trait]
@@ -40,6 +40,53 @@ pub trait DecisionStore: Send + Sync {
             .filter(|d| d.related_entity_ids.iter().any(|e| wanted.contains(e)))
             .collect())
     }
+
+    /// Il ledger completo: ogni decisione con il suo [`DecisionStatus`] derivato.
+    ///
+    /// È la vista d'ispezione del briefing: dice cosa è ancora valido e cosa è
+    /// stato rimpiazzato *senza nascondere la storia* (nessuna decisione sparisce
+    /// dal log, cambia solo l'etichetta derivata). Default sopra
+    /// [`all`](DecisionStore::all).
+    async fn ledger(&self) -> anyhow::Result<Vec<(Decision, DecisionStatus)>> {
+        let all = self.all().await?;
+        let superseded = superseded_ids(&all);
+        Ok(all
+            .into_iter()
+            .map(|d| {
+                let status = if superseded.contains(&d.id) {
+                    DecisionStatus::Superseded
+                } else {
+                    DecisionStatus::Accepted
+                };
+                (d, status)
+            })
+            .collect())
+    }
+
+    /// Le decisioni **correnti**: il ledger filtrato a [`DecisionStatus::Accepted`].
+    ///
+    /// È la proiezione "verità di oggi" del log additivo — quella che il Query
+    /// Engine porta nel contesto come *perché* ancora valido, senza trascinarsi
+    /// dietro le scelte già rimpiazzate.
+    async fn current_decisions(&self) -> anyhow::Result<Vec<Decision>> {
+        Ok(self
+            .ledger()
+            .await?
+            .into_iter()
+            .filter(|(_, status)| *status == DecisionStatus::Accepted)
+            .map(|(d, _)| d)
+            .collect())
+    }
+}
+
+/// L'insieme degli id rimpiazzati: ogni id che compare nel `supersedes` di una
+/// qualunque decisione del log. Calcolato in un colpo solo così che derivare lo
+/// stato sia O(1) per decisione.
+fn superseded_ids(decisions: &[Decision]) -> HashSet<EntityId> {
+    decisions
+        .iter()
+        .flat_map(|d| d.supersedes.iter().copied())
+        .collect()
 }
 
 /// Store effimero in memoria. Persiste finché vive il processo.
@@ -90,6 +137,7 @@ mod tests {
             rationale: String::new(),
             related_entity_ids: related,
             related_decision_ids: Vec::new(),
+            supersedes: Vec::new(),
             tags: Vec::new(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         }
@@ -122,5 +170,38 @@ mod tests {
 
         // Lista di entità vuota ⇒ nessuna decisione (non "tutte").
         assert!(store.related_to(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn supersession_derives_status_without_rewriting_history() {
+        let store = InMemoryDecisionStore::new();
+        let old = decision("vecchia scelta", vec![]);
+        let mut newer = decision("nuova scelta", vec![]);
+        newer.supersedes = vec![old.id];
+        store.record(&old).await.unwrap();
+        store.record(&newer).await.unwrap();
+
+        // La storia resta intatta: entrambe vivono ancora nel log.
+        assert_eq!(store.all().await.unwrap().len(), 2);
+
+        // Lo stato è derivato, non scritto: la vecchia è rimpiazzata.
+        let ledger = store.ledger().await.unwrap();
+        let status_of = |id| ledger.iter().find(|(d, _)| d.id == id).map(|(_, s)| *s);
+        assert_eq!(status_of(old.id), Some(DecisionStatus::Superseded));
+        assert_eq!(status_of(newer.id), Some(DecisionStatus::Accepted));
+
+        // La proiezione corrente tiene solo la nuova.
+        let current = store.current_decisions().await.unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, newer.id);
+    }
+
+    #[tokio::test]
+    async fn current_decisions_without_supersession_keeps_everything() {
+        let store = InMemoryDecisionStore::new();
+        store.record(&decision("uno", vec![])).await.unwrap();
+        store.record(&decision("due", vec![])).await.unwrap();
+        // Nessun `supersedes` ⇒ nessuna è rimpiazzata: il corrente è tutto il log.
+        assert_eq!(store.current_decisions().await.unwrap().len(), 2);
     }
 }

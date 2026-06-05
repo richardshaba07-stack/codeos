@@ -16,6 +16,6 @@ mod markdown;
 mod store;
 
 pub use actor::MemoryActor;
-pub use decision::{Decision, DecisionKind};
+pub use decision::{Decision, DecisionKind, DecisionStatus};
 pub use markdown::MarkdownDecisionStore;
 pub use store::{DecisionStore, InMemoryDecisionStore};

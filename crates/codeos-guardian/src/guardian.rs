@@ -2292,6 +2292,7 @@ mod tests {
                 rationale: "isolare il dominio".to_string(),
                 related_entity_ids: vec![],
                 related_decision_ids: vec![],
+                supersedes: vec![],
                 tags: vec!["payments".to_string()],
                 timestamp: "2024-01-01T00:00:00Z".to_string(),
             })

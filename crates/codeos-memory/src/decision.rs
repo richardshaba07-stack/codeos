@@ -42,6 +42,22 @@ impl DecisionKind {
     }
 }
 
+/// Lo stato *derivato* di una [`Decision`] nel ledger architetturale.
+///
+/// Non è un campo memorizzato: si calcola dal log additivo, mai scritto su una
+/// vecchia decisione. Una decisione è [`Superseded`](DecisionStatus::Superseded)
+/// se e solo se un'altra la elenca nel proprio `supersedes`. Poiché si può
+/// rimpiazzare solo una decisione che già esiste, chi rimpiazza arriva sempre
+/// *dopo*: la freccia della supersessione è anche quella del tempo, e lo stato
+/// corrente resta una proiezione del passato dimostrato — mai un'invenzione.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionStatus {
+    /// Nessuna decisione l'ha rimpiazzata: è la verità corrente.
+    Accepted,
+    /// Una decisione successiva la elenca nel proprio `supersedes`.
+    Superseded,
+}
+
 /// Una memoria storica completa, con identità e timestamp assegnati dal Memory
 /// Engine. Immutabile dopo la creazione (la storia non si riscrive: una nuova
 /// scelta è una nuova `Decision` che può referenziare le precedenti via
@@ -60,6 +76,11 @@ pub struct Decision {
     pub related_entity_ids: Vec<EntityId>,
     /// Altre decisioni collegate (catena storica).
     pub related_decision_ids: Vec<EntityId>,
+    /// Le decisioni che questa **rimpiazza**. Additivo e direzionale: registrare
+    /// una supersessione non muta la vecchia decisione (la storia non si
+    /// riscrive), aggiunge solo questo puntatore nella nuova. Da qui si deriva
+    /// lo stato [`DecisionStatus::Superseded`].
+    pub supersedes: Vec<EntityId>,
     pub tags: Vec<String>,
     /// Istante di registrazione, in formato RFC 3339.
     pub timestamp: String,
@@ -78,6 +99,9 @@ impl Decision {
             rationale: new.rationale,
             related_entity_ids: new.related_entity_ids,
             related_decision_ids: new.related_decision_ids,
+            // Il bus (`NewDecision`) non esprime ancora la supersessione: campo
+            // vuoto, onesto. Il cablaggio è una slice successiva.
+            supersedes: Vec::new(),
             tags: new.tags,
             timestamp: chrono::Utc::now().to_rfc3339(),
         }
