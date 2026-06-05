@@ -12,10 +12,14 @@
 
 mod actor;
 mod decision;
+mod evidence;
 mod markdown;
+mod proposal;
 mod store;
 
 pub use actor::MemoryActor;
 pub use decision::{Decision, DecisionKind, DecisionStatus};
+pub use evidence::Evidence;
 pub use markdown::MarkdownDecisionStore;
+pub use proposal::Proposal;
 pub use store::{DecisionStore, InMemoryDecisionStore};

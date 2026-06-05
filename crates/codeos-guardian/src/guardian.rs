@@ -2313,6 +2313,7 @@ mod tests {
                 related_decision_ids: vec![],
                 supersedes: vec![],
                 deprecates: vec![],
+                evidence: vec![],
                 tags: vec!["payments".to_string()],
                 timestamp: "2024-01-01T00:00:00Z".to_string(),
             })

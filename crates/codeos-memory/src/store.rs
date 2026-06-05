@@ -146,6 +146,7 @@ mod tests {
             related_decision_ids: Vec::new(),
             supersedes: Vec::new(),
             deprecates: Vec::new(),
+            evidence: Vec::new(),
             tags: Vec::new(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         }

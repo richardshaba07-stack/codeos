@@ -14,6 +14,8 @@
 use codeos_types::bus::NewDecision;
 use codeos_types::EntityId;
 
+use crate::evidence::Evidence;
+
 /// Che tipo di memoria è.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionKind {
@@ -95,6 +97,12 @@ pub struct Decision {
     /// stato [`DecisionStatus::Deprecated`]. È il gancio per il ritiro di un
     /// invariante da parte del Guardian.
     pub deprecates: Vec<EntityId>,
+    /// La **provenienza**: le evidenze verificabili che sostengono il razionale.
+    /// Vuoto per le decisioni di pura autorità umana (un umano scrive il suo
+    /// perché); non-vuoto per le [`Proposal`](crate::Proposal) confermate, dove
+    /// il trap #1 impone ≥1 citazione. Tenerla nel ledger rende il *perché*
+    /// verificabile a posteriori, non solo al momento della proposta.
+    pub evidence: Vec<Evidence>,
     pub tags: Vec<String>,
     /// Istante di registrazione, in formato RFC 3339.
     pub timestamp: String,
@@ -118,6 +126,10 @@ impl Decision {
             // popolano direttamente; il cablaggio sul bus è una slice successiva.
             supersedes: Vec::new(),
             deprecates: Vec::new(),
+            // `NewDecision` (il bus) è autorità umana: nessuna evidenza richiesta.
+            // Le Proposal generate dal sistema passano invece da `Proposal::confirm`,
+            // che inietta qui l'evidenza citata (trap #1).
+            evidence: Vec::new(),
             tags: new.tags,
             timestamp: chrono::Utc::now().to_rfc3339(),
         }

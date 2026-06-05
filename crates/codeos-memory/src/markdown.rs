@@ -13,15 +13,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
-use codeos_types::EntityId;
+use codeos_types::{EntityId, RelationKind};
 use uuid::Uuid;
 
 use crate::decision::{Decision, DecisionKind};
+use crate::evidence::Evidence;
 use crate::store::DecisionStore;
 
 const FRONT_MATTER_DELIM: &str = "---\n";
 const SECTION_CONTEXT: &str = "Contesto";
 const SECTION_RATIONALE: &str = "Razionale";
+const SECTION_EVIDENCE: &str = "Evidenza";
 
 /// Store su file system: ogni [`Decision`] è un `.md` nella directory data.
 pub struct MarkdownDecisionStore {
@@ -127,7 +129,72 @@ fn render(d: &Decision) -> String {
     s.push_str(&format!("\n\n## {SECTION_RATIONALE}\n\n"));
     s.push_str(d.rationale.trim());
     s.push('\n');
+
+    // L'evidenza vive nel corpo, come lista leggibile a mano: è il *perché*
+    // verificabile, e nel briefing dev'essere ispezionabile da un umano. Sezione
+    // omessa quando vuota (decisione di autorità umana), così i file restano puliti.
+    if !d.evidence.is_empty() {
+        s.push_str(&format!("\n## {SECTION_EVIDENCE}\n\n"));
+        for e in &d.evidence {
+            s.push_str(&format!("- {}\n", render_evidence_line(e)));
+        }
+    }
     s
+}
+
+/// Una citazione su riga singola, in forma `tag: payload` (l'arco usa
+/// ` --Kind--> ` come separatore: i delimitatori con spazio non compaiono nei
+/// qualified name, quindi il round-trip è robusto).
+fn render_evidence_line(e: &Evidence) -> String {
+    match e {
+        Evidence::Commit(h) => format!("commit: {}", one_line(h)),
+        Evidence::Edge {
+            source,
+            kind,
+            target,
+        } => format!(
+            "edge: {} --{}--> {}",
+            one_line(source),
+            kind.as_str(),
+            one_line(target)
+        ),
+        Evidence::Entity(q) => format!("entity: {}", one_line(q)),
+        Evidence::Test(t) => format!("test: {}", one_line(t)),
+        Evidence::PriorDecision(id) => format!("decision: {id}"),
+    }
+}
+
+/// Legge la sezione `## Evidenza` in una lista di [`Evidence`]. Le righe
+/// malformate vengono **saltate** (non si inventa evidenza da testo corrotto):
+/// una citazione illeggibile non deve far perdere l'intera decisione.
+fn parse_evidence(body: &str) -> Vec<Evidence> {
+    section(body, SECTION_EVIDENCE)
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("- "))
+        .filter_map(parse_evidence_line)
+        .collect()
+}
+
+fn parse_evidence_line(line: &str) -> Option<Evidence> {
+    let (tag, payload) = line.split_once(':')?;
+    let payload = payload.trim();
+    match tag.trim() {
+        "commit" => Some(Evidence::Commit(payload.to_string())),
+        "entity" => Some(Evidence::Entity(payload.to_string())),
+        "test" => Some(Evidence::Test(payload.to_string())),
+        "decision" => parse_id(payload).ok().map(Evidence::PriorDecision),
+        "edge" => {
+            let (source, rest) = payload.split_once(" --")?;
+            let (kind, target) = rest.split_once("--> ")?;
+            Some(Evidence::Edge {
+                source: source.trim().to_string(),
+                kind: RelationKind::from_str_lenient(kind.trim()),
+                target: target.trim().to_string(),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Deserializza una decisione dal formato Markdown.
@@ -170,6 +237,7 @@ fn parse(content: &str) -> anyhow::Result<Decision> {
             .context("campo 'related_decisions' non valido")?,
         supersedes: parse_ids(&get("supersedes")).context("campo 'supersedes' non valido")?,
         deprecates: parse_ids(&get("deprecates")).context("campo 'deprecates' non valido")?,
+        evidence: parse_evidence(body),
         tags: parse_list(&get("tags")),
         timestamp: get("timestamp"),
     })
@@ -273,6 +341,17 @@ mod tests {
             related_decision_ids: vec![EntityId::new()],
             supersedes: vec![EntityId::new()],
             deprecates: vec![EntityId::new()],
+            evidence: vec![
+                Evidence::Commit("a1b2c3d4".to_string()),
+                // Qualified name con `::` e `<>`: mette alla prova i separatori.
+                Evidence::Edge {
+                    source: "crate::auth::login::handle".to_string(),
+                    kind: RelationKind::Calls,
+                    target: "crate::session::Store::<T>::insert".to_string(),
+                },
+                Evidence::Entity("crate::auth::login".to_string()),
+                Evidence::PriorDecision(EntityId::new()),
+            ],
             tags: vec!["sicurezza".to_string(), "login".to_string()],
             timestamp: "2026-05-31T10:00:00+00:00".to_string(),
         }
@@ -292,6 +371,7 @@ mod tests {
         assert_eq!(parsed.related_decision_ids, original.related_decision_ids);
         assert_eq!(parsed.supersedes, original.supersedes);
         assert_eq!(parsed.deprecates, original.deprecates);
+        assert_eq!(parsed.evidence, original.evidence); // arco con `::`/`<>` incluso
         assert_eq!(parsed.tags, original.tags);
         assert_eq!(parsed.timestamp, original.timestamp); // contiene ':' → idem
                                                           // Il contesto multilinea è normalizzato (trim) ma preservato nel contenuto.

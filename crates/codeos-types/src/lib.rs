@@ -118,6 +118,46 @@ pub enum RelationKind {
     Unresolved,
 }
 
+impl RelationKind {
+    /// Forma stringa canonica: il nome della variante. È il contratto di
+    /// serializzazione per chi persiste o **cita** un arco (lo storage, e il
+    /// Memory Engine che lo elenca come evidenza di una decisione) — stabile e
+    /// indipendente dal `Debug`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelationKind::Calls => "Calls",
+            RelationKind::Imports => "Imports",
+            RelationKind::Implements => "Implements",
+            RelationKind::Extends => "Extends",
+            RelationKind::Tests => "Tests",
+            RelationKind::Uses => "Uses",
+            RelationKind::Creates => "Creates",
+            RelationKind::Modifies => "Modifies",
+            RelationKind::BelongsTo => "BelongsTo",
+            RelationKind::Unresolved => "Unresolved",
+        }
+    }
+
+    /// Inverso tollerante di [`as_str`](RelationKind::as_str): una stringa
+    /// sconosciuta diventa [`Unresolved`](RelationKind::Unresolved) — il valore
+    /// che dice "non lo so" in modo esplicito, mai un tipo inventato (tesi
+    /// anti-falso-positivo applicata alla deserializzazione).
+    pub fn from_str_lenient(s: &str) -> Self {
+        match s {
+            "Calls" => RelationKind::Calls,
+            "Imports" => RelationKind::Imports,
+            "Implements" => RelationKind::Implements,
+            "Extends" => RelationKind::Extends,
+            "Tests" => RelationKind::Tests,
+            "Uses" => RelationKind::Uses,
+            "Creates" => RelationKind::Creates,
+            "Modifies" => RelationKind::Modifies,
+            "BelongsTo" => RelationKind::BelongsTo,
+            _ => RelationKind::Unresolved,
+        }
+    }
+}
+
 /// Arco del grafo.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Relation {
@@ -229,5 +269,33 @@ impl GraphDelta {
             && self.removed_entity_ids.is_empty()
             && self.added_relations.is_empty()
             && self.removed_relation_ids.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relation_kind_str_round_trips_and_defaults_to_unresolved() {
+        for kind in [
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::Implements,
+            RelationKind::Extends,
+            RelationKind::Tests,
+            RelationKind::Uses,
+            RelationKind::Creates,
+            RelationKind::Modifies,
+            RelationKind::BelongsTo,
+            RelationKind::Unresolved,
+        ] {
+            assert_eq!(RelationKind::from_str_lenient(kind.as_str()), kind);
+        }
+        // Sconosciuto ⇒ Unresolved (esplicitamente "non lo so", mai un'invenzione).
+        assert_eq!(
+            RelationKind::from_str_lenient("Telepatia"),
+            RelationKind::Unresolved
+        );
     }
 }
