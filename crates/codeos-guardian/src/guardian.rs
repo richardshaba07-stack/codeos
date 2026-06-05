@@ -14,15 +14,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use codeos_memory::{Decision, DecisionKind, DecisionStore};
+use codeos_memory::{Decision, DecisionKind, DecisionStore, Evidence, Proposal};
 use codeos_paleo::{excavate, occasions, Abstention, CommitHistory, DecisionFossil, Z_95};
 use codeos_storage::{GraphStorage, RelationFilter};
 use codeos_types::bus::{ArchitectureViolation, NewDecision};
 use codeos_types::{Entity, EntityId, EntityKind, Relation};
 
 use crate::invariant::{
-    boundary_entities, layer_of_entity, mine_layering_rules, violations_for, LayerConfig, LayerKey,
-    LayeringRule,
+    boundary_entities, layer_of_entity, mine_layering_rules, support_edges, violations_for,
+    LayerConfig, LayerKey, LayeringRule,
 };
 use crate::meta::{mine_missing_invariants, MetaConfig, MissingInvariant};
 
@@ -380,7 +380,9 @@ impl Guardian {
                 continue;
             }
             let related = boundary_entities(rule, &relations, &layer_map);
-            let decision = promotion_decision(rule, related, fossils.get(&rule_key(rule)));
+            let fossil = fossils.get(&rule_key(rule));
+            let evidence = promotion_evidence(rule, &relations, &layer_map, fossil);
+            let decision = promotion_decision(rule, related, evidence, fossil);
             store.record(&decision).await?;
             tracing::info!(
                 upstream = %rule.upstream,
@@ -1403,6 +1405,7 @@ fn parse_rule_key(key: &str) -> Option<(&str, &str)> {
 fn promotion_decision(
     rule: &LayeringRule,
     related_entity_ids: Vec<EntityId>,
+    evidence: Vec<Evidence>,
     fossil: Option<&DecisionFossil>,
 ) -> Decision {
     let mut context = format!(
@@ -1461,7 +1464,53 @@ fn promotion_decision(
         related_decision_ids: Vec::new(),
         tags,
     };
-    Decision::from_new(new, DecisionKind::ArchitectureRule)
+    // Trappola #1 resa esecutiva: se il grafo (e la storia) provano qualcosa di
+    // citabile, la promozione passa per il cancello `Proposal` — che per costruzione
+    // non esiste senza evidenza — e quella evidenza viaggia DENTRO la Decision (il
+    // perché resta verificabile a posteriori). Senza nulla da citare (archi privi di
+    // identità stabile e niente git) non si finge: si ricade su `from_new`, una
+    // Decision onesta a evidenza vuota, identica a una scritta a mano.
+    if evidence.is_empty() {
+        Decision::from_new(new, DecisionKind::ArchitectureRule)
+    } else {
+        Proposal::new(new, DecisionKind::ArchitectureRule, evidence)
+            .expect("evidenza non vuota garantita dal ramo sopra")
+            .confirm()
+    }
+}
+
+/// Le evidenze che il grafo (e la storia git) **già provano** per questa regola:
+/// ogni arco di supporto osservato, citato per identità stabile
+/// (`Evidence::Edge`), più — se c'è un fossile — il commit che ha disegnato il
+/// confine (`Evidence::Commit`). È la materia prima del cancello [`Proposal`]: la
+/// promozione non porterà rationale inventato, solo ciò che il grafo dimostra.
+///
+/// Gli archi senza `source_qname`/`target_qname` nei metadati (strutturali, o
+/// risolti prima della Slice 2) vengono **saltati** dal `filter_map`: non si
+/// inventa un'identità che l'arco non porta. Costo zero di query: i nomi sono già
+/// nei metadati dell'arco.
+fn promotion_evidence(
+    rule: &LayeringRule,
+    relations: &[Relation],
+    layer_map: &HashMap<EntityId, LayerKey>,
+    fossil: Option<&DecisionFossil>,
+) -> Vec<Evidence> {
+    let mut evidence: Vec<Evidence> = support_edges(rule, relations, layer_map)
+        .into_iter()
+        .filter_map(|rel| {
+            let source = rel.metadata.get("source_qname")?.clone();
+            let target = rel.metadata.get("target_qname")?.clone();
+            Some(Evidence::Edge {
+                source,
+                kind: rel.kind,
+                target,
+            })
+        })
+        .collect();
+    if let Some(fossil) = fossil.filter(|f| !f.born_at.is_empty()) {
+        evidence.push(Evidence::Commit(fossil.born_at.clone()));
+    }
+    evidence
 }
 
 /// Registra il **ritiro** di un invariante diventato stale. Non è una regola in
@@ -1683,6 +1732,13 @@ mod tests {
         // interrogando una qualsiasi delle entità coinvolte.
         assert!(decision.related_entity_ids.contains(&api[0].id));
         assert!(decision.related_entity_ids.contains(&core[0].id));
+        // Archi nudi (senza identità stabile) e niente git ⇒ nessuna evidenza da
+        // citare: si ricade su `from_new`, evidenza vuota. Onesto, non si inventa.
+        assert!(
+            decision.evidence.is_empty(),
+            "senza qname né fossile l'evidenza dev'essere vuota: {:?}",
+            decision.evidence
+        );
 
         // Idempotente: una seconda passata non duplica l'invariante.
         let again = guardian.learn().await.unwrap();
@@ -1695,6 +1751,71 @@ mod tests {
         let (storage, _api, _core) = seeded_two_layer_graph().await;
         let guardian = Guardian::new(storage);
         assert!(guardian.learn().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn promotion_cites_its_support_edges_as_evidence() {
+        use codeos_memory::{Evidence, InMemoryDecisionStore};
+
+        // Come `seeded_two_layer_graph`, ma gli archi portano l'identità stabile
+        // (`source_qname`/`target_qname`) come in produzione dopo la Slice 2. È
+        // l'unica differenza che serve perché il Guardian possa citarli — a costo
+        // zero di query: i nomi sono già nei metadati dell'arco.
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let api: Vec<Entity> = (0..3)
+            .map(|i| entity(&format!("app::api::handler_{i}::run")))
+            .collect();
+        let core: Vec<Entity> = (0..3)
+            .map(|i| entity(&format!("app::core::service_{i}::do_it")))
+            .collect();
+        let relations: Vec<Relation> = (0..3)
+            .map(|i| {
+                let mut r = relation(RelationKind::Calls, api[i].id, core[i].id);
+                r.metadata
+                    .insert("source_qname".to_string(), api[i].qualified_name.clone());
+                r.metadata
+                    .insert("target_qname".to_string(), core[i].qualified_name.clone());
+                r
+            })
+            .collect();
+        storage
+            .apply_delta(GraphDelta {
+                added_entities: api.iter().chain(core.iter()).cloned().collect(),
+                added_relations: relations,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let store = Arc::new(InMemoryDecisionStore::new());
+        let guardian = Guardian::with_memory(storage, store.clone());
+        assert_eq!(guardian.learn().await.unwrap().len(), 1);
+
+        let all = store.all().await.unwrap();
+        let promo = &all[0];
+        // L'invariante promosso PORTA l'evidenza nel ledger: i 3 archi di supporto,
+        // citati per identità stabile. Niente rationale campato in aria — solo ciò
+        // che il grafo prova (trappola #1: la Proposal non esiste senza evidenza).
+        assert_eq!(promo.evidence.len(), 3, "evidenza = {:?}", promo.evidence);
+        for ev in &promo.evidence {
+            let Evidence::Edge {
+                source,
+                kind,
+                target,
+            } = ev
+            else {
+                panic!("attesa solo Evidence::Edge, trovato {ev:?}");
+            };
+            assert_eq!(*kind, RelationKind::Calls);
+            assert!(
+                source.starts_with("app::api::handler_"),
+                "source = {source}"
+            );
+            assert!(
+                target.starts_with("app::core::service_"),
+                "target = {target}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2108,6 +2229,15 @@ mod tests {
             promo.tags.iter().any(|t| t == "born-at:birth01"),
             "tags = {:?}",
             promo.tags
+        );
+        // Il fossile non è solo prosa nel contesto: è evidenza STRUTTURATA che
+        // viaggia nella Decision. Gli archi qui sono nudi (nessun qname), quindi
+        // l'unica evidenza è il commit di nascita citato per hash.
+        assert_eq!(
+            promo.evidence,
+            vec![codeos_memory::Evidence::Commit("birth01".to_string())],
+            "evidenza = {:?}",
+            promo.evidence
         );
 
         // Idempotente: l'arricchimento col fossile non altera la chiave di dedup.

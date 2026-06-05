@@ -256,6 +256,30 @@ pub fn mine_layering_rules(
     rules
 }
 
+/// Gli archi di **supporto** di una regola: le dipendenze `downstream → upstream`
+/// realmente osservate che la giustificano. Parallelo di [`boundary_entities`]
+/// (che ne restituisce gli estremi), ma espone gli **archi** interi: servono al
+/// Memory Engine per citarli come evidenza strutturata (`Evidence::Edge`) quando
+/// promuove l'invariante a `Decision`, senza una sola query in più. Stesso filtro
+/// di [`cross_layer`]; output deterministico (ordinato per id dell'arco).
+pub fn support_edges<'a>(
+    rule: &LayeringRule,
+    relations: &'a [Relation],
+    entity_layer: &HashMap<EntityId, LayerKey>,
+) -> Vec<&'a Relation> {
+    let mut out: Vec<&Relation> = relations
+        .iter()
+        .filter(|rel| {
+            matches!(
+                cross_layer(rel, entity_layer),
+                Some((s, t)) if s == &rule.downstream && t == &rule.upstream
+            )
+        })
+        .collect();
+    out.sort_by_key(|rel| rel.id.0);
+    out
+}
+
 /// Le entità che **attraversano il confine** governato da una regola: gli estremi
 /// degli archi `downstream → upstream` realmente osservati. Sono le entità più
 /// rilevanti per "spiegare" l'invariante: agganciandole a una `Decision`, il Query
@@ -267,13 +291,9 @@ pub fn boundary_entities(
     entity_layer: &HashMap<EntityId, LayerKey>,
 ) -> Vec<EntityId> {
     let mut set: HashSet<EntityId> = HashSet::new();
-    for rel in relations {
-        if let Some((s, t)) = cross_layer(rel, entity_layer) {
-            if s == &rule.downstream && t == &rule.upstream {
-                set.insert(rel.source_id);
-                set.insert(rel.target_id);
-            }
-        }
+    for rel in support_edges(rule, relations, entity_layer) {
+        set.insert(rel.source_id);
+        set.insert(rel.target_id);
     }
     let mut out: Vec<EntityId> = set.into_iter().collect();
     out.sort_by_key(|id| id.0);
