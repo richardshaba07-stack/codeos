@@ -93,6 +93,17 @@ export interface LayeringInvariant {
   severity?: string;
 }
 
+/** Un invariante in formazione (stadio 1): la stessa asimmetria pura di un
+ *  invariante, ma ancora sotto soglia. Derivato e mai persistito. Niente
+ *  confidence/severity: un confine non ancora formato non si stima (un segnale,
+ *  non una verità). `needed` dice quanti archi mancano alla promozione. */
+export interface LayeringCandidate {
+  upstream: string;
+  downstream: string;
+  support: number;
+  needed: number;
+}
+
 /** La nascita storica di un confine (Fossile di Decisione, asse intento). */
 export interface DecisionFossil {
   upstream: string;
@@ -115,6 +126,7 @@ export interface ArchitecturalGap {
 /** Il referto architetturale completo: lo spazio negativo lungo i quattro assi. */
 export interface ArchitectureReport {
   invariants: LayeringInvariant[];
+  candidates: LayeringCandidate[];
   fossils: DecisionFossil[];
   gaps: ArchitecturalGap[];
 }
@@ -231,6 +243,7 @@ export class CodeOsClient {
     );
     return {
       invariants: resp.invariants ?? [],
+      candidates: resp.candidates ?? [],
       fossils: resp.fossils ?? [],
       gaps: resp.gaps ?? [],
     };

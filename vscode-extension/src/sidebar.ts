@@ -14,12 +14,18 @@ import {
   ArchitecturalGap,
   ArchitectureReport,
   DecisionFossil,
+  LayeringCandidate,
   LayeringInvariant,
   SourceLocation,
   ViolationEvent,
 } from './client';
 
-const EMPTY_REPORT: ArchitectureReport = { invariants: [], fossils: [], gaps: [] };
+const EMPTY_REPORT: ArchitectureReport = {
+  invariants: [],
+  candidates: [],
+  fossils: [],
+  gaps: [],
+};
 
 /** Nodo dell'albero. Le sezioni portano i figli già materializzati; le foglie
  *  possono portare una posizione su cui saltare al click. */
@@ -94,6 +100,7 @@ export class ArchitectureTreeProvider implements vscode.TreeDataProvider<CodeOsN
     return [
       status,
       this.invariantsSection(),
+      this.candidatesSection(),
       this.fossilsSection(),
       this.gapsSection(),
       this.violationsSection(),
@@ -109,6 +116,16 @@ export class ArchitectureTreeProvider implements vscode.TreeDataProvider<CodeOsN
       'law',
     );
     return section;
+  }
+
+  private candidatesSection(): CodeOsNode {
+    const items = this.report.candidates.map((c) => candidateNode(c));
+    return sectionNode(
+      'Invarianti in formazione',
+      items,
+      'Stadio 1: asimmetrie pure ancora sotto soglia. Derivate, mai persistite — un segnale, non una verità.',
+      'beaker',
+    );
   }
 
   private fossilsSection(): CodeOsNode {
@@ -191,6 +208,27 @@ function invariantNode(inv: LayeringInvariant): CodeOsNode {
   return node;
 }
 
+function candidateNode(c: LayeringCandidate): CodeOsNode {
+  // Stessa notazione dell'invariante (`downstream ⊀ upstream`): è lo stesso spazio
+  // negativo, solo non ancora a soglia. Il contesto della sezione dice «in formazione».
+  const node = new CodeOsNode(
+    `${c.downstream} ⊀ ${c.upstream}`,
+    vscode.TreeItemCollapsibleState.None,
+  );
+  node.description = `sup ${c.support} · ${neededPhrase(c.needed)} alla soglia`;
+  node.tooltip = new vscode.MarkdownString(
+    `**${c.downstream}** sta formando un confine verso **${c.upstream}**: ` +
+      `dipendenza a senso unico, nessun arco di ritorno.\n\n` +
+      `- Supporto: ${c.support} archi\n` +
+      `- Alla promozione a invariante \`${c.downstream} ⊀ ${c.upstream}\`: ${neededPhrase(c.needed)}\n` +
+      `- Derivato e mai persistito — un segnale, non una verità (niente confidenza/gravità).`,
+  );
+  // Niente `severityIcon`: un confine non formato non si stima. Cerchio vuoto =
+  // sotto soglia, deliberatamente neutro (nessuna gravità rivendicata).
+  node.iconPath = new vscode.ThemeIcon('circle-outline');
+  return node;
+}
+
 function fossilNode(f: DecisionFossil): CodeOsNode {
   const node = new CodeOsNode(
     `${f.downstream} → ${f.upstream}`,
@@ -249,6 +287,13 @@ function severityIcon(severity?: string): vscode.ThemeIcon {
     default:
       return new vscode.ThemeIcon('warning', new vscode.ThemeColor('charts.yellow'));
   }
+}
+
+/** Quanti archi mancano alla soglia, con l'accordo singolare/plurale
+ *  («manca 1 arco» / «mancano N archi»). `needed` è sempre ≥ 1 (un candidato è
+ *  sotto soglia per costruzione). Gemello TS di `needed_phrase` nella CLI. */
+function neededPhrase(needed: number): string {
+  return needed === 1 ? 'manca 1 arco' : `mancano ${needed} archi`;
 }
 
 function violationKey(v: ViolationEvent): string {

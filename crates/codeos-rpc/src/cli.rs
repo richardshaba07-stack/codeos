@@ -352,8 +352,9 @@ async fn run_doctor() {
                         let r = resp.into_inner();
                         println!("  [✓] Server gRPC vivo: referto ottenuto");
                         println!(
-                            "      → {} invarianti, {} fossili, {} lacune nel grafo corrente",
+                            "      → {} invarianti, {} in formazione, {} fossili, {} lacune nel grafo corrente",
                             r.invariants.len(),
+                            r.candidates.len(),
                             r.fossils.len(),
                             r.gaps.len()
                         );
@@ -685,6 +686,14 @@ fn report_to_json(report: &proto::GetArchitectureReportResponse) -> serde_json::
             "severity": i.severity,
             "origin": i.origin,
         })).collect::<Vec<_>>(),
+        // Gli invarianti in formazione (stadio 1): niente confidence/severity — un
+        // confine non ancora formato non si stima (trap #3); `needed` dice quanto manca.
+        "candidates": report.candidates.iter().map(|c| json!({
+            "upstream": c.upstream,
+            "downstream": c.downstream,
+            "support": c.support,
+            "needed": c.needed,
+        })).collect::<Vec<_>>(),
         "fossils": report.fossils.iter().map(|f| json!({
             "upstream": f.upstream,
             "downstream": f.downstream,
@@ -899,6 +908,38 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &R
         }
     }
 
+    // --- INVARIANTI IN FORMAZIONE (stadio 1: candidati sotto soglia) ---
+    // Lo stesso spazio negativo puro degli invarianti, ma non ancora a soglia piena.
+    // Derivati e mai persistiti: un segnale, non una verità. Niente severità (un
+    // confine non formato non si stima): in compatto un esempio + conteggio (come i
+    // fossili), in verbose l'elenco completo.
+    println!("\n🌱 INVARIANTI IN FORMAZIONE (Stadio 1 — Candidati)");
+    println!("--------------------------------------------------");
+    if report.candidates.is_empty() {
+        println!("  (Nessun confine in formazione: nessuna asimmetria pura sotto soglia)");
+    } else if opts.verbose {
+        for c in &report.candidates {
+            println!(
+                "  • '{}' sta emergendo come dipendente a senso unico da '{}'\n    [Supporto: {} archi · {} alla promozione a invariante]",
+                c.downstream,
+                c.upstream,
+                c.support,
+                needed_phrase(c.needed)
+            );
+        }
+    } else {
+        // Il candidato in testa è il più vicino alla soglia (ordine: supporto desc).
+        let c = &report.candidates[0];
+        println!(
+            "  • {} confini in formazione; es. '{}' → '{}' ({} alla promozione)",
+            report.candidates.len(),
+            c.downstream,
+            c.upstream,
+            needed_phrase(c.needed)
+        );
+        println!("    (derivati e mai persistiti; usa --verbose per l'elenco completo)");
+    }
+
     // --- FOSSILI DI DECISIONE ---
     println!("\n🦴 FOSSILI DI DECISIONE (Asse Intento)");
     println!("--------------------------------------");
@@ -983,6 +1024,17 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &R
     println!("\n=======================================================\n");
 }
 
+/// Quanti archi mancano a un candidato per diventare invariante, in italiano con
+/// l'accordo singolare/plurale ("gli manca 1 arco" / "gli mancano N archi").
+/// `needed` è sempre ≥ 1 (un candidato è sotto soglia per costruzione).
+fn needed_phrase(needed: u32) -> String {
+    if needed == 1 {
+        "gli manca 1 arco".to_string()
+    } else {
+        format!("gli mancano {needed} archi")
+    }
+}
+
 /// Badge leggibile per una severità trasportata come stringa ("info"/"warning"/
 /// "high_risk"). Sconosciuto → neutro.
 fn severity_badge(severity: &str) -> &'static str {
@@ -1017,7 +1069,9 @@ fn severity_rank(severity: &str) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{diagnose_db, diagnose_repo, usage_text, DiagKind};
+    use super::{
+        diagnose_db, diagnose_repo, needed_phrase, proto, report_to_json, usage_text, DiagKind,
+    };
 
     /// Ogni comando gestito dal dispatcher in `main` deve comparire nell'help.
     /// È il guard-rail contro la regressione «comando aggiunto al `match`, scordato
@@ -1087,5 +1141,51 @@ mod tests {
             diagnose_db(Some("/tmp/g.db"), false, true, false).kind,
             DiagKind::Ok
         );
+    }
+
+    /// `report_to_json` deve esporre gli invarianti in formazione sotto `candidates`,
+    /// coi quattro campi pubblici (upstream/downstream/support/needed) e SENZA
+    /// confidence/severity: un confine non ancora formato non si stima (trap #3).
+    /// È il guard-rail che il candidato messo sul filo resti visibile nel JSON.
+    #[test]
+    fn report_to_json_surfaces_candidates() {
+        let report = proto::GetArchitectureReportResponse {
+            candidates: vec![proto::LayeringCandidate {
+                upstream: "core".to_string(),
+                downstream: "ui".to_string(),
+                support: 2,
+                needed: 1,
+            }],
+            ..Default::default()
+        };
+        let json = report_to_json(&report);
+        let candidates = json["candidates"]
+            .as_array()
+            .expect("`candidates` deve essere un array");
+        assert_eq!(candidates.len(), 1, "il candidato deve comparire nel JSON");
+        let c = &candidates[0];
+        assert_eq!(c["upstream"], "core");
+        assert_eq!(c["downstream"], "ui");
+        assert_eq!(c["support"], 2);
+        assert_eq!(c["needed"], 1);
+        // Nessuna stima su un confine non formato: confidence/severity assenti (trap #3).
+        assert!(
+            c.get("confidence").is_none(),
+            "un candidato non porta confidence (trap #3)"
+        );
+        assert!(
+            c.get("severity").is_none(),
+            "un candidato non porta severity (trap #3)"
+        );
+    }
+
+    /// `needed_phrase` deve concordare in numero: «gli manca 1 arco» al singolare,
+    /// «gli mancano N archi» al plurale. È microcopy, ma un tool che scrive «1 archi»
+    /// suona rotto — e la fiducia nel referto si gioca anche su questi dettagli.
+    #[test]
+    fn needed_phrase_agrees_in_number() {
+        assert_eq!(needed_phrase(1), "gli manca 1 arco");
+        assert_eq!(needed_phrase(2), "gli mancano 2 archi");
+        assert_eq!(needed_phrase(3), "gli mancano 3 archi");
     }
 }

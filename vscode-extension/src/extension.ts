@@ -206,8 +206,8 @@ async function architectureReport(context: vscode.ExtensionContext): Promise<voi
   });
   await vscode.window.showTextDocument(doc, { preview: false });
   log(
-    `Referto: ${report.invariants.length} invarianti, ${report.fossils.length} fossili, ` +
-      `${report.gaps.length} lacune`,
+    `Referto: ${report.invariants.length} invarianti, ${report.candidates.length} in formazione, ` +
+      `${report.fossils.length} fossili, ${report.gaps.length} lacune`,
   );
 }
 
@@ -236,6 +236,26 @@ function renderReport(report: ArchitectureReport): string {
       lines.push(
         `| \`${inv.upstream}\` | \`${inv.downstream}\` | ${inv.support} | ${conf} | ${cal} |`,
       );
+    }
+  }
+  lines.push('');
+
+  // Asse struttura, stadio 1: gli invarianti ancora in formazione (sotto soglia).
+  lines.push('## Invarianti in formazione (stadio 1)');
+  lines.push('');
+  lines.push(
+    '_Le stesse asimmetrie pure degli invarianti, ma ancora **sotto soglia**. ' +
+      'Derivate e mai persistite — un segnale, non una verità: niente confidenza né ' +
+      'gravità (un confine non ancora formato non si stima)._',
+  );
+  lines.push('');
+  if (report.candidates.length === 0) {
+    lines.push('_Nessun confine in formazione: nessuna asimmetria pura sotto soglia._');
+  } else {
+    lines.push('| Fondazione (upstream) | Dipende (downstream) | Support | Archi alla soglia |');
+    lines.push('| --- | --- | ---: | ---: |');
+    for (const c of report.candidates) {
+      lines.push(`| \`${c.upstream}\` | \`${c.downstream}\` | ${c.support} | ${c.needed} |`);
     }
   }
   lines.push('');
@@ -311,7 +331,8 @@ async function refreshSidebar(context: vscode.ExtensionContext): Promise<void> {
   sidebar.setReport(report);
   log(
     `Sidebar aggiornata: ${report.invariants.length} invarianti, ` +
-      `${report.fossils.length} fossili, ${report.gaps.length} lacune`,
+      `${report.candidates.length} in formazione, ${report.fossils.length} fossili, ` +
+      `${report.gaps.length} lacune`,
   );
 }
 
