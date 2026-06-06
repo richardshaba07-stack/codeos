@@ -409,9 +409,25 @@ fn scoped_name(scope: &Scope, raw: &str) -> String {
 
 fn bare_type_name(raw: &str) -> Option<String> {
     let before_generics = raw.split('<').next().unwrap_or(raw);
-    let cleaned = before_generics
-        .trim()
-        .trim_start_matches('&')
+    let after_ref = before_generics.trim().trim_start_matches('&').trim_start();
+    // Un riferimento può portare una lifetime esplicita: `&'de RawValue`,
+    // `&'a mut Value`. Dopo aver tolto `&` resta `'de RawValue`; la lifetime
+    // inizia con `'` e DEVE essere scartata, altrimenti la `take_while` qui
+    // sotto si ferma subito sull'apostrofo, il nome-tipo esce vuoto e l'impl
+    // perde il suo Self type → `handle_impl` ripiega su `walk_children` e i
+    // metodi finiscono mal-classificati come FUNZIONI libere del modulo
+    // (es. serde_json `impl Deserializer<'de> for &'de RawValue`: 31 metodi
+    // `deserialize_*` diventavano `raw::deserialize_*`, kind sbagliato e
+    // qualname senza tipo/trait). Disciplina anti-FP: lo strip è puramente
+    // sintattico (riferimento + lifetime + `mut`/`dyn`), non inventa nulla.
+    let no_lifetime = if let Some(rest) = after_ref.strip_prefix('\'') {
+        rest.split_once(char::is_whitespace)
+            .map(|(_, tail)| tail.trim_start())
+            .unwrap_or("")
+    } else {
+        after_ref
+    };
+    let cleaned = no_lifetime
         .trim_start_matches("mut ")
         .trim_start_matches("dyn ")
         .trim();
@@ -739,6 +755,87 @@ impl From<&str> for Version {
                 "'{name}' dovrebbe stare sotto Version"
             );
         }
+    }
+
+    /// Regressione (misurata su serde_json, ~10× semver): un `impl Trait for
+    /// &'a Tipo` — riferimento con lifetime ESPLICITA — faceva tornare `None` a
+    /// `bare_type_name` (dopo lo strip di `&` resta `'de RawValue` e la
+    /// `take_while` si ferma sull'apostrofo → nome vuoto). `handle_impl`
+    /// ripiegava su `walk_children` e i metodi finivano mal-classificati come
+    /// FUNZIONI libere del modulo: in serde_json i 31 `deserialize_*` di
+    /// `impl Deserializer<'de> for &'de RawValue` diventavano `raw::deserialize_*`
+    /// (kind sbagliato, qualname senza tipo né trait). Ora il Self type viene
+    /// riconosciuto e i metodi stanno sotto il tipo, disambiguati dal trait.
+    #[tokio::test]
+    async fn methods_of_lifetime_reference_impls_are_attributed_to_the_type() {
+        const SRC: &str = r#"
+pub struct RawValue;
+
+impl<'de> Deserializer<'de> for &'de RawValue {
+    fn deserialize_any<V>(self, _v: V) {}
+    fn deserialize_bool<V>(self, _v: V) {}
+}
+"#;
+        let result = parse(SRC).await;
+        let raw = find(&result, "RawValue");
+
+        // I due metodi dell'impl su riferimento+lifetime sono Method sotto RawValue,
+        // e portano il trait come disambiguatore (non il nome nudo).
+        for leaf in ["deserialize_any", "deserialize_bool"] {
+            let methods: Vec<&ParsedEntity> = result
+                .entities
+                .iter()
+                .filter(|e| e.kind == EntityKind::Method && e.name.ends_with(leaf))
+                .collect();
+            assert_eq!(
+                methods.len(),
+                1,
+                "atteso 1 Method '{leaf}', trovati: {:?}",
+                methods.iter().map(|e| &e.name).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                methods[0].parent_local_id.as_deref(),
+                Some(raw.local_id.as_str()),
+                "'{leaf}' deve stare sotto RawValue"
+            );
+            assert!(
+                methods[0].name.contains("Deserializer"),
+                "'{leaf}' deve portare il trait disambiguante: {}",
+                methods[0].name
+            );
+        }
+
+        // Non deve restare ALCUNA funzione libera mal-classificata (la vecchia bug).
+        let stray: Vec<&str> = result
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function && e.name.starts_with("deserialize_"))
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "metodi di un impl su riferimento trapelati come funzioni libere: {stray:?}"
+        );
+    }
+
+    #[test]
+    fn bare_type_name_strips_reference_and_lifetime() {
+        // Casi che già funzionavano: nessuna regressione.
+        assert_eq!(bare_type_name("Number").as_deref(), Some("Number"));
+        assert_eq!(bare_type_name("&Number").as_deref(), Some("Number"));
+        assert_eq!(
+            bare_type_name("&mut Deserializer<R>").as_deref(),
+            Some("Deserializer")
+        );
+        assert_eq!(bare_type_name("dyn Trait").as_deref(), Some("Trait"));
+        // Casi che PRIMA del fix tornavano None: riferimento con lifetime esplicita.
+        assert_eq!(bare_type_name("&'de RawValue").as_deref(), Some("RawValue"));
+        assert_eq!(bare_type_name("&'a mut Value").as_deref(), Some("Value"));
+        assert_eq!(
+            bare_type_name("&'de Map<String, Value>").as_deref(),
+            Some("Map")
+        );
+        assert_eq!(bare_type_name("&'static str").as_deref(), Some("str"));
     }
 
     #[tokio::test]
