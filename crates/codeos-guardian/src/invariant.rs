@@ -30,6 +30,13 @@ pub const DEFAULT_LAYER_DEPTH: usize = 2;
 /// troppo poco significativa per dichiararla un invariante.
 pub const DEFAULT_MIN_SUPPORT: u32 = 3;
 
+/// La soglia minima perché un'asimmetria sia un *candidato* invece che rumore.
+/// Sotto 2 archi non c'è ripetizione: un singolo arco in una direzione (e zero
+/// nell'altra) è un caso, non un confine che si sta formando. I candidati vivono
+/// nella banda `[DEFAULT_MIN_CANDIDATE_SUPPORT, min_support)`: abbastanza ripetuti
+/// da non essere rumore, non abbastanza da diventare invarianti.
+pub const DEFAULT_MIN_CANDIDATE_SUPPORT: u32 = 2;
+
 /// Configurazione del miner di layering.
 #[derive(Debug, Clone)]
 pub struct LayerConfig {
@@ -104,6 +111,27 @@ pub struct LayeringRule {
     /// Se la regola è stata dissotterrata dal grafo o dichiarata a mano nella
     /// config. Una regola dichiarata vale per decreto e non si calibra sul tempo.
     pub origin: RuleOrigin,
+}
+
+/// Un invariante **in formazione**: la stessa asimmetria pura di una
+/// [`LayeringRule`], ma con supporto ancora sotto la soglia. È lo **stadio 1** del
+/// flusso (candidato → proposta → decisione): un segnale grezzo, *derivato* e
+/// **mai persistito** nel ledger (che custodisce solo storia confermata). Niente
+/// `confidence` euristica qui: un candidato non è ancora abbastanza solido da
+/// meritare una stima, e l'assenza del float lascia il tipo `Eq` (comodo nei test
+/// e onesto: non c'è nulla da approssimare finché il confine non si è formato).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayeringCandidate {
+    /// Il layer da cui si dipenderebbe (a valle nessun arco osservato). Target.
+    pub upstream: LayerKey,
+    /// Il layer che dipende (la direzione osservata). Source.
+    pub downstream: LayerKey,
+    /// Quanti archi `downstream → upstream` sono stati osservati finora.
+    pub support: u32,
+    /// Quanti archi ancora mancano per diventare un invariante: `min_support -
+    /// support`. È il campo che dichiara apertamente l'immaturità (trap #3: non
+    /// fossilizziamo un segnale acerbo spacciandolo per confine già stabilito).
+    pub needed: u32,
 }
 
 /// Solo le relazioni che esprimono una **dipendenza direzionale** definiscono
@@ -196,25 +224,19 @@ pub(crate) fn count_cross_layer_edges(
     counts
 }
 
-/// **Il miner.** Scopre le regole di layering dalle relazioni: per ogni coppia di
-/// layer, se una direzione ha supporto sufficiente e l'altra è completamente
-/// assente (spazio negativo), emette un invariante.
-///
-/// Scelta conservativa deliberata: emettiamo una regola **solo** quando la
-/// direzione proibita ha *zero* archi osservati. Bastasse un solo arco contrario,
-/// non sarebbe più "negativo puro" e il rischio di falso positivo crescerebbe.
-/// Preferiamo poche regole solide a molte regole rumorose.
-pub fn mine_layering_rules(
-    relations: &[Relation],
-    entity_layer: &HashMap<EntityId, LayerKey>,
-    config: &LayerConfig,
-) -> Vec<LayeringRule> {
-    let counts = count_cross_layer_edges(relations, entity_layer);
-
-    let mut rules = Vec::new();
+/// Tutte le **asimmetrie pure** tra coppie di layer: una direzione osservata
+/// (supporto > 0) con l'opposta a *zero* archi (spazio negativo puro). **Nessuna
+/// soglia** applicata qui: è il mattone comune a regole e candidati, così che
+/// restino lo *stesso* pattern classificato solo dal supporto, incapaci di
+/// divergere (una regola è un candidato che ha superato `min_support`, non una
+/// cosa scoperta da un codice diverso). Ogni tupla è `(downstream, upstream,
+/// support)`: `downstream` dipende da `upstream` — la direzione osservata, mai il
+/// contrario. La coppia non ordinata è trattata una sola volta.
+fn pure_asymmetries(counts: &HashMap<(LayerKey, LayerKey), u32>) -> Vec<(LayerKey, LayerKey, u32)> {
+    let mut out = Vec::new();
     let mut handled: HashSet<(LayerKey, LayerKey)> = HashSet::new();
 
-    for ((a, b), &ab) in &counts {
+    for ((a, b), &ab) in counts {
         // Tratta la coppia non ordinata {a, b} una sola volta.
         if handled.contains(&(a.clone(), b.clone())) || handled.contains(&(b.clone(), a.clone())) {
             continue;
@@ -223,28 +245,45 @@ pub fn mine_layering_rules(
 
         let ba = counts.get(&(b.clone(), a.clone())).copied().unwrap_or(0);
 
-        // La direzione con supporto è quella "vera"; l'altra dev'essere assente.
-        if ab >= config.min_support && ba == 0 {
+        // Asimmetria pura: una sola direzione ha archi, l'altra è vuota.
+        if ab > 0 && ba == 0 {
             // archi a → b ⇒ a è downstream (dipende), b è upstream (base).
-            rules.push(LayeringRule {
-                id: EntityId::new(),
-                upstream: b.clone(),
-                downstream: a.clone(),
-                support: ab,
-                confidence: confidence_for(ab),
-                origin: RuleOrigin::Discovered,
-            });
-        } else if ba >= config.min_support && ab == 0 {
-            rules.push(LayeringRule {
-                id: EntityId::new(),
-                upstream: a.clone(),
-                downstream: b.clone(),
-                support: ba,
-                confidence: confidence_for(ba),
-                origin: RuleOrigin::Discovered,
-            });
+            out.push((a.clone(), b.clone(), ab));
+        } else if ba > 0 && ab == 0 {
+            out.push((b.clone(), a.clone(), ba));
         }
     }
+    out
+}
+
+/// **Il miner.** Scopre le regole di layering dalle relazioni: per ogni coppia di
+/// layer, se una direzione ha supporto sufficiente e l'altra è completamente
+/// assente (spazio negativo), emette un invariante.
+///
+/// Scelta conservativa deliberata: emettiamo una regola **solo** quando la
+/// direzione proibita ha *zero* archi osservati. Bastasse un solo arco contrario,
+/// non sarebbe più "negativo puro" e il rischio di falso positivo crescerebbe.
+/// Preferiamo poche regole solide a molte regole rumorose. La selezione del
+/// negativo puro è delegata a [`pure_asymmetries`]; qui si applica solo la soglia.
+pub fn mine_layering_rules(
+    relations: &[Relation],
+    entity_layer: &HashMap<EntityId, LayerKey>,
+    config: &LayerConfig,
+) -> Vec<LayeringRule> {
+    let counts = count_cross_layer_edges(relations, entity_layer);
+
+    let mut rules: Vec<LayeringRule> = pure_asymmetries(&counts)
+        .into_iter()
+        .filter(|(_, _, support)| *support >= config.min_support)
+        .map(|(downstream, upstream, support)| LayeringRule {
+            id: EntityId::new(),
+            upstream,
+            downstream,
+            support,
+            confidence: confidence_for(support),
+            origin: RuleOrigin::Discovered,
+        })
+        .collect();
 
     // Output deterministico: prima le regole con più supporto, poi per nome.
     rules.sort_by(|x, y| {
@@ -254,6 +293,43 @@ pub fn mine_layering_rules(
             .then_with(|| x.upstream.cmp(&y.upstream))
     });
     rules
+}
+
+/// **Lo stadio 1 del flusso.** Le asimmetrie che si stanno *formando*: stesso
+/// spazio negativo puro di una regola, ma con supporto nella banda
+/// `[DEFAULT_MIN_CANDIDATE_SUPPORT, min_support)` — abbastanza ripetute da non
+/// essere rumore, non abbastanza da essere invarianti. **Derivate, mai
+/// persistite** (il ledger custodisce solo storia confermata): un candidato è un
+/// *segnale*, non una verità. Condividendo [`pure_asymmetries`] con
+/// [`mine_layering_rules`], un candidato e una regola sono lo stesso pattern, e la
+/// promozione resta solo questione di supporto — non possono divergere.
+pub fn mine_layering_candidates(
+    relations: &[Relation],
+    entity_layer: &HashMap<EntityId, LayerKey>,
+    config: &LayerConfig,
+) -> Vec<LayeringCandidate> {
+    let counts = count_cross_layer_edges(relations, entity_layer);
+    let band = DEFAULT_MIN_CANDIDATE_SUPPORT..config.min_support;
+
+    let mut candidates: Vec<LayeringCandidate> = pure_asymmetries(&counts)
+        .into_iter()
+        .filter(|(_, _, support)| band.contains(support))
+        .map(|(downstream, upstream, support)| LayeringCandidate {
+            upstream,
+            downstream,
+            support,
+            needed: config.min_support - support,
+        })
+        .collect();
+
+    // Stesso ordine deterministico delle regole: più supporto prima, poi per nome.
+    candidates.sort_by(|x, y| {
+        y.support
+            .cmp(&x.support)
+            .then_with(|| x.downstream.cmp(&y.downstream))
+            .then_with(|| x.upstream.cmp(&y.upstream))
+    });
+    candidates
 }
 
 /// Gli archi di **supporto** di una regola: le dipendenze `downstream → upstream`
@@ -660,5 +736,118 @@ mod tests {
         );
         assert_eq!(rules[0].upstream, LayerKey("app::core".to_string()));
         assert_eq!(rules[0].downstream, LayerKey("app::api".to_string()));
+    }
+
+    #[test]
+    fn a_forming_asymmetry_surfaces_as_a_candidate() {
+        let mut map = HashMap::new();
+        let api = layered(2, "app::api", &mut map);
+        let core = layered(2, "app::core", &mut map);
+
+        // Due archi api → core, zero core → api: asimmetria pura ma sotto la soglia
+        // (3). Non è ancora un invariante, ma non è nemmeno rumore: è un candidato.
+        let relations = vec![
+            rel(RelationKind::Calls, api[0], core[0]),
+            rel(RelationKind::Calls, api[1], core[1]),
+        ];
+
+        let cfg = LayerConfig::default();
+        assert!(
+            mine_layering_rules(&relations, &map, &cfg).is_empty(),
+            "due archi non bastano per un invariante"
+        );
+
+        let candidates = mine_layering_candidates(&relations, &map, &cfg);
+        assert_eq!(candidates.len(), 1, "candidati = {candidates:?}");
+        assert_eq!(candidates[0].upstream, LayerKey("app::core".to_string()));
+        assert_eq!(candidates[0].downstream, LayerKey("app::api".to_string()));
+        assert_eq!(candidates[0].support, 2);
+        assert_eq!(
+            candidates[0].needed, 1,
+            "manca un solo arco alla promozione"
+        );
+    }
+
+    #[test]
+    fn a_candidate_graduates_to_a_rule_at_min_support() {
+        let mut map = HashMap::new();
+        let api = layered(3, "app::api", &mut map);
+        let core = layered(3, "app::core", &mut map);
+        let cfg = LayerConfig::default();
+
+        // Con due archi è un candidato e NON una regola.
+        let forming = vec![
+            rel(RelationKind::Calls, api[0], core[0]),
+            rel(RelationKind::Calls, api[1], core[1]),
+        ];
+        assert_eq!(mine_layering_candidates(&forming, &map, &cfg).len(), 1);
+        assert!(mine_layering_rules(&forming, &map, &cfg).is_empty());
+
+        // Il terzo arco lo promuove: ora è una regola e NON più un candidato. Lo
+        // stesso pattern attraversa la soglia, classificato solo dal supporto —
+        // è la prova strutturale che candidato e regola non possono divergere.
+        let mut mature = forming;
+        mature.push(rel(RelationKind::Imports, api[2], core[2]));
+        assert_eq!(mine_layering_rules(&mature, &map, &cfg).len(), 1);
+        assert!(
+            mine_layering_candidates(&mature, &map, &cfg).is_empty(),
+            "a soglia raggiunta non è più un candidato: è diventato regola"
+        );
+    }
+
+    #[test]
+    fn a_single_edge_is_noise_not_a_candidate() {
+        let mut map = HashMap::new();
+        let api = layered(1, "app::api", &mut map);
+        let core = layered(1, "app::core", &mut map);
+
+        // Un solo arco in una direzione (e zero nell'altra) non è un confine che si
+        // forma: è un caso. Sotto DEFAULT_MIN_CANDIDATE_SUPPORT, niente candidato.
+        let relations = vec![rel(RelationKind::Calls, api[0], core[0])];
+        assert!(
+            mine_layering_candidates(&relations, &map, &LayerConfig::default()).is_empty(),
+            "un singolo arco è rumore, non un candidato"
+        );
+    }
+
+    #[test]
+    fn a_bidirectional_pair_yields_no_candidate() {
+        let mut map = HashMap::new();
+        let api = layered(2, "app::api", &mut map);
+        let core = layered(2, "app::core", &mut map);
+
+        // Due archi api → core ma anche uno core → api: l'asimmetria non è pura, e un
+        // candidato resta comunque spazio negativo puro. Niente candidato.
+        let relations = vec![
+            rel(RelationKind::Calls, api[0], core[0]),
+            rel(RelationKind::Calls, api[1], core[1]),
+            rel(RelationKind::Calls, core[0], api[0]),
+        ];
+        assert!(
+            mine_layering_candidates(&relations, &map, &LayerConfig::default()).is_empty(),
+            "senza spazio negativo puro non c'è candidato"
+        );
+    }
+
+    #[test]
+    fn low_confidence_and_test_edges_do_not_form_candidates() {
+        let mut map = HashMap::new();
+        let api = layered(2, "app::api", &mut map);
+        let core = layered(2, "app::core", &mut map);
+
+        // Stesso filtro a monte delle regole (entrambe passano da `cross_layer`): un
+        // candidato non può nascere da archi che potrebbero mentire (low) o che
+        // attraversano i layer per mestiere (test).
+        let low = vec![
+            rel_conf(RelationKind::Calls, api[0], core[0], "low"),
+            rel_conf(RelationKind::Calls, api[1], core[1], "low"),
+        ];
+        assert!(mine_layering_candidates(&low, &map, &LayerConfig::default()).is_empty());
+
+        let from_tests = vec![
+            rel_test(RelationKind::Calls, api[0], core[0]),
+            rel_test(RelationKind::Calls, api[1], core[1]),
+        ];
+        assert!(mine_layering_candidates(&from_tests, &map, &LayerConfig::default()).is_empty());
     }
 }

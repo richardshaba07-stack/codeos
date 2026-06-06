@@ -21,8 +21,8 @@ use codeos_types::bus::{ArchitectureViolation, NewDecision};
 use codeos_types::{Entity, EntityId, EntityKind, Relation};
 
 use crate::invariant::{
-    boundary_entities, layer_of_entity, mine_layering_rules, support_edges, violations_for,
-    LayerConfig, LayerKey, LayeringRule,
+    boundary_entities, layer_of_entity, mine_layering_candidates, mine_layering_rules,
+    support_edges, violations_for, LayerConfig, LayerKey, LayeringCandidate, LayeringRule,
 };
 use crate::meta::{mine_missing_invariants, MetaConfig, MissingInvariant};
 
@@ -159,6 +159,31 @@ impl Guardian {
         let layer_map = self.build_layer_map(&relations).await?;
         let mined = mine_layering_rules(&relations, &layer_map, &self.config);
         Ok(self.merge_declared(mined))
+    }
+
+    /// **Lo stadio 1 del flusso (candidato → proposta → decisione).** Le asimmetrie
+    /// che si stanno *formando* nell'intero grafo: stesso spazio negativo puro di un
+    /// invariante, ma con supporto ancora nella banda
+    /// `[DEFAULT_MIN_CANDIDATE_SUPPORT, min_support)`.
+    ///
+    /// **Sola lettura, derivata, mai persistita.** A differenza di
+    /// [`learn`](Self::learn), non tocca il `DecisionStore`: un candidato è un
+    /// segnale grezzo, non storia confermata, e il ledger custodisce solo ciò che è
+    /// stato deciso. Le regole **dichiarate a mano** non vi compaiono: valgono già
+    /// per decreto, non sono confini *in formazione*. È lo specchio anticipatore di
+    /// [`mine_rules`](Self::mine_rules) — mostra cosa potrebbe diventare un
+    /// invariante prima che lo diventi, senza fossilizzarlo (trap #3).
+    pub async fn candidates(&self) -> anyhow::Result<Vec<LayeringCandidate>> {
+        let relations = self
+            .storage
+            .query_relations(RelationFilter::default())
+            .await?;
+        let layer_map = self.build_layer_map(&relations).await?;
+        Ok(mine_layering_candidates(
+            &relations,
+            &layer_map,
+            &self.config,
+        ))
     }
 
     /// Come [`mine_rules`](Self::mine_rules), ma **calibra** la confidenza di ogni
@@ -1631,6 +1656,46 @@ mod tests {
         assert_eq!(rules.len(), 1, "regole = {rules:?}");
         assert_eq!(rules[0].upstream, LayerKey("app::core".to_string()));
         assert_eq!(rules[0].downstream, LayerKey("app::api".to_string()));
+    }
+
+    #[tokio::test]
+    async fn surfaces_a_forming_boundary_as_a_candidate() {
+        // Due archi api → core (zero nel verso opposto): asimmetria pura ma sotto la
+        // soglia di default (3). `mine_rules` non lo vede ancora come invariante, ma
+        // `candidates` lo fa emergere come confine *in formazione* (stadio 1 del
+        // flusso) — derivato dallo storage, senza scrivere nulla nel ledger.
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let api: Vec<Entity> = (0..2)
+            .map(|i| entity(&format!("app::api::handler_{i}::run")))
+            .collect();
+        let core: Vec<Entity> = (0..2)
+            .map(|i| entity(&format!("app::core::service_{i}::do_it")))
+            .collect();
+        let relations = (0..2)
+            .map(|i| relation(RelationKind::Calls, api[i].id, core[i].id))
+            .collect();
+        storage
+            .apply_delta(GraphDelta {
+                added_entities: api.iter().chain(core.iter()).cloned().collect(),
+                added_relations: relations,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let guardian = Guardian::new(storage);
+
+        assert!(
+            guardian.mine_rules().await.unwrap().is_empty(),
+            "due archi non sono ancora un invariante"
+        );
+
+        let candidates = guardian.candidates().await.unwrap();
+        assert_eq!(candidates.len(), 1, "candidati = {candidates:?}");
+        assert_eq!(candidates[0].upstream, LayerKey("app::core".to_string()));
+        assert_eq!(candidates[0].downstream, LayerKey("app::api".to_string()));
+        assert_eq!(candidates[0].support, 2);
+        assert_eq!(candidates[0].needed, 1);
     }
 
     #[tokio::test]
