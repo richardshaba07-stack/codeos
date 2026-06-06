@@ -30,13 +30,9 @@ use crate::meta::{mine_missing_invariants, MetaConfig, MissingInvariant};
 /// dall'`id`, rigenerato a ogni mining): è la chiave del ciclo di vita di una
 /// regola in memoria. Forma: `layering-invariant:{upstream}|{downstream}`.
 const RULE_TAG_PREFIX: &str = "layering-invariant:";
-/// Tag di stato di una promozione: la regola è in vigore.
-const STATUS_ACTIVE: &str = "status:active";
-/// Tag di stato di un ritiro: la regola non è più sostenuta dal grafo.
-const STATUS_RETIRED: &str = "status:retired";
 
-/// Una voce del "registro" degli invarianti attualmente in vigore, ricostruito
-/// ripercorrendo la storia additiva delle decisioni.
+/// Una voce del "registro" degli invarianti attualmente in vigore, **derivata dal
+/// ledger** (le decisioni correnti), non da un tag di stato scritto a mano.
 struct ActiveInvariant {
     /// La `Decision` che ha promosso l'invariante (la referenzieremo nel ritiro).
     promotion_id: EntityId,
@@ -346,11 +342,21 @@ impl Guardian {
         // (e a costo zero) senza storia: la promozione resta com'era.
         let fossils = self.excavate_fossils(&rules).await?;
 
-        // Ricostruisci il registro degli invarianti ATTIVI ripercorrendo la storia
-        // (le decisioni arrivano ordinate per timestamp): una promozione attiva la
-        // chiave, un ritiro la disattiva. È la storia additiva a definire lo stato.
+        // Il registro degli invarianti ATTIVI è DERIVATO dal ledger, non ricostruito
+        // ripercorrendo tag di stato scritti a mano: `current_decisions()` sono già le
+        // decisioni `Accepted`, e una promozione che un ritiro ha `deprecated` diventa
+        // `Deprecated` → cade da sé fuori da questo insieme (la stessa "verità di oggi"
+        // che il Query Engine consuma). Tra le correnti, una regola in vigore è una
+        // `ArchitectureRule` (il ritiro è una `Decision`, kind diverso) che porta la
+        // propria chiave nel tag `RULE_TAG_PREFIX`. **Una sola fonte di verità:** lo
+        // stato lo dice il ledger (supersedes/deprecates), mai un tag duplicato che
+        // potrebbe divergere — coerente col principio di Slice A "lo stato si deriva,
+        // non si memorizza".
         let mut active: HashMap<String, ActiveInvariant> = HashMap::new();
-        for decision in store.all().await? {
+        for decision in store.current_decisions().await? {
+            if decision.kind != DecisionKind::ArchitectureRule {
+                continue;
+            }
             let Some(key) = decision
                 .tags
                 .iter()
@@ -359,17 +365,13 @@ impl Guardian {
             else {
                 continue;
             };
-            if decision.tags.iter().any(|t| t == STATUS_RETIRED) {
-                active.remove(&key);
-            } else {
-                active.insert(
-                    key,
-                    ActiveInvariant {
-                        promotion_id: decision.id,
-                        related_entity_ids: decision.related_entity_ids,
-                    },
-                );
-            }
+            active.insert(
+                key,
+                ActiveInvariant {
+                    promotion_id: decision.id,
+                    related_entity_ids: decision.related_entity_ids,
+                },
+            );
         }
 
         let mut changes = Vec::new();
@@ -1420,7 +1422,6 @@ fn promotion_decision(
         "layering".to_string(),
         "invariante".to_string(),
         rule_key(rule),
-        STATUS_ACTIVE.to_string(),
     ];
 
     // Fossile di Decisione: àncora la regola alla sua origine storica.
@@ -1544,18 +1545,17 @@ fn retraction_decision(
         ),
         related_entity_ids,
         related_decision_ids: vec![promotion_id],
-        // Cabla il ritiro nel ledger: la promozione risulterà `Deprecated` (stato
-        // derivato), non solo etichettata `status:retired`. Così un consumatore del
-        // Memory Engine vede l'invariante decaduto senza conoscere i tag del Guardian.
-        // Ora che il bus porta `deprecates`, lo esprimiamo nel `NewDecision` invece
-        // di mutare la `Decision` dopo `from_new`.
+        // Il ritiro vive nel ledger come un `deprecates` sulla promozione: da lì si
+        // DERIVA il suo stato `Deprecated`, unica fonte di verità. Niente tag
+        // `status:retired` parallelo — lo stato si deriva, non si memorizza (Slice A):
+        // un consumatore del Memory Engine vede l'invariante decaduto senza conoscere
+        // i tag del Guardian, e non resta una seconda etichetta che possa divergere.
         supersedes: Vec::new(),
         deprecates: vec![promotion_id],
         tags: vec![
             "layering".to_string(),
             "invariante".to_string(),
             format!("{RULE_TAG_PREFIX}{upstream}|{downstream}"),
-            STATUS_RETIRED.to_string(),
         ],
     };
     Decision::from_new(new, DecisionKind::Decision)
@@ -1861,9 +1861,11 @@ mod tests {
             .iter()
             .find(|d| d.kind == DecisionKind::ArchitectureRule)
             .expect("promozione mancante");
+        // Il ritiro è l'unica `Decision` (kind diverso dalla promozione, che è una
+        // `ArchitectureRule`): lo riconosciamo dallo stato del ledger, non da un tag.
         let retraction = all
             .iter()
-            .find(|d| d.tags.iter().any(|t| t == "status:retired"))
+            .find(|d| d.kind == DecisionKind::Decision)
             .expect("ritiro mancante");
         // Il ritiro referenzia la promozione e ne eredita le entità di confine.
         assert!(retraction.related_decision_ids.contains(&promotion.id));
@@ -1928,14 +1930,11 @@ mod tests {
         // Storia: promozione, ritiro, ri-promozione — tre strati, due regole attive nel tempo.
         let all = store.all().await.unwrap();
         assert_eq!(all.len(), 3);
-        let active = all
+        let promotions = all
             .iter()
-            .filter(|d| {
-                d.kind == DecisionKind::ArchitectureRule
-                    && !d.tags.iter().any(|t| t == "status:retired")
-            })
+            .filter(|d| d.kind == DecisionKind::ArchitectureRule)
             .count();
-        assert_eq!(active, 2, "due promozioni nella storia");
+        assert_eq!(promotions, 2, "due promozioni nella storia");
     }
 
     // ---------------------------------------------------------------------------
