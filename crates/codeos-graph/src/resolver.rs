@@ -102,8 +102,29 @@ impl GraphResolver {
             let mut local_map: HashMap<String, EntityId> = HashMap::new();
             let mut local_qname: HashMap<String, String> = HashMap::new();
             for parsed in &file.entities {
-                let id = EntityId::new();
                 let qname = self.qualified_name(parsed, &module_prefix, &local_qname);
+
+                // Anti-collisione di identità: due entità con lo STESSO
+                // qualified_name nascono quando il sorgente ha varianti cfg
+                // mutuamente esclusive di UN metodo logico — es. serde_json
+                // `impl Display for Number` con due `fn fmt` sotto
+                // #[cfg(feature="arbitrary_precision")] / #[cfg(not(...))].
+                // CodeOS parsa TUTTI i rami cfg, quindi entrambe arrivano qui
+                // con qname identico: è la STESSA identità. Ne teniamo UNA (la
+                // prima vista) e rimappiamo il local_id del duplicato sull'entità
+                // già creata, così le relazioni nel corpo della variante puntano
+                // al metodo tenuto. Evita che UN duplicato faccia fallire
+                // l'INTERO indice (UNIQUE violation → rollback → 0 entità):
+                // «un'identità in meno è meglio di un indice che muore».
+                // Disciplina anti-FP: si droppano SOLO qname IDENTICI (stessa
+                // identità), mai omonimi (quelli si astengono altrove).
+                if let Some(&existing) = new_by_qname.get(&qname) {
+                    local_map.insert(parsed.local_id.clone(), existing);
+                    local_qname.insert(parsed.local_id.clone(), qname);
+                    continue;
+                }
+
+                let id = EntityId::new();
                 let lang = parsed
                     .metadata
                     .get("language")
@@ -1505,6 +1526,66 @@ mod tests {
             .any(|r| r.kind == RelationKind::BelongsTo
                 && r.source_id == method.id
                 && r.target_id == class.id));
+    }
+
+    /// Regressione (misurata su serde_json): `impl Display for Number` ha DUE
+    /// `fn fmt` mutuamente esclusivi sotto #[cfg(feature="arbitrary_precision")]
+    /// / #[cfg(not(...))]. CodeOS parsa ENTRAMBI i rami cfg → due `ParsedEntity`
+    /// con `qualified_name` IDENTICO. Senza dedup l'INSERT viola
+    /// `UNIQUE(qualified_name)` e l'INTERA transazione fa rollback (misurato sul
+    /// crate reale: serde_json → 0 entità salvate). Il resolver tiene UNA sola
+    /// identità: «un'identità in meno è meglio di un indice che muore».
+    #[tokio::test]
+    async fn cfg_variant_duplicate_methods_collapse_to_one_identity() {
+        let src = r#"
+pub struct Number;
+
+impl Display for Number {
+    #[cfg(not(feature = "arbitrary_precision"))]
+    fn fmt(&self) {}
+    #[cfg(feature = "arbitrary_precision")]
+    fn fmt(&self) {}
+}
+"#;
+        let parsed = parse_rust("src/number.rs", src).await;
+
+        // Non-vacuità: il parser DAVVERO emette due metodi omonimi (i due rami
+        // cfg), quindi il dedup ha del lavoro reale da fare.
+        let parsed_fmt = parsed
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method && e.name.ends_with("fmt"))
+            .count();
+        assert_eq!(parsed_fmt, 2, "il parser deve vedere entrambi i rami cfg");
+
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None);
+        let delta = resolver.resolve(&[parsed], &storage).await.unwrap();
+
+        // Il resolver collassa i due in UNA sola entità con quel qualified_name.
+        let fmt: Vec<&Entity> = delta
+            .added_entities
+            .iter()
+            .filter(|e| e.qualified_name.ends_with("Number::Display::fmt"))
+            .collect();
+        assert_eq!(
+            fmt.len(),
+            1,
+            "attesa 1 sola identità Display::fmt, trovate: {:?}",
+            fmt.iter().map(|e| &e.qualified_name).collect::<Vec<_>>()
+        );
+        let fmt_qname = fmt[0].qualified_name.clone();
+
+        // E il delta si applica SENZA violare UNIQUE: l'indice sopravvive.
+        storage.apply_delta(delta).await.unwrap();
+        assert!(
+            storage
+                .get_entity_by_qname(&fmt_qname)
+                .await
+                .unwrap()
+                .is_some(),
+            "l'unica identità Display::fmt deve essere persistita"
+        );
     }
 
     #[tokio::test]
