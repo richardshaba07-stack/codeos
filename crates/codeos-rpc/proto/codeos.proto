@@ -117,6 +117,18 @@ message LayeringInvariant {
   string origin = 7;
 }
 
+// Un invariante *in formazione*: la stessa asimmetria pura di un LayeringInvariant,
+// ma con supporto ancora sotto la soglia. È lo stadio 1 del flusso (candidato →
+// proposta → decisione). Derivato e mai persistito: un segnale, non una verità —
+// niente confidenza/severità, un confine non ancora formato non si stima.
+message LayeringCandidate {
+  string upstream = 1;
+  string downstream = 2;
+  uint32 support = 3;
+  // Quanti archi ancora mancano perché diventi un invariante (min_support - support).
+  uint32 needed = 4;
+}
+
 // La nascita storica di un confine (Fossile di Decisione).
 message DecisionFossil {
   string upstream = 1;
@@ -155,6 +167,9 @@ message GetArchitectureReportResponse {
   // La misura di affidabilità del referto qui sopra.
   GraphQuality quality = 4;
   bool history_insufficient = 5;
+  // Gli invarianti IN FORMAZIONE: asimmetrie pure ancora sotto soglia, derivate e
+  // mai persistite. Stadio 1 del flusso candidato → proposta → decisione.
+  repeated LayeringCandidate candidates = 6;
 }
 
 // ---------------------------------------------------------------------------

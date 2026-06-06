@@ -181,6 +181,10 @@ pub struct ArchitectureReport {
     /// Gli invarianti di layering scoperti (asse struttura), con la confidenza
     /// eventualmente ricalibrata dal Campo di Astensione (asse tempo).
     pub invariants: Vec<LayeringInvariantInfo>,
+    /// Gli invarianti **in formazione**: asimmetrie pure ancora sotto soglia (stadio
+    /// 1 del flusso). Derivati e mai persistiti, accanto agli invarianti maturi così
+    /// che un consumatore veda anche i confini che *stanno* nascendo, non solo i nati.
+    pub candidates: Vec<LayeringCandidateInfo>,
     /// I Fossili di Decisione: la nascita storica di ciascun confine (asse intento).
     pub fossils: Vec<DecisionFossilInfo>,
     /// Le lacune del secondo ordine: gli invarianti mancanti dove la convenzione
@@ -364,6 +368,23 @@ pub struct LayeringInvariantInfo {
     pub severity: Severity,
     /// Se l'invariante è stato scoperto dai dati o dichiarato a mano nella config.
     pub origin: RuleOrigin,
+}
+
+/// Un invariante **in formazione** in forma piatta per il trasporto: la stessa
+/// asimmetria pura di un [`LayeringInvariantInfo`], ma con supporto ancora sotto la
+/// soglia. È lo stadio 1 del flusso (candidato → proposta → decisione), **derivato
+/// e mai persistito**. Niente `confidence`/`severity`: un confine non ancora formato
+/// non si stima (trap #3); `needed` dichiara apertamente quanto manca alla promozione.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayeringCandidateInfo {
+    /// Il layer-fondazione (la base da cui si dipenderebbe).
+    pub upstream: String,
+    /// Il layer che dipende a senso unico (la direzione osservata).
+    pub downstream: String,
+    /// Quanti archi `downstream → upstream` sono stati osservati finora.
+    pub support: u32,
+    /// Quanti archi ancora mancano perché diventi un invariante (`min_support - support`).
+    pub needed: u32,
 }
 
 /// La nascita storica di un confine architetturale (Fossile di Decisione).

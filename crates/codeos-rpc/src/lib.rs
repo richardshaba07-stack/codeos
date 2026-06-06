@@ -26,7 +26,7 @@ use std::pin::Pin;
 use codeos_core::DispatcherHandle;
 use codeos_types::bus::{
     ArchitecturalGapInfo, CodeOsEvent, Command, DecisionFossilInfo, GraphQualityInfo,
-    LayeringInvariantInfo, NewDecision, QueryRequest,
+    LayeringCandidateInfo, LayeringInvariantInfo, NewDecision, QueryRequest,
 };
 use codeos_types::{Entity, EntityId, EntityKind, Relation, RelationKind, SourceLocation};
 use tokio::sync::{broadcast, mpsc};
@@ -335,6 +335,11 @@ impl CodeOs for CodeOsService {
                 .collect(),
             quality: Some(graph_quality_to_proto(report.quality)),
             history_insufficient: report.history_insufficient,
+            candidates: report
+                .candidates
+                .into_iter()
+                .map(layering_candidate_to_proto)
+                .collect(),
         }))
     }
 
@@ -629,6 +634,15 @@ fn layering_invariant_to_proto(info: LayeringInvariantInfo) -> proto::LayeringIn
     }
 }
 
+fn layering_candidate_to_proto(info: LayeringCandidateInfo) -> proto::LayeringCandidate {
+    proto::LayeringCandidate {
+        upstream: info.upstream,
+        downstream: info.downstream,
+        support: info.support,
+        needed: info.needed,
+    }
+}
+
 fn decision_fossil_to_proto(info: DecisionFossilInfo) -> proto::DecisionFossil {
     proto::DecisionFossil {
         upstream: info.upstream,
@@ -899,9 +913,10 @@ mod tests {
             .expect("RPC GetArchitectureReport fallita")
             .into_inner();
 
-        // Grafo vuoto: nessun invariante, nessun fossile, nessuna lacuna — ma l'RPC
-        // attraversa tutta la pila (filo → Dispatcher → Guardian → ritorno).
+        // Grafo vuoto: nessun invariante, nessun candidato, nessun fossile, nessuna
+        // lacuna — ma l'RPC attraversa tutta la pila (filo → Dispatcher → Guardian).
         assert!(response.invariants.is_empty());
+        assert!(response.candidates.is_empty());
         assert!(response.fossils.is_empty());
         assert!(response.gaps.is_empty());
 

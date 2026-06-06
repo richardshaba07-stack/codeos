@@ -18,7 +18,7 @@ use codeos_paleo::GitLog;
 use codeos_storage::GraphStorage;
 use codeos_types::bus::{
     ArchitecturalGapInfo, ArchitectureReport, CodeOsEvent, Command, DecisionFossilInfo,
-    LayeringInvariantInfo, Severity,
+    LayeringCandidateInfo, LayeringInvariantInfo, Severity,
 };
 use codeos_types::GraphDelta;
 use tokio::sync::{broadcast, mpsc};
@@ -201,6 +201,8 @@ impl GuardianActor {
             .await
             .unwrap_or(false);
         let gaps = self.guardian.missing_invariants().await?;
+        // Stadio 1 del flusso: i confini ancora in formazione (derivati, non persistiti).
+        let raw_candidates = self.guardian.candidates().await?;
         // Qualità del grafo (P2-7): quanto fidarsi del referto appena costruito.
         let quality = self.guardian.graph_quality().await?;
 
@@ -217,6 +219,16 @@ impl GuardianActor {
                     severity: Severity::for_invariant(confidence),
                     origin: rule.origin,
                 }
+            })
+            .collect();
+
+        let candidates = raw_candidates
+            .into_iter()
+            .map(|c| LayeringCandidateInfo {
+                upstream: c.upstream.0,
+                downstream: c.downstream.0,
+                support: c.support,
+                needed: c.needed,
             })
             .collect();
 
@@ -244,6 +256,7 @@ impl GuardianActor {
 
         Ok(ArchitectureReport {
             invariants,
+            candidates,
             fossils,
             gaps,
             quality,
@@ -496,5 +509,65 @@ mod tests {
         // Senza storia non ci sono fossili; il grafo a due layer non ha lacune.
         assert!(report.fossils.is_empty());
         assert!(report.gaps.is_empty());
+        // Tre archi sono già un invariante MATURO: niente da mostrare fra i candidati.
+        assert!(
+            report.candidates.is_empty(),
+            "un invariante a soglia piena non è un candidato: {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_surfaces_a_forming_candidate() {
+        use codeos_types::bus::Command;
+
+        // Due archi api → core (zero nel verso opposto): asimmetria pura ma sotto la
+        // soglia. Non è ancora un invariante, ma il referto deve mostrarlo come
+        // confine *in formazione* (stadio 1) — derivato, senza scrivere nel ledger.
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let api: Vec<Entity> = (0..2)
+            .map(|i| entity(&format!("app::api::handler_{i}::run")))
+            .collect();
+        let core: Vec<Entity> = (0..2)
+            .map(|i| entity(&format!("app::core::service_{i}::do_it")))
+            .collect();
+        let forming: Vec<Relation> = (0..2)
+            .map(|i| relation(RelationKind::Calls, api[i].id, core[i].id))
+            .collect();
+        storage
+            .apply_delta(codeos_types::GraphDelta {
+                added_entities: api.iter().chain(core.iter()).cloned().collect(),
+                added_relations: forming,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let (tx, _keep) = broadcast::channel(16);
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let actor = GuardianActor::new(storage, tx.clone());
+        tokio::spawn(actor.run_with_commands(tx.subscribe(), cmd_rx));
+
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
+        cmd_tx
+            .send(Command::ArchitectureReport { reply_to: reply_tx })
+            .await
+            .unwrap();
+
+        let report = tokio::time::timeout(Duration::from_secs(5), reply_rx.recv())
+            .await
+            .expect("nessuna risposta al referto entro il timeout")
+            .expect("canale di risposta chiuso")
+            .expect("referto fallito");
+
+        // Nessun invariante maturo, ma un candidato che dichiara quanto gli manca.
+        assert!(
+            report.invariants.is_empty(),
+            "due archi non sono ancora un invariante: {report:?}"
+        );
+        assert_eq!(report.candidates.len(), 1, "report = {report:?}");
+        assert_eq!(report.candidates[0].upstream, "app::core");
+        assert_eq!(report.candidates[0].downstream, "app::api");
+        assert_eq!(report.candidates[0].support, 2);
+        assert_eq!(report.candidates[0].needed, 1);
     }
 }
