@@ -54,6 +54,9 @@ impl GraphResolver {
         let mut new_by_qname: HashMap<String, EntityId> = HashMap::new();
         let mut new_by_name: HashMap<String, Vec<(EntityId, String)>> = HashMap::new();
         let mut new_by_id_lang: HashMap<EntityId, String> = HashMap::new();
+        // Mappa id→kind del batch: nel Passo 3 il guard anti-membro (Fix #10)
+        // distingue Method da Function senza una query (vedi `resolve_target`).
+        let mut new_by_id_kind: HashMap<EntityId, codeos_types::EntityKind> = HashMap::new();
         // Reverse del batch (id→qname): nel Passo 3 dà il `qualified_name` del
         // TARGET appena risolto senza una query, per timbrare l'identità stabile
         // dell'arco (`source_qname`/`target_qname`) e conservarne la nascita.
@@ -140,6 +143,7 @@ impl GraphResolver {
                     .or_default()
                     .push((id, qname.clone()));
                 new_by_id_lang.insert(id, lang);
+                new_by_id_kind.insert(id, parsed.kind);
 
                 // source_kind: il parser può già averlo dedotto (es. `#[cfg(test)]`
                 // inline); altrimenti vale la classificazione per path del file.
@@ -270,6 +274,7 @@ impl GraphResolver {
                 new_by_qname: &new_by_qname,
                 new_by_name: &new_by_name,
                 new_by_id_lang: &new_by_id_lang,
+                new_by_id_kind: &new_by_id_kind,
                 storage,
             };
             for parsed in &ctx.relations {
@@ -805,6 +810,7 @@ struct ResolutionContext<'a> {
     new_by_qname: &'a HashMap<String, EntityId>,
     new_by_name: &'a HashMap<String, Vec<(EntityId, String)>>,
     new_by_id_lang: &'a HashMap<EntityId, String>,
+    new_by_id_kind: &'a HashMap<EntityId, codeos_types::EntityKind>,
     storage: &'a dyn GraphStorage,
 }
 
@@ -921,6 +927,20 @@ async fn resolve_target(
     // omonimi (misurato su semver: l'euristica risolveva `BuildMetadata::as_str` a
     // `Prerelease::as_str`). Stessa disciplina anti-omonimi del Passo 1.5.
     let bare = last_segment(target).unwrap_or(target);
+    // Fix #10 (anti-FP, SOLO web) — una call con receiver `recv.leaf()` in JS/TS è un
+    // accesso a proprietà/metodo: una `function` libera NON è invocabile come membro
+    // di un valore, quindi nel fallback per nome semplice un receiver "foreign"
+    // (≠ this/super/self) può legarsi SOLO a un Method, mai a una Function omonima.
+    // Era il caso reale `schema.safeParse(data)` (metodo Zod) conflato col free-fn
+    // `safeParse` del progetto: un arco che mente. Gated al linguaggio perché in
+    // Python `modulo.func()` PUÒ chiamare una funzione libera (lì il guard è OFF), e
+    // Rust usa path `::`, mai `.`. I receiver namespace (`import * as ns`) sono già
+    // dirottati dallo Stadio 2; ciò che resta qui è un valore a runtime. Se un
+    // namespace sfuggito cadesse fin qui, astenersi è coerente con la tesi: un arco
+    // mancante batte uno indovinato.
+    let foreign_member = (ctx.language == "typescript" || ctx.language == "javascript")
+        && target.contains('.')
+        && first_segment(target).is_some_and(|s| !is_self_receiver(s));
     if let Some(candidates) = ctx.new_by_name.get(bare) {
         let same_module: Vec<EntityId> = candidates
             .iter()
@@ -930,6 +950,11 @@ async fn resolve_target(
                     .is_some_and(|t_lang| language_matches(ctx.language, t_lang))
             })
             .filter(|(_, qname)| qname.starts_with(ctx.module_prefix))
+            // Fix #10: receiver-membro foreign ⇒ solo Method (mai una Function libera).
+            .filter(|(id, _)| {
+                !foreign_member
+                    || ctx.new_by_id_kind.get(id) == Some(&codeos_types::EntityKind::Method)
+            })
             .map(|(id, _)| *id)
             .collect();
         match same_module.as_slice() {
@@ -956,6 +981,8 @@ async fn resolve_target(
             language_matches(ctx.language, &t_lang)
         })
         .filter(|e| e.qualified_name.starts_with(ctx.module_prefix))
+        // Fix #10: stesso guard del batch, applicato anche al fallback su DB.
+        .filter(|e| !foreign_member || e.kind == codeos_types::EntityKind::Method)
         .collect();
     if let [unico] = same_module_db.as_slice() {
         return Ok(Some((unico.id, ResolutionStrategy::SameModule)));
@@ -1277,6 +1304,15 @@ fn first_segment(target: &str) -> Option<&str> {
 
 fn last_segment(target: &str) -> Option<&str> {
     target.rsplit(['.', ':']).find(|s| !s.is_empty())
+}
+
+/// Receiver che denota il TIPO che racchiude la call — `this.foo()`, `super.bar()`
+/// e gli equivalenti `self`/`Self`/`cls` di altri linguaggi: il tipo del receiver è
+/// noto (è l'entità chiamante), quindi il guard anti-membro del Fix #10 NON si
+/// applica. Ogni altro receiver puntato (`schema.safeParse`) è "foreign": una
+/// variabile/parametro il cui tipo è ignoto al match per nome semplice.
+fn is_self_receiver(seg: &str) -> bool {
+    matches!(seg, "this" | "super" | "self" | "Self" | "cls")
 }
 
 /// Identità stabile di un arco risolto → la sua nascita. La coppia di
@@ -1606,6 +1642,61 @@ impl Display for Number {
             .find(|r| r.kind == RelationKind::Calls && r.source_id == top.id)
             .expect("la call risolta a 'helper' è assente");
         assert_eq!(call.target_id, helper.id);
+    }
+
+    #[tokio::test]
+    async fn foreign_member_call_does_not_bind_to_free_function() {
+        // Fix #10 (anti-FP, web): `schema.validate(data)` è una call su un receiver
+        // foreign (parametro `schema`, tipo ignoto). Il suo leaf `validate` coincide
+        // con una `function` libera OMONIMA dello stesso modulo, ma una funzione
+        // libera NON è invocabile come membro di un valore: l'arco
+        // `parseInput -> validate(free fn)` sarebbe un arco che mente (era il caso
+        // reale `schema.safeParse` di Zod). Dev'essere Unresolved, non Calls.
+        // Controllo positivo nello stesso file: la call NUDA `validate()` continua a
+        // risolvere alla funzione libera — il guard colpisce SOLO l'accesso a membro.
+        // `schema: any` apposta: niente method-signature inline omonima (sarebbe un
+        // Method `validate` nel modulo che il guard match-erebbe legittimamente,
+        // confondendo il test). Specchia il reale `schema: z.ZodSchema` (tipo
+        // importato, il cui metodo vive fuori dal progetto): nel modulo l'unico
+        // `validate` è la FUNZIONE libera.
+        let src = "export function validate(x: unknown): unknown {\n  return x;\n}\n\
+                   export function parseInput(schema: any, data: unknown): unknown {\n  return schema.validate(data);\n}\n\
+                   export function callBare(): unknown {\n  return validate(1);\n}\n";
+        let parsed = parse_ts("/repo/src/v.ts", src).await;
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        let delta = resolver.resolve(&[parsed], &storage).await.unwrap();
+        let validate = find(&delta, "src::v::validate");
+        let parse_input = find(&delta, "src::v::parseInput");
+        let call_bare = find(&delta, "src::v::callBare");
+
+        // (1) Il membro foreign NON crea un arco Calls verso la funzione libera.
+        let leaked = delta.added_relations.iter().any(|r| {
+            r.kind == RelationKind::Calls
+                && r.source_id == parse_input.id
+                && r.target_id == validate.id
+        });
+        assert!(
+            !leaked,
+            "Fix #10: `schema.validate` non deve legarsi alla funzione libera omonima"
+        );
+        // L'astensione è ESPLICITA: un arco Unresolved dal chiamante, non un buco muto.
+        let abstained = delta
+            .added_relations
+            .iter()
+            .any(|r| r.kind == RelationKind::Unresolved && r.source_id == parse_input.id);
+        assert!(
+            abstained,
+            "Fix #10: l'astensione dev'essere un Unresolved onesto, non un drop silenzioso"
+        );
+
+        // (2) Controllo positivo: la call NUDA `validate()` risolve alla funzione libera.
+        let (bare_target, _) = call_from(&delta, call_bare.id);
+        assert_eq!(
+            bare_target, validate.id,
+            "una call nuda `validate()` deve ancora risolvere alla funzione libera"
+        );
     }
 
     #[tokio::test]
