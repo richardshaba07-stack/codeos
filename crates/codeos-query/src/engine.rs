@@ -127,12 +127,17 @@ impl QueryEngine {
             .collect();
         relations.extend(test_relations);
 
-        // Conta le relazioni irrisolte che partono dalle entità selezionate
-        // (per la NOTA finale).
-        let unresolved = self.count_unresolved(&selected_ids).await?;
+        // Raccoglie i BUCHI NOTI: i riferimenti che partono dalle entità
+        // selezionate e che il resolver NON ha collegato a un'entità del progetto.
+        // Il contesto li NOMINA (non li conta soltanto): un buco nascosto farebbe
+        // credere all'LLM che l'entità sia più connessa di quanto il grafo sappia
+        // — un arco mancante spacciato per completezza. È la tesi anti-falso-
+        // positivo applicata al contesto: meglio un buco nominato che un numero
+        // che lo nasconde.
+        let holes = self.collect_unresolved(&selected_ids).await?;
 
         // Passo 6 — Formattazione del contesto.
-        let formatted_context = format_context(text, &selected, &relations, &decisions, unresolved);
+        let formatted_context = format_context(text, &selected, &relations, &decisions, &holes);
 
         Ok(QueryResponse {
             formatted_context,
@@ -239,20 +244,46 @@ impl QueryEngine {
         Ok(test_relations)
     }
 
-    async fn count_unresolved(&self, selected_ids: &HashSet<EntityId>) -> anyhow::Result<usize> {
-        let mut total = 0;
+    /// Raccoglie i BUCHI NOTI delle entità selezionate: i riferimenti che il
+    /// resolver ha lasciato `Unresolved` (target ignoto). Ogni arco `Unresolved`
+    /// porta nei metadata il nome testuale originale (`unresolved_target`) e il
+    /// tipo di riferimento mancato (`original_kind`): li riportiamo così com'erano
+    /// nel sorgente, senza inventare un bersaglio. De-duplica per (sorgente,
+    /// target) e salta gli archi senza nome (non si nomina un buco che non c'è).
+    async fn collect_unresolved(
+        &self,
+        selected_ids: &HashSet<EntityId>,
+    ) -> anyhow::Result<Vec<UnresolvedHole>> {
+        let mut holes = Vec::new();
+        let mut seen: HashSet<(EntityId, String)> = HashSet::new();
         for id in selected_ids {
-            total += self
+            let rels = self
                 .storage
                 .query_relations(RelationFilter {
                     source_id: Some(*id),
                     kind: Some(RelationKind::Unresolved),
                     ..Default::default()
                 })
-                .await?
-                .len();
+                .await?;
+            for rel in rels {
+                let Some(target) = rel.metadata.get("unresolved_target") else {
+                    continue;
+                };
+                if target.is_empty() || !seen.insert((*id, target.clone())) {
+                    continue;
+                }
+                holes.push(UnresolvedHole {
+                    source_id: *id,
+                    target: target.clone(),
+                    original_kind: rel
+                        .metadata
+                        .get("original_kind")
+                        .cloned()
+                        .unwrap_or_default(),
+                });
+            }
         }
-        Ok(total)
+        Ok(holes)
     }
 }
 
@@ -261,6 +292,20 @@ struct Expansion {
     entities: HashMap<EntityId, Entity>,
     scores: HashMap<EntityId, u32>,
     relations: Vec<Relation>,
+}
+
+/// Un BUCO NOTO del contesto: un riferimento che il resolver non ha collegato a
+/// un'entità del progetto. Il contesto lo NOMINA (target testuale originale +
+/// tipo di riferimento) invece di nasconderlo — tesi anti-falso-positivo applicata
+/// al contesto: un buco nominato è meglio di un numero che lo nasconde.
+struct UnresolvedHole {
+    source_id: EntityId,
+    /// Il nome così come scritto nel sorgente (es. `schema.safeParse`), dai
+    /// metadata `unresolved_target` dell'arco. Mai inventato.
+    target: String,
+    /// Il tipo di riferimento mancato (`Calls`, `Imports`, …), dai metadata
+    /// `original_kind`. Può essere vuoto se assente.
+    original_kind: String,
 }
 
 /// Le relazioni lungo cui la BFS scende (Passo 4). Le altre (es. `Unresolved`,
@@ -391,7 +436,7 @@ fn format_context(
     entities: &[Entity],
     relations: &[Relation],
     decisions: &[Decision],
-    unresolved: usize,
+    holes: &[UnresolvedHole],
 ) -> String {
     let by_id: HashMap<EntityId, &Entity> = entities.iter().map(|e| (e.id, e)).collect();
 
@@ -446,11 +491,39 @@ fn format_context(
         }
     }
 
-    if unresolved > 0 {
-        out.push_str(&format!(
-            "\nNOTA: {unresolved} relazioni non risolte tra le entità selezionate. \
-             Verificare le dipendenze esterne.\n"
-        ));
+    // BUCHI NOTI — i riferimenti non risolti delle entità selezionate, NOMINATI.
+    // Il vecchio formato ne dava solo il NUMERO ("N relazioni non risolte"): un
+    // conteggio nasconde QUALE riferimento manca e fa sembrare l'entità più
+    // connessa di quanto il grafo sappia davvero. Qui ognuno è mostrato col suo
+    // nome originale (dal sorgente) e col tipo di riferimento mancato, ordinati
+    // per stabilità. Tesi anti-falso-positivo al livello del contesto: meglio un
+    // buco nominato che un numero che lo nasconde.
+    if !holes.is_empty() {
+        out.push_str(
+            "\nBUCHI NOTI (riferimenti non risolti a un'entità del progetto — mostrati, non nascosti):\n",
+        );
+        let mut lines: Vec<String> = holes
+            .iter()
+            .map(|h| {
+                let source = by_id
+                    .get(&h.source_id)
+                    .map(|e| e.qualified_name.as_str())
+                    .unwrap_or("?");
+                let kind = match h.original_kind.as_str() {
+                    "" => String::new(),
+                    k => format!(" ({})", k.to_lowercase()),
+                };
+                format!("- {source} → {}{kind}", h.target)
+            })
+            .collect();
+        lines.sort();
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out.push_str(
+            "  (non collegati a un'unica entità nota: da verificare, non assumere assenti)\n",
+        );
     }
 
     out
@@ -742,5 +815,53 @@ mod tests {
         assert!(response
             .formatted_context
             .contains("Nessuna entità rilevante"));
+    }
+
+    #[tokio::test]
+    async fn context_names_the_unresolved_hole_not_just_counts_it() {
+        // `parse_input` chiama `validate_external`, che NON esiste nel progetto: il
+        // resolver lascia un arco Unresolved. Il contesto deve NOMINARE quel buco
+        // (col nome del riferimento mancato), non darne solo il conteggio.
+        let storage = graph_from(
+            "ingest/parser.py",
+            "def parse_input(data):\n    return validate_external(data)\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine
+            .query(&nl("parse_input"))
+            .await
+            .unwrap()
+            .formatted_context;
+
+        assert!(
+            ctx.contains("BUCHI NOTI"),
+            "manca la sezione dei buchi noti:\n{ctx}"
+        );
+        assert!(
+            ctx.contains("validate_external"),
+            "il target non risolto dev'essere NOMINATO, non solo contato:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_holes_section_when_every_reference_resolves() {
+        // Qui ogni chiamata si risolve (`login` → `verify_password`, entrambi nel
+        // progetto): non esistono buchi, quindi la sezione non deve comparire — non
+        // si annuncia un'incertezza che non c'è.
+        let storage = graph_from(
+            "auth.py",
+            "def verify_password():\n    pass\n\ndef login():\n    verify_password()\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine.query(&nl("login")).await.unwrap().formatted_context;
+
+        assert!(
+            !ctx.contains("BUCHI NOTI"),
+            "tutto è risolto: la sezione dei buchi non deve comparire:\n{ctx}"
+        );
     }
 }
