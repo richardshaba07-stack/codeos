@@ -13,4 +13,4 @@ mod actor;
 mod engine;
 
 pub use actor::QueryActor;
-pub use engine::{QueryConfig, QueryEngine};
+pub use engine::{CallPath, QueryConfig, QueryEngine};

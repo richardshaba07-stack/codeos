@@ -285,6 +285,107 @@ impl QueryEngine {
         }
         Ok(holes)
     }
+
+    /// Cerca il **cammino di chiamata** più corto da `from` a `to` seguendo SOLO
+    /// archi `Calls` RISOLTI (target non-nil). BFS diretta con tracciamento del
+    /// padre: il primo cammino trovato è anche il più corto.
+    ///
+    /// È il livello L2 del context builder (pilastro 3) ridotto alla sua primitiva
+    /// onesta. Due garanzie anti-falso-positivo, per costruzione:
+    /// - `Some(path)` ⇒ OGNI passo consecutivo è una chiamata reale e già risolta
+    ///   dal grafo — il cammino non attraversa MAI un arco indovinato, non può mentire;
+    /// - `None` ⇒ non esiste cammino nel grafo di chiamate NOTO. È un "non lo so"
+    ///   onesto: gli archi non risolti sono marcati `Unresolved` (mai fabbricati),
+    ///   perciò un `None` riflette il confine reale della conoscenza, non lo nasconde.
+    ///
+    /// Non filtra le entità esterne: se il grafo ha risolto una chiamata verso una
+    /// dipendenza esterna, quel passo è reale e va mostrato — escluderlo
+    /// nasconderebbe un pezzo vero del cammino.
+    pub async fn call_path(
+        &self,
+        from: EntityId,
+        to: EntityId,
+    ) -> anyhow::Result<Option<CallPath>> {
+        // Un'entità "raggiunge" se stessa con un cammino banale di un solo passo.
+        if from == to {
+            return Ok(self
+                .storage
+                .get_entity_by_id(&from)
+                .await?
+                .map(|e| CallPath { steps: vec![e] }));
+        }
+
+        // BFS diretta sugli archi `Calls` risolti, tracciando il padre di ogni
+        // nodo per ricostruire il cammino una volta raggiunto `to`.
+        let mut parent: HashMap<EntityId, EntityId> = HashMap::new();
+        let mut visited: HashSet<EntityId> = HashSet::new();
+        visited.insert(from);
+        let mut queue: VecDeque<EntityId> = VecDeque::new();
+        queue.push_back(from);
+
+        let mut reached = false;
+        while let Some(id) = queue.pop_front() {
+            if id == to {
+                reached = true;
+                break;
+            }
+            let calls = self
+                .storage
+                .query_relations(RelationFilter {
+                    source_id: Some(id),
+                    kind: Some(RelationKind::Calls),
+                    ..Default::default()
+                })
+                .await?;
+            for rel in calls {
+                // Difensivo: un arco `Calls` ha sempre un target risolto (gli ignoti
+                // sono `Unresolved`), ma non ci fidiamo di un nil scritto per errore.
+                if rel.target_id.is_nil() {
+                    continue;
+                }
+                if visited.insert(rel.target_id) {
+                    parent.insert(rel.target_id, id);
+                    queue.push_back(rel.target_id);
+                }
+            }
+        }
+
+        if !reached {
+            return Ok(None);
+        }
+
+        // Risali la catena dei padri da `to` a `from`, poi inverti.
+        let mut ids = vec![to];
+        let mut cur = to;
+        while cur != from {
+            let p = parent[&cur];
+            ids.push(p);
+            cur = p;
+        }
+        ids.reverse();
+
+        // Materializza le entità nell'ordine del cammino. Se un nodo non è più nel
+        // grafo, NON restituiamo un cammino monco e bugiardo: nessun cammino.
+        let mut steps = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.storage.get_entity_by_id(&id).await? {
+                Some(entity) => steps.push(entity),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(CallPath { steps }))
+    }
+}
+
+/// Un **cammino di chiamata** onesto: la sequenza ordinata di entità da una
+/// sorgente a una destinazione dove OGNI passo consecutivo è un arco `Calls`
+/// risolto del grafo. `steps.first()` è la sorgente, `steps.last()` la
+/// destinazione. Restituito SOLO quando il cammino esiste davvero nel grafo di
+/// chiamate noto: non contiene mai un passo indovinato — tesi anti-falso-positivo
+/// applicata al livello L2 del context builder.
+#[derive(Debug, Clone)]
+pub struct CallPath {
+    pub steps: Vec<Entity>,
 }
 
 /// Risultato dell'espansione BFS, prima della selezione finale.
@@ -558,6 +659,20 @@ mod tests {
         QueryRequest::NaturalLanguage {
             text: text.to_string(),
         }
+    }
+
+    /// Recupera l'id dell'entità il cui qualified_name termina con `suffix`
+    /// (es. `"::handler"`), per ancorare i test del cammino di chiamata.
+    async fn id_of(storage: &Arc<SqliteStorage>, suffix: &str) -> EntityId {
+        let pattern = suffix.trim_start_matches(':');
+        storage
+            .find_entities_by_name_pattern(pattern)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.qualified_name.ends_with(suffix))
+            .unwrap_or_else(|| panic!("attesa un'entità che termina con {suffix}"))
+            .id
     }
 
     #[test]
@@ -862,6 +977,122 @@ mod tests {
         assert!(
             !ctx.contains("BUCHI NOTI"),
             "tutto è risolto: la sezione dei buchi non deve comparire:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_path_finds_the_direct_call() {
+        // `handler` chiama `service`: il cammino è esattamente handler → service.
+        let storage = graph_from(
+            "app.py",
+            "def service():\n    pass\n\ndef handler():\n    service()\n",
+        )
+        .await;
+        let handler = id_of(&storage, "::handler").await;
+        let service = id_of(&storage, "::service").await;
+        let engine = QueryEngine::new(storage);
+
+        let path = engine
+            .call_path(handler, service)
+            .await
+            .unwrap()
+            .expect("atteso un cammino handler → service");
+        let names: Vec<&str> = path
+            .steps
+            .iter()
+            .map(|e| e.qualified_name.as_str())
+            .collect();
+        assert_eq!(path.steps.len(), 2, "cammino diretto = 2 passi: {names:?}");
+        assert!(
+            names[0].ends_with("::handler"),
+            "il primo passo è la sorgente: {names:?}"
+        );
+        assert!(
+            names[1].ends_with("::service"),
+            "l'ultimo passo è la destinazione: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_path_follows_a_transitive_chain() {
+        // handler → service → repo: il cammino attraversa il passo intermedio.
+        let storage = graph_from(
+            "app.py",
+            "def repo():\n    pass\n\ndef service():\n    repo()\n\ndef handler():\n    service()\n",
+        )
+        .await;
+        let handler = id_of(&storage, "::handler").await;
+        let repo = id_of(&storage, "::repo").await;
+        let engine = QueryEngine::new(storage);
+
+        let path = engine
+            .call_path(handler, repo)
+            .await
+            .unwrap()
+            .expect("atteso un cammino handler → service → repo");
+        let names: Vec<String> = path
+            .steps
+            .iter()
+            .map(|e| e.qualified_name.clone())
+            .collect();
+        assert_eq!(
+            path.steps.len(),
+            3,
+            "cammino transitivo = 3 passi: {names:?}"
+        );
+        assert!(names[0].ends_with("::handler"), "sorgente: {names:?}");
+        assert!(
+            names[1].ends_with("::service"),
+            "passo intermedio: {names:?}"
+        );
+        assert!(names[2].ends_with("::repo"), "destinazione: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn call_path_is_none_when_no_call_chain_exists() {
+        // Due funzioni che non si chiamano: nessun cammino noto ⇒ None onesto, mai
+        // un cammino inventato per "accontentare" la domanda.
+        let storage = graph_from(
+            "app.py",
+            "def handler():\n    pass\n\ndef orphan():\n    pass\n",
+        )
+        .await;
+        let handler = id_of(&storage, "::handler").await;
+        let orphan = id_of(&storage, "::orphan").await;
+        let engine = QueryEngine::new(storage);
+
+        let path = engine.call_path(handler, orphan).await.unwrap();
+        assert!(
+            path.is_none(),
+            "nessuna chiamata tra le due ⇒ nessun cammino: {:?}",
+            path.map(|p| p
+                .steps
+                .iter()
+                .map(|e| e.qualified_name.clone())
+                .collect::<Vec<_>>())
+        );
+    }
+
+    #[tokio::test]
+    async fn call_path_does_not_bridge_an_unresolved_hop() {
+        // Il cuore anti-falso-positivo del livello L2: `handler` FA una chiamata, ma
+        // a `missing_external` (fuori dal progetto ⇒ arco `Unresolved`). Non esiste
+        // alcun cammino RISOLTO handler → target, quindi il risultato è None: la
+        // ricerca non scavalca MAI un buco per fabbricare un collegamento.
+        let storage = graph_from(
+            "app.py",
+            "def target():\n    pass\n\ndef handler():\n    missing_external()\n",
+        )
+        .await;
+        let handler = id_of(&storage, "::handler").await;
+        let target = id_of(&storage, "::target").await;
+        let engine = QueryEngine::new(storage);
+
+        let path = engine.call_path(handler, target).await.unwrap();
+        assert!(
+            path.is_none(),
+            "l'unica chiamata di handler è Unresolved: nessun cammino verso target, \
+             non un collegamento inventato"
         );
     }
 }
