@@ -5,7 +5,7 @@
 //! briefing, incluso il Passo 3: il *perché* (le [`Decision`] del Memory Engine
 //! agganciate alle entità selezionate) viene iniettato nel contesto.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use codeos_memory::{Decision, DecisionStore, InMemoryDecisionStore};
@@ -1513,6 +1513,60 @@ fn format_context(
     let mut out = String::new();
     out.push_str(&format!("Contesto per: \"{text}\"\n\n"));
 
+    // Livello L0 — PANORAMICA: la forma architetturale a colpo d'occhio. Su quali
+    // moduli (file) del PROGETTO si distribuisce il sottografo rilevante, e come
+    // dipendono l'uno dall'altro (archi entità→entità aggregati a file→file, solo
+    // cross-file). È l'overview AGGREGATA che FILE RILEVANTI (elenco di entità) e
+    // DIPENDENZE CHIAVE (archi tra entità) non danno. Le dipendenze ESTERNE
+    // (`ExternalDependency`) sono ESCLUSE: non sono moduli del progetto, e contarle
+    // come un pseudo-modulo «<external>» falserebbe la mappa — la loro presenza è già
+    // visibile a livello di entità. Compare solo se il sottografo tocca ≥2 moduli del
+    // progetto. Riflette le entità MOSTRATE (se il passo Compress ne ha omesse, FILE
+    // RILEVANTI lo dichiara).
+    {
+        let mut per_file: BTreeMap<&str, usize> = BTreeMap::new();
+        for e in entities {
+            if e.kind == EntityKind::ExternalDependency {
+                continue;
+            }
+            *per_file.entry(e.location.file_path.as_str()).or_insert(0) += 1;
+        }
+        if per_file.len() >= 2 {
+            out.push_str("PANORAMICA (i moduli del progetto su cui si distribuisce il sottografo rilevante):\n");
+            // Moduli per numero di entità rilevanti (desc), poi per nome: il più
+            // centrale in testa, ordine deterministico.
+            let mut files: Vec<(&str, usize)> = per_file.into_iter().collect();
+            files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            for (file, count) in &files {
+                out.push_str(&format!("- {file} ({count} entità rilevanti)\n"));
+            }
+            // Dipendenze tra moduli del progetto: archi cross-file fra entità non
+            // esterne. Gli archi verso `ExternalDependency` non sono dipendenze TRA
+            // moduli del progetto e restano fuori.
+            let mut edges: BTreeSet<(&str, &str)> = BTreeSet::new();
+            for rel in relations {
+                if let (Some(s), Some(t)) = (by_id.get(&rel.source_id), by_id.get(&rel.target_id)) {
+                    if s.kind == EntityKind::ExternalDependency
+                        || t.kind == EntityKind::ExternalDependency
+                    {
+                        continue;
+                    }
+                    let (sf, tf) = (s.location.file_path.as_str(), t.location.file_path.as_str());
+                    if sf != tf {
+                        edges.insert((sf, tf));
+                    }
+                }
+            }
+            if !edges.is_empty() {
+                out.push_str("  dipendenze tra moduli:\n");
+                for (s, t) in &edges {
+                    out.push_str(&format!("  - {s} → {t}\n"));
+                }
+            }
+            out.push('\n');
+        }
+    }
+
     out.push_str("FILE RILEVANTI:\n");
     for entity in entities {
         out.push_str(&format!(
@@ -1889,6 +1943,22 @@ mod tests {
         Arc::new(storage)
     }
 
+    /// Variante MULTI-FILE: risolve insieme più file Python (per testare la
+    /// PANORAMICA, che ha senso solo su un sottografo che spazia su ≥2 moduli).
+    async fn graph_from_files(files: &[(&str, &str)]) -> Arc<SqliteStorage> {
+        let mut parsed = Vec::new();
+        for (path, src) in files {
+            parsed.push(PythonParser::new().parse_file(Path::new(path), src).await);
+        }
+        let storage = SqliteStorage::in_memory().unwrap();
+        let delta = GraphResolver::new(None)
+            .resolve(&parsed, &storage)
+            .await
+            .unwrap();
+        storage.apply_delta(delta).await.unwrap();
+        Arc::new(storage)
+    }
+
     /// Variante TypeScript: serve dove conta il guard "Fix #10" (un membro su
     /// receiver foreign deve restare `Unresolved`, non legarsi a una funzione libera
     /// omonima). Passa una project-root così i nomi qualificati sono `src::…::…`.
@@ -2233,6 +2303,58 @@ mod tests {
         assert!(
             !ctx.contains("OMESSE"),
             "niente da comprimere: nessuna nota d'omissione:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn panorama_lists_the_modules_when_the_subgraph_spans_several() {
+        // Il livello L0. La keyword combacia con un'entità in DUE file diversi:
+        // il sottografo rilevante spazia su 2 moduli, e la PANORAMICA li deve
+        // nominare aggregati (l'ampiezza che FILE RILEVANTI dà solo entità per entità).
+        let storage = graph_from_files(&[
+            ("auth.py", "def auth_service():\n    pass\n"),
+            ("data.py", "def data_service():\n    pass\n"),
+        ])
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine
+            .query(&nl("service"))
+            .await
+            .unwrap()
+            .formatted_context;
+
+        assert!(
+            ctx.contains("PANORAMICA"),
+            "il sottografo tocca 2 moduli: deve esserci la PANORAMICA L0:\n{ctx}"
+        );
+        let panorama = ctx
+            .split("PANORAMICA")
+            .nth(1)
+            .expect("la sezione PANORAMICA è appena stata verificata presente");
+        assert!(
+            panorama.contains("auth.py") && panorama.contains("data.py"),
+            "la PANORAMICA deve elencare ENTRAMBI i moduli:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_panorama_section_for_a_single_module() {
+        // Tutto in un file solo: la PANORAMICA (overview tra moduli) non aggiungerebbe
+        // nulla a FILE RILEVANTI ⇒ non deve comparire. Anti-rumore, come le altre
+        // sezioni che appaiono solo quando portano informazione.
+        let storage = graph_from(
+            "app.py",
+            "def alpha():\n    pass\n\ndef beta():\n    alpha()\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine.query(&nl("beta")).await.unwrap().formatted_context;
+
+        assert!(
+            !ctx.contains("PANORAMICA"),
+            "un solo modulo: niente sezione PANORAMICA d'eco:\n{ctx}"
         );
     }
 
