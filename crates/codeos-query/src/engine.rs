@@ -30,6 +30,11 @@ const IMPACT_FOCUS_ENTITIES: usize = 3;
 /// (`new`, `get`) ne genererebbe a decine. Li tronciamo con un conteggio onesto
 /// del residuo, invece di inondare la context window o di nasconderli del tutto.
 const MAX_POSSIBLE_PER_ENTITY: usize = 5;
+/// Tetto ai chiamanti CONFERMATI (diretti + transitivi) mostrati per entità nel
+/// contesto. Ora che includono i chiamanti a più hop, possono essere molti su
+/// un'entità molto usata; li tronciamo coi PIÙ VICINI in testa (sono ordinati per
+/// distanza) e un conteggio onesto del residuo — mai inondare, mai nascondere.
+const MAX_CONFIRMED_CALLERS: usize = 8;
 /// Quante entità chiave collegare all'entità centrale coi PERCORSI DI CHIAMATA
 /// (catene `Calls` in avanti). Come [`IMPACT_FOCUS_ENTITIES`], tenuto piccolo:
 /// ogni target costa una BFS sugli archi del grafo, e i percorsi sono contorno
@@ -337,16 +342,20 @@ impl QueryEngine {
     }
 
     /// Raccoglie il RAGGIO D'IMPATTO reverse per le prime [`IMPACT_FOCUS_ENTITIES`]
-    /// entità (le più rilevanti, già ordinate per punteggio): chi le CHIAMA, fuori
-    /// dal sottografo già selezionato. È la metà che la BFS in avanti non vede.
+    /// entità (le più rilevanti, già ordinate per punteggio): chi le CHIAMA — sia
+    /// DIRETTAMENTE sia a TRANSITIVE distanze — fuori dal sottografo già selezionato.
+    /// È la metà che la BFS in avanti non vede, e ora a TUTTA la sua profondità: se
+    /// `A → B → X`, toccare X impatta anche A, e il contesto deve dirlo.
     ///
-    /// Tesi anti-falso-positivo, qui in due modi: (1) escludiamo i chiamanti già
-    /// selezionati — sono visibili in DIPENDENZE CHIAVE, ripeterli gonfierebbe il
-    /// contesto senza aggiungere nulla; (2) teniamo i chiamanti CONFERMATI distinti
-    /// dai POSSIBILI (riferimenti non risolti omonimi) ereditando la separazione da
-    /// [`QueryEngine::impact`], e tronciamo i possibili a un tetto onesto registrando
-    /// quanti ne restano — mai inondare, mai nascondere. Le liste sono ordinate per
-    /// nome così l'output è stabile e il troncamento deterministico.
+    /// Tesi anti-falso-positivo, qui in tre modi: (1) escludiamo i chiamanti già
+    /// selezionati — sono visibili in DIPENDENZE CHIAVE / FILE RILEVANTI, ripeterli
+    /// gonfierebbe il contesto; (2) i CONFERMATI (da [`QueryEngine::impact_transitive`],
+    /// ogni hop un arco `Calls` risolto) restano distinti dai POSSIBILI (riferimenti
+    /// non risolti omonimi, da [`QueryEngine::impact`], solo 1 hop — i match-di-nome non
+    /// si compongono transitivamente senza mentire), e ogni confermato porta la sua
+    /// distanza in hop; (3) tronciamo confermati e possibili a tetti onesti registrando
+    /// quanti ne restano, e propaghiamo `depth_capped` quando il raggio è stato tagliato
+    /// dalla profondità massima — mai inondare la context window, mai nascondere.
     async fn collect_impact(
         &self,
         selected: &[Entity],
@@ -354,22 +363,33 @@ impl QueryEngine {
     ) -> anyhow::Result<Vec<ImpactSummary>> {
         let mut summaries = Vec::new();
         for entity in selected.iter().take(IMPACT_FOCUS_ENTITIES) {
-            let Some(impact) = self.impact(entity.id).await? else {
-                continue;
+            // CONFERMATI — chiamanti diretti E transitivi col loro hop, fuori dal set
+            // già selezionato. Già ordinati per (distanza, nome) dalla capability:
+            // il filtro preserva l'ordine, quindi il troncamento tiene i PIÙ VICINI.
+            let (mut confirmed, depth_capped) = match self.impact_transitive(entity.id).await? {
+                Some(ti) => (
+                    ti.callers
+                        .into_iter()
+                        .filter(|c| !selected_ids.contains(&c.entity.id))
+                        .collect::<Vec<TransitiveCaller>>(),
+                    ti.depth_capped,
+                ),
+                None => (Vec::new(), false),
             };
+            let confirmed_truncated = confirmed.len().saturating_sub(MAX_CONFIRMED_CALLERS);
+            confirmed.truncate(MAX_CONFIRMED_CALLERS);
 
-            let mut confirmed: Vec<Entity> = impact
-                .confirmed_callers
-                .into_iter()
-                .filter(|c| !selected_ids.contains(&c.id))
-                .collect();
-            confirmed.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
-
-            let mut possible: Vec<PossibleCaller> = impact
-                .possible_callers
-                .into_iter()
-                .filter(|p| !selected_ids.contains(&p.source.id))
-                .collect();
+            // POSSIBILI — solo i riferimenti non risolti omonimi (1 hop, da `impact`),
+            // fuori dal set. La transitività NON li tocca: un possibile-di-un-possibile
+            // sarebbe congettura al quadrato.
+            let mut possible: Vec<PossibleCaller> = match self.impact(entity.id).await? {
+                Some(im) => im
+                    .possible_callers
+                    .into_iter()
+                    .filter(|p| !selected_ids.contains(&p.source.id))
+                    .collect(),
+                None => Vec::new(),
+            };
             possible.sort_by(|a, b| a.source.qualified_name.cmp(&b.source.qualified_name));
             let possible_truncated = possible.len().saturating_sub(MAX_POSSIBLE_PER_ENTITY);
             possible.truncate(MAX_POSSIBLE_PER_ENTITY);
@@ -382,6 +402,8 @@ impl QueryEngine {
             summaries.push(ImpactSummary {
                 entity: entity.clone(),
                 confirmed,
+                confirmed_truncated,
+                depth_capped,
                 possible,
                 possible_truncated,
             });
@@ -1076,16 +1098,20 @@ struct UnresolvedHole {
     original_kind: String,
 }
 
-/// Il RAGGIO D'IMPATTO reverse di UNA entità chiave: chi la chiama, fuori dal
-/// sottografo già selezionato. È ciò che la BFS in avanti (callee → callee) non
-/// può strutturalmente mostrare. Eredita da [`Impact`] la separazione fra
-/// `confirmed` (archi `Calls` risolti) e `possible` (riferimenti `Unresolved`
-/// omonimi, non confermati): il confine fra certo e sospetto resta visibile nel
-/// contesto. `possible_truncated` conta i possibili scartati dal tetto, così il
-/// troncamento è onesto invece che silenzioso.
+/// Il RAGGIO D'IMPATTO reverse di UNA entità chiave: chi la chiama — direttamente e
+/// a distanze TRANSITIVE — fuori dal sottografo già selezionato. È ciò che la BFS in
+/// avanti (callee → callee) non può strutturalmente mostrare. Mantiene la separazione
+/// fra `confirmed` (chiamanti certi, ognuno con la sua distanza in hop: ogni passo è
+/// un arco `Calls` risolto) e `possible` (riferimenti `Unresolved` omonimi, non
+/// confermati, solo 1 hop): il confine fra certo e sospetto resta visibile nel
+/// contesto. `confirmed_truncated`/`possible_truncated` contano gli scartati dai
+/// tetti e `depth_capped` segnala se il raggio è stato tagliato dalla profondità
+/// massima — il troncamento è onesto invece che silenzioso.
 struct ImpactSummary {
     entity: Entity,
-    confirmed: Vec<Entity>,
+    confirmed: Vec<TransitiveCaller>,
+    confirmed_truncated: usize,
+    depth_capped: bool,
     possible: Vec<PossibleCaller>,
     possible_truncated: usize,
 }
@@ -1277,23 +1303,45 @@ fn format_context(
 
     // Passo 5.5 — IMPATTO reverse. DIPENDENZE CHIAVE qui sopra mostra da COSA
     // dipendono le entità (archi in avanti, callee); questa sezione mostra il
-    // rovescio — CHI le chiama — che la BFS in avanti non può vedere. Compare solo
-    // quando c'è davvero un chiamante esterno al sottografo: niente sezione vuota.
-    // Tesi anti-falso-positivo resa visibile: i chiamanti CONFERMATI (`-`, arco
-    // `Calls` risolto) restano distinti dai POSSIBILI (`?`, sola corrispondenza di
-    // nome su un riferimento non risolto), e il troncamento dei possibili è contato,
-    // mai silenzioso.
+    // rovescio — CHI le chiama, DIRETTAMENTE e a distanze TRANSITIVE — che la BFS in
+    // avanti non può vedere. Compare solo quando c'è davvero un chiamante esterno al
+    // sottografo: niente sezione vuota. Tesi anti-falso-positivo resa visibile: i
+    // chiamanti CONFERMATI (`-`, ogni hop un arco `Calls` risolto; gli indiretti con
+    // la loro distanza «a N hop») restano distinti dai POSSIBILI (`?`, sola
+    // corrispondenza di nome su un riferimento non risolto), e i troncamenti — sui
+    // confermati lontani, sui possibili, e il tetto di profondità — sono contati, mai
+    // silenziosi.
     if !impacts.is_empty() {
         out.push_str(
             "\nIMPATTO (chi CHIAMA le entità chiave — il rovescio delle DIPENDENZE CHIAVE):\n",
         );
+        let mut any_indirect = false;
         for summary in impacts {
             out.push_str(&format!(
                 "- {} ← chiamato da:\n",
                 summary.entity.qualified_name
             ));
             for caller in &summary.confirmed {
-                out.push_str(&format!("    - {}\n", caller.qualified_name));
+                if caller.hops <= 1 {
+                    out.push_str(&format!("    - {}\n", caller.entity.qualified_name));
+                } else {
+                    any_indirect = true;
+                    out.push_str(&format!(
+                        "    - {} (a {} hop)\n",
+                        caller.entity.qualified_name, caller.hops
+                    ));
+                }
+            }
+            if summary.confirmed_truncated > 0 {
+                out.push_str(&format!(
+                    "    - (+{} altri chiamanti più lontani)\n",
+                    summary.confirmed_truncated
+                ));
+            }
+            if summary.depth_capped {
+                out.push_str(&format!(
+                    "    - (… e oltre {MAX_IMPACT_DEPTH} hop il raggio continua, non elencato)\n"
+                ));
             }
             for caller in &summary.possible {
                 out.push_str(&format!(
@@ -1308,8 +1356,12 @@ fn format_context(
                 ));
             }
         }
+        out.push_str("  («-» chiamante confermato da arco `Calls`;");
+        if any_indirect {
+            out.push_str(" «(a N hop)» = confermato ma indiretto (N chiamate di distanza);");
+        }
         out.push_str(
-            "  («-» chiamante confermato da arco `Calls`; «?» solo corrispondenza di nome su un\n   riferimento non risolto, da verificare — non è prova di chiamata.)\n",
+            " «?» solo corrispondenza di nome su\n   un riferimento non risolto, da verificare — non è prova di chiamata.)\n",
         );
     }
 
@@ -1975,6 +2027,72 @@ mod tests {
         assert!(
             !ctx.contains("IMPATTO"),
             "l'unico chiamante (login) è già nel contesto: niente sezione IMPATTO d'eco:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn impatto_surfaces_transitive_callers_with_their_distance() {
+        // L'integrazione del raggio TRANSITIVO in `query()`. `target` (l'unico seme)
+        // non chiama nulla, quindi la BFS in avanti seleziona solo lui: `direct` e
+        // `indirect` sono chiamanti A MONTE, NON selezionati. `direct` lo chiama a 1
+        // hop, `indirect` lo raggiunge a 2 (indirect → direct → target). Senza il
+        // transitivo, `indirect` non comparirebbe MAI nel contesto: è proprio la
+        // sezione IMPATTO, ora a tutta profondità, a renderlo visibile con la sua
+        // distanza.
+        let storage = graph_from(
+            "app.py",
+            "def target():\n    pass\n\n\
+             def direct():\n    target()\n\n\
+             def indirect():\n    direct()\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine.query(&nl("target")).await.unwrap().formatted_context;
+
+        assert!(ctx.contains("IMPATTO"), "manca la sezione IMPATTO:\n{ctx}");
+        let impatto = ctx
+            .split("IMPATTO")
+            .nth(1)
+            .expect("la sezione IMPATTO è appena stata verificata presente");
+        assert!(
+            impatto.contains("::indirect"),
+            "il chiamante transitivo `indirect` deve comparire sotto IMPATTO:\n{ctx}"
+        );
+        assert!(
+            impatto.contains("(a 2 hop)"),
+            "il chiamante transitivo deve portare la sua distanza in hop:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn impatto_does_not_annotate_distance_when_callers_are_only_direct() {
+        // `target` è chiamato SOLO direttamente (da `caller`, a 1 hop): non esiste
+        // alcun chiamante transitivo. La sezione deve mostrare il chiamante diretto
+        // senza alcuna annotazione di distanza — niente `(a N hop)` inventato, e la
+        // legenda non spiega un marcatore indiretto che non compare. È la prova che il
+        // livello transitivo è additivo e onesto: distanza solo dove c'è davvero.
+        let storage = graph_from(
+            "app.py",
+            "def target():\n    pass\n\ndef caller():\n    target()\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine.query(&nl("target")).await.unwrap().formatted_context;
+
+        assert!(ctx.contains("IMPATTO"), "manca la sezione IMPATTO:\n{ctx}");
+        let impatto = ctx
+            .split("IMPATTO")
+            .nth(1)
+            .expect("la sezione IMPATTO è appena stata verificata presente");
+        assert!(
+            impatto.contains("::caller"),
+            "il chiamante diretto dev'essere elencato:\n{ctx}"
+        );
+        assert!(
+            !impatto.contains("(a "),
+            "nessun chiamante transitivo ⇒ nessuna annotazione di distanza:\n{ctx}"
         );
     }
 
