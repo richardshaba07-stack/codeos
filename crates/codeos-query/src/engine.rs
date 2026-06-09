@@ -20,6 +20,14 @@ use codeos_types::{Entity, EntityId, EntityKind, Relation, RelationKind};
 const DEFAULT_MAX_DEPTH: u32 = 3;
 /// Numero massimo di entità nel sottografo, per non sforare la context window.
 const DEFAULT_MAX_ENTITIES: usize = 50;
+/// Budget in CARATTERI del contesto generato (passo "Compress" della pipeline
+/// Gather-Select-Structure-Compress). È una soglia volutamente alta: non tocca le
+/// query normali, ma su un sottografo ricco impedisce al contesto di gonfiarsi
+/// oltre la finestra utile dell'LLM. Quando scatta, si tagliano le entità MENO
+/// rilevanti (in coda all'ordine di rilevanza) e lo si DICHIARA — mai un taglio
+/// silenzioso. "Caratteri" e non "token": è un proxy onesto, non una stima di
+/// tokenizzazione che fingerebbe una precisione che non ho.
+const DEFAULT_MAX_CONTEXT_CHARS: usize = 8000;
 /// Quante entità chiave (le più rilevanti) analizzare per il raggio d'impatto
 /// reverse (chi le chiama). Tenuto piccolo: l'impatto è informazione di contorno
 /// sulle entità centrali, non su tutto il sottografo — e ogni analisi costa una
@@ -65,6 +73,9 @@ const MAX_PATH_LEN: usize = 8;
 pub struct QueryConfig {
     pub max_depth: u32,
     pub max_entities: usize,
+    /// Budget in caratteri del contesto generato (passo "Compress"). Oltre questo,
+    /// le entità meno rilevanti vengono omesse e l'omissione è dichiarata.
+    pub max_context_chars: usize,
 }
 
 impl Default for QueryConfig {
@@ -72,6 +83,7 @@ impl Default for QueryConfig {
         Self {
             max_depth: DEFAULT_MAX_DEPTH,
             max_entities: DEFAULT_MAX_ENTITIES,
+            max_context_chars: DEFAULT_MAX_CONTEXT_CHARS,
         }
     }
 }
@@ -196,8 +208,13 @@ impl QueryEngine {
         // cammini multi-hop — un cammino diretto è già una riga di DIPENDENZE CHIAVE.
         let call_paths = self.collect_call_paths(&selected).await?;
 
-        // Passo 6 — Formattazione del contesto.
-        let formatted_context = format_context(
+        // Passo 6 — Formattazione del contesto. Passo 7 — COMPRESS: se il testo
+        // sfora il budget, si tagliano le entità meno rilevanti (in coda all'ordine)
+        // e l'omissione è dichiarata. È il passo "Compress" della pipeline
+        // Gather-Select-Structure-Compress, applicato con la stessa onestà del resto:
+        // un taglio NOMINATO è meglio di un contesto gonfio o di un troncamento muto.
+        let formatted_context = compress_context(
+            self.config.max_context_chars,
             text,
             &selected,
             &relations,
@@ -1204,6 +1221,7 @@ struct Expansion {
 /// un'entità del progetto. Il contesto lo NOMINA (target testuale originale +
 /// tipo di riferimento) invece di nasconderlo — tesi anti-falso-positivo applicata
 /// al contesto: un buco nominato è meglio di un numero che lo nasconde.
+#[derive(Clone)]
 struct UnresolvedHole {
     source_id: EntityId,
     /// Il nome così come scritto nel sorgente (es. `schema.safeParse`), dai
@@ -1223,6 +1241,7 @@ struct UnresolvedHole {
 /// contesto. `confirmed_truncated`/`possible_truncated` contano gli scartati dai
 /// tetti e `depth_capped` segnala se il raggio è stato tagliato dalla profondità
 /// massima — il troncamento è onesto invece che silenzioso.
+#[derive(Clone)]
 struct ImpactSummary {
     entity: Entity,
     confirmed: Vec<TransitiveCaller>,
@@ -1237,6 +1256,7 @@ struct ImpactSummary {
 /// [`MAX_ROUTES_PER_TARGET`], dal più corto); `more` conta le vie ulteriori trovate
 /// ma non mostrate, così il troncamento è onesto invece che silenzioso. Tutte le vie
 /// di un gruppo condividono la stessa destinazione (`routes[*].steps.last()`).
+#[derive(Clone)]
 struct TargetRoutes {
     routes: Vec<CallPath>,
     more: usize,
@@ -1385,7 +1405,99 @@ fn empty_decisions() -> Arc<dyn DecisionStore> {
     Arc::new(InMemoryDecisionStore::new())
 }
 
-/// Passo 6: genera il prompt strutturato per l'LLM.
+/// Passo 7 — **COMPRESS**: se il contesto sfora `max_chars`, tiene solo le prime `k`
+/// entità più rilevanti (l'ordine di `select_top`) che ci stanno, e CON loro restringe
+/// tutte le sezioni per-entità. È il passo finale della pipeline
+/// Gather-Select-Structure-Compress.
+///
+/// **Perché restringere l'INTERO sottografo a top-k, non solo l'elenco entità**
+/// (lezione di una verifica su codice reale): tagliare solo FILE RILEVANTI lasciava
+/// la sezione BUCHI NOTI a piena dimensione — su un file vero domina lei, coi suoi
+/// riferimenti non risolti — e si finiva per omettere 49 entità su 50 recuperando
+/// pochi caratteri, con una nota fuorviante. Qui invece, per ogni `k`, si filtrano
+/// AL sottoinsieme top-k anche i buchi (per sorgente), l'impatto (per entità) e i
+/// percorsi (per destinazione): così ogni sezione si restringe COERENTEMENTE, e il
+/// contesto compresso è un sottografo più piccolo ma bilanciato, non uno mutilato.
+/// Le relazioni si filtrano già da sole (il `by_id` di `format_context` salta gli
+/// archi verso entità non mostrate). DECISIONI resta (è il "perché", non scala con le
+/// entità ed è già a tetto).
+///
+/// La lunghezza è monotòna non-decrescente in `k`, quindi una ricerca binaria trova
+/// il massimo `k` entro il budget. Onestà: il taglio è sempre DICHIARATO (la nota in
+/// FILE RILEVANTI); se persino una sola entità sfora, la si mostra comunque (un
+/// contesto vuoto è inutile) — il budget è una soglia morbida, non una censura.
+#[allow(clippy::too_many_arguments)]
+fn compress_context(
+    max_chars: usize,
+    text: &str,
+    entities: &[Entity],
+    relations: &[Relation],
+    decisions: &[Decision],
+    holes: &[UnresolvedHole],
+    impacts: &[ImpactSummary],
+    call_paths: &[TargetRoutes],
+) -> String {
+    let total = entities.len();
+    // Formatta il sottografo delle prime `k` entità, restringendo OGNI sezione
+    // per-entità al loro insieme così che tutto scali insieme a `k`.
+    let render = |k: usize| -> String {
+        let kept: HashSet<EntityId> = entities[..k].iter().map(|e| e.id).collect();
+        let holes_k: Vec<UnresolvedHole> = holes
+            .iter()
+            .filter(|h| kept.contains(&h.source_id))
+            .cloned()
+            .collect();
+        let impacts_k: Vec<ImpactSummary> = impacts
+            .iter()
+            .filter(|s| kept.contains(&s.entity.id))
+            .cloned()
+            .collect();
+        let paths_k: Vec<TargetRoutes> = call_paths
+            .iter()
+            .filter(|g| {
+                g.routes
+                    .first()
+                    .and_then(|p| p.steps.last())
+                    .is_some_and(|e| kept.contains(&e.id))
+            })
+            .cloned()
+            .collect();
+        format_context(
+            text,
+            &entities[..k],
+            relations,
+            decisions,
+            &holes_k,
+            &impacts_k,
+            &paths_k,
+            total - k,
+        )
+    };
+
+    let full = render(total); // k == total ⇒ omitted 0, nessuna nota
+    if full.len() <= max_chars || total <= 1 {
+        return full;
+    }
+
+    // Ricerca binaria del massimo k ∈ [1, total-1] entro il budget (la nota
+    // d'omissione è inclusa nella misura, così il risultato la conta).
+    let (mut lo, mut hi) = (1usize, total - 1);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if render(mid).len() <= max_chars {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    render(lo)
+}
+
+/// Passo 6: genera il prompt strutturato per l'LLM. `omitted` è il numero di entità
+/// MENO rilevanti tagliate dal passo "Compress" (0 quando non c'è compressione).
+/// Se positivo, FILE RILEVANTI lo DICHIARA, così l'LLM sa che il sottografo è
+/// parziale per budget, non perché il grafo non sapesse di più.
+#[allow(clippy::too_many_arguments)]
 fn format_context(
     text: &str,
     entities: &[Entity],
@@ -1394,6 +1506,7 @@ fn format_context(
     holes: &[UnresolvedHole],
     impacts: &[ImpactSummary],
     call_paths: &[TargetRoutes],
+    omitted: usize,
 ) -> String {
     let by_id: HashMap<EntityId, &Entity> = entities.iter().map(|e| (e.id, e)).collect();
 
@@ -1405,6 +1518,11 @@ fn format_context(
         out.push_str(&format!(
             "- {} [{:?}] — {}\n",
             entity.qualified_name, entity.kind, entity.location.file_path
+        ));
+    }
+    if omitted > 0 {
+        out.push_str(&format!(
+            "- (+{omitted} entità meno rilevanti OMESSE per restare entro il budget del contesto)\n"
         ));
     }
 
@@ -2062,6 +2180,60 @@ mod tests {
         assert!(response
             .formatted_context
             .contains("Nessuna entità rilevante"));
+    }
+
+    #[tokio::test]
+    async fn context_is_compressed_when_it_exceeds_the_budget() {
+        // 15 funzioni che combaciano tutte con la keyword ⇒ tutte selezionate: il
+        // contesto pieno è grande. Con un budget piccolo, il passo Compress tiene le
+        // più rilevanti (in testa all'ordine) e DICHIARA quante ne ha omesse — mai un
+        // taglio silenzioso.
+        let mut src = String::new();
+        for i in 0..15 {
+            src.push_str(&format!("def task_{i}():\n    pass\n\n"));
+        }
+        let storage = graph_from("app.py", &src).await;
+        let config = QueryConfig {
+            max_context_chars: 400,
+            ..QueryConfig::default()
+        };
+        let engine = QueryEngine::with_config(storage, config);
+
+        let ctx = engine.query(&nl("task")).await.unwrap().formatted_context;
+
+        assert!(
+            ctx.len() <= 400,
+            "il contesto deve stare nel budget: {} caratteri\n{ctx}",
+            ctx.len()
+        );
+        assert!(
+            ctx.contains("OMESSE"),
+            "il taglio dev'essere DICHIARATO, non silenzioso:\n{ctx}"
+        );
+        let shown = ctx.matches("[Function]").count();
+        assert!(
+            shown < 15,
+            "alcune entità devono essere state omesse: mostrate {shown}/15\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_is_not_compressed_when_it_fits_the_budget() {
+        // Grafo piccolo, budget di default ampio: nessuna compressione, nessuna nota.
+        // La prova che il passo Compress è additivo — non tocca le query normali.
+        let storage = graph_from(
+            "app.py",
+            "def alpha():\n    pass\n\ndef beta():\n    alpha()\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine.query(&nl("beta")).await.unwrap().formatted_context;
+
+        assert!(
+            !ctx.contains("OMESSE"),
+            "niente da comprimere: nessuna nota d'omissione:\n{ctx}"
+        );
     }
 
     #[tokio::test]
