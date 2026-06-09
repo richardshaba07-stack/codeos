@@ -40,6 +40,10 @@ const MAX_CONFIRMED_CALLERS: usize = 8;
 /// ogni target costa una BFS sugli archi del grafo, e i percorsi sono contorno
 /// sulle entità centrali, non una mappa di tutto il sottografo.
 const PATH_FOCUS_TARGETS: usize = 3;
+/// Quante vie (multi-hop) verso UNA stessa destinazione mostrare in PERCORSI. Più
+/// di una rivela il coupling; troppe inonderebbero — le ulteriori sono contate, non
+/// nascoste.
+const MAX_ROUTES_PER_TARGET: usize = 2;
 /// Profondità massima della BFS a ritroso dell'impatto TRANSITIVO (chi raggiunge X
 /// seguendo archi `Calls` risolti). Oltre poche hop l'"impatto" è troppo diffuso
 /// per essere azionabile, e su grafi grandi la BFS sarebbe costosa; quando il tetto
@@ -425,20 +429,23 @@ impl QueryEngine {
     /// entità chiave: la catena di archi `Calls` risolti che le collega. È la metà
     /// gemella dell'impatto reverse — qui in avanti (chi raggiunge chi).
     ///
-    /// Tesi anti-falso-positivo, in tre modi: (1) eredita da [`QueryEngine::call_path`]
+    /// Tesi anti-falso-positivo, in tre modi: (1) eredita da [`QueryEngine::call_paths`]
     /// la garanzia che ogni passo è una chiamata reale già risolta — nessun cammino
-    /// indovinato, e `None` onesto quando non esiste invece di un ponte fabbricato;
-    /// (2) tiene SOLO i cammini multi-hop (≥ 3 passi, cioè con almeno un nodo
-    /// intermedio): un cammino diretto `centro → target` è già una riga di DIPENDENZE
-    /// CHIAVE, ri-mostrarlo qui sarebbe un'eco, non informazione; (3) niente cammino,
-    /// niente voce — la sezione non annuncia un percorso che non c'è.
+    /// indovinato, niente ponte su un `Unresolved`; (2) tiene SOLO i cammini multi-hop
+    /// (≥ 3 passi, cioè con almeno un nodo intermedio): un cammino diretto `centro →
+    /// target` è già una riga di DIPENDENZE CHIAVE, ri-mostrarlo qui sarebbe un'eco;
+    /// (3) niente cammino, niente voce — la sezione non annuncia un percorso che non
+    /// c'è, e i cammini ulteriori oltre il tetto [`MAX_ROUTES_PER_TARGET`] sono
+    /// CONTATI (`more`), non scartati in silenzio.
     ///
     /// Il valore aggiunto rispetto a DIPENDENZE CHIAVE: quella elenca archi singoli e
     /// di tipo misto, questa rende esplicita la *raggiungibilità transitiva* come
-    /// catena ordinata di sole chiamate, e può far emergere un nodo intermedio che il
-    /// cap di selezione aveva tagliato.
-    async fn collect_call_paths(&self, selected: &[Entity]) -> anyhow::Result<Vec<CallPath>> {
-        let mut paths = Vec::new();
+    /// catena ordinata di sole chiamate. E mostrando PIÙ vie verso la stessa
+    /// destinazione (via [`QueryEngine::call_paths`], non più solo la più corta) rende
+    /// visibile il coupling — «la raggiunge in due modi indipendenti» — che un singolo
+    /// cammino nasconderebbe.
+    async fn collect_call_paths(&self, selected: &[Entity]) -> anyhow::Result<Vec<TargetRoutes>> {
+        let mut groups = Vec::new();
         // L'entità CENTRALE dev'essere un callable: un Module o una Class non hanno
         // archi `Calls` uscenti e non potrebbero mai essere sorgente di un cammino.
         // E nel sottografo il Module tende a ordinarsi PER PRIMO (gli arrivano i
@@ -447,24 +454,30 @@ impl QueryEngine {
         // questo filtro l'entità centrale sarebbe spesso un modulo da cui nessun
         // cammino parte. Ancoriamo alla prima Function/Method per rilevanza.
         let Some(focus) = selected.iter().find(|e| is_callable(e.kind)) else {
-            return Ok(paths);
+            return Ok(groups);
         };
         for target in selected
             .iter()
             .filter(|e| is_callable(e.kind) && e.id != focus.id)
             .take(PATH_FOCUS_TARGETS)
         {
-            let Some(path) = self.call_path(focus.id, target.id).await? else {
-                continue;
-            };
-            // Solo multi-hop: un cammino di 2 passi (centro → target diretto) è già
-            // visibile in DIPENDENZE CHIAVE come singolo arco — qui sarebbe un'eco.
-            if path.steps.len() < 3 {
+            // Tutte le vie (fino al tetto di `call_paths`), poi solo le multi-hop: un
+            // cammino di 2 passi (centro → target diretto) è già in DIPENDENZE CHIAVE.
+            let mut routes: Vec<CallPath> = self
+                .call_paths(focus.id, target.id)
+                .await?
+                .into_iter()
+                .filter(|p| p.steps.len() >= 3)
+                .collect();
+            if routes.is_empty() {
                 continue;
             }
-            paths.push(path);
+            // Mostriamo le più corte fino al tetto, contando le altre (mai in silenzio).
+            let more = routes.len().saturating_sub(MAX_ROUTES_PER_TARGET);
+            routes.truncate(MAX_ROUTES_PER_TARGET);
+            groups.push(TargetRoutes { routes, more });
         }
-        Ok(paths)
+        Ok(groups)
     }
 
     /// Cerca il **cammino di chiamata** più corto da `from` a `to` seguendo SOLO
@@ -1219,6 +1232,16 @@ struct ImpactSummary {
     possible_truncated: usize,
 }
 
+/// Le vie di chiamata dall'entità centrale verso UNA destinazione chiave, per la
+/// sezione PERCORSI. `routes` sono i cammini multi-hop mostrati (al più
+/// [`MAX_ROUTES_PER_TARGET`], dal più corto); `more` conta le vie ulteriori trovate
+/// ma non mostrate, così il troncamento è onesto invece che silenzioso. Tutte le vie
+/// di un gruppo condividono la stessa destinazione (`routes[*].steps.last()`).
+struct TargetRoutes {
+    routes: Vec<CallPath>,
+    more: usize,
+}
+
 /// Le relazioni lungo cui la BFS scende (Passo 4). Le altre (es. `Unresolved`,
 /// `Implements`, `Extends`) non vengono attraversate per l'espansione di contesto.
 fn should_follow(kind: RelationKind) -> bool {
@@ -1370,7 +1393,7 @@ fn format_context(
     decisions: &[Decision],
     holes: &[UnresolvedHole],
     impacts: &[ImpactSummary],
-    call_paths: &[CallPath],
+    call_paths: &[TargetRoutes],
 ) -> String {
     let by_id: HashMap<EntityId, &Entity> = entities.iter().map(|e| (e.id, e)).collect();
 
@@ -1474,18 +1497,35 @@ fn format_context(
     // chiamate `Calls`. Diverso da DIPENDENZE CHIAVE, che elenca archi singoli e di
     // tipo misto senza mai connetterli in un percorso. Compare solo coi cammini
     // multi-hop (un cammino diretto è già un arco lì sopra: qui sarebbe un'eco) e
-    // mai con un passo indovinato — `call_path` non scavalca un `Unresolved`.
+    // mai con un passo indovinato — `call_paths` non scavalca un `Unresolved`. Mostra
+    // PIÙ vie verso la stessa destinazione quando esistono (coupling), contando le
+    // ulteriori oltre il tetto invece di nasconderle.
     if !call_paths.is_empty() {
         out.push_str(
             "\nPERCORSI DI CHIAMATA (come l'entità centrale raggiunge le altre entità chiave):\n",
         );
-        for path in call_paths {
-            let chain: Vec<&str> = path
-                .steps
-                .iter()
-                .map(|e| e.qualified_name.as_str())
-                .collect();
-            out.push_str(&format!("- {}\n", chain.join(" → ")));
+        for group in call_paths {
+            for path in &group.routes {
+                let chain: Vec<&str> = path
+                    .steps
+                    .iter()
+                    .map(|e| e.qualified_name.as_str())
+                    .collect();
+                out.push_str(&format!("- {}\n", chain.join(" → ")));
+            }
+            if group.more > 0 {
+                // Tutte le vie del gruppo finiscono sulla stessa destinazione.
+                let target = group
+                    .routes
+                    .first()
+                    .and_then(|p| p.steps.last())
+                    .map(|e| e.qualified_name.as_str())
+                    .unwrap_or("?");
+                out.push_str(&format!(
+                    "  (+{} altre vie verso {}, non mostrate)\n",
+                    group.more, target
+                ));
+            }
         }
         out.push_str(
             "  («→» catena di archi `Calls` risolti, passo per passo; nessun passo è indovinato —\n   se il grafo non conosce un cammino, la riga non compare.)\n",
@@ -2259,6 +2299,38 @@ mod tests {
         assert!(
             !ctx.contains("PERCORSI DI CHIAMATA"),
             "una chiamata diretta è già in DIPENDENZE CHIAVE: niente sezione PERCORSI d'eco:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn percorsi_shows_multiple_routes_to_the_same_target() {
+        // L'integrazione di `call_paths` in PERCORSI. `focus` raggiunge `target` per
+        // DUE vie indipendenti (via `via_a` e via `via_b`). Prima, con `call_path`,
+        // PERCORSI ne mostrava UNA sola; ora le mostra entrambe — il coupling reso
+        // visibile nel contesto per l'LLM.
+        let storage = graph_from(
+            "app.py",
+            "def target():\n    pass\n\n\
+             def via_a():\n    target()\n\n\
+             def via_b():\n    target()\n\n\
+             def focus():\n    via_a()\n    via_b()\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine.query(&nl("focus")).await.unwrap().formatted_context;
+
+        assert!(
+            ctx.contains("PERCORSI DI CHIAMATA"),
+            "manca la sezione PERCORSI:\n{ctx}"
+        );
+        let percorsi = ctx
+            .split("PERCORSI DI CHIAMATA")
+            .nth(1)
+            .expect("la sezione PERCORSI è appena stata verificata presente");
+        assert!(
+            percorsi.contains("::via_a") && percorsi.contains("::via_b"),
+            "PERCORSI deve mostrare ENTRAMBE le vie verso target (via_a e via_b):\n{ctx}"
         );
     }
 
