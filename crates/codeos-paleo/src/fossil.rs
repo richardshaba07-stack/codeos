@@ -111,11 +111,11 @@ impl DecisionFossil {
 /// 1. La storia ha pochissimi commit utili (meno di 3).
 /// 2. Il commit di nascita tocca troppi file (es. initial commit massivo, con più di 30 file modificati).
 /// 3. Quasi tutti i confini (>= 80%, se ci sono almeno 2 confini) nascono nello stesso commit.
-pub fn is_history_insufficient(
-    commits: &[Commit],
-    fossils: &[DecisionFossil],
-) -> bool {
-    let useful_commits = commits.iter().filter(|c| !c.changed_files.is_empty()).count();
+pub fn is_history_insufficient(commits: &[Commit], fossils: &[DecisionFossil]) -> bool {
+    let useful_commits = commits
+        .iter()
+        .filter(|c| !c.changed_files.is_empty())
+        .count();
     if useful_commits < 3 {
         return true;
     }
@@ -253,16 +253,14 @@ mod tests {
             Commit::with_meta("c1", 100, "init", ["file1.rs"]),
             Commit::with_meta("c2", 200, "work", ["file2.rs"]),
         ];
-        let fossils = vec![
-            DecisionFossil {
-                upstream: "up".to_string(),
-                downstream: "down".to_string(),
-                born_at: "c1".to_string(),
-                born_at_unix: 100,
-                intent: "init".to_string(),
-                born_structure: vec!["file1.rs".to_string()],
-            }
-        ];
+        let fossils = vec![DecisionFossil {
+            upstream: "up".to_string(),
+            downstream: "down".to_string(),
+            born_at: "c1".to_string(),
+            born_at_unix: 100,
+            intent: "init".to_string(),
+            born_structure: vec!["file1.rs".to_string()],
+        }];
         assert!(is_history_insufficient(&commits, &fossils));
 
         // 2. Commit con troppi file (initial commit massivo > 30 file)
@@ -275,16 +273,14 @@ mod tests {
             Commit::with_meta("c2", 200, "work1", ["file_a.rs"]),
             Commit::with_meta("c3", 300, "work2", ["file_b.rs"]),
         ];
-        let fossils_mass = vec![
-            DecisionFossil {
-                upstream: "up".to_string(),
-                downstream: "down".to_string(),
-                born_at: "c1".to_string(),
-                born_at_unix: 100,
-                intent: "mass init".to_string(),
-                born_structure: vec!["file_1.rs".to_string()],
-            }
-        ];
+        let fossils_mass = vec![DecisionFossil {
+            upstream: "up".to_string(),
+            downstream: "down".to_string(),
+            born_at: "c1".to_string(),
+            born_at_unix: 100,
+            intent: "mass init".to_string(),
+            born_structure: vec!["file_1.rs".to_string()],
+        }];
         assert!(is_history_insufficient(&commits_mass, &fossils_mass));
 
         // 3. Quasi tutti i confini nascono nello stesso commit (>= 80%)

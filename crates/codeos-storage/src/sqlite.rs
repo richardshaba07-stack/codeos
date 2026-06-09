@@ -137,7 +137,11 @@ fn run_migrations(conn: &mut Connection) -> anyhow::Result<()> {
             .with_context(|| format!("aggiornamento di user_version a v{next} fallito"))?;
         tx.commit()
             .with_context(|| format!("commit della migrazione v{next} fallito"))?;
-        tracing::info!(from = version, to = next, "migrazione dello schema applicata");
+        tracing::info!(
+            from = version,
+            to = next,
+            "migrazione dello schema applicata"
+        );
     }
     Ok(())
 }
@@ -738,7 +742,11 @@ mod tests {
         let storage = SqliteStorage::in_memory().unwrap();
         let caller = entity("pkg::a::caller", EntityKind::Function, "pkg/a.rs");
         let callee = entity("pkg::a::callee", EntityKind::Function, "pkg/a.rs");
-        let ext = entity("external::tokio", EntityKind::ExternalDependency, "<external>");
+        let ext = entity(
+            "external::tokio",
+            EntityKind::ExternalDependency,
+            "<external>",
+        );
 
         let rel = |kind, source: EntityId, target: EntityId, conf: &str| Relation {
             id: EntityId::new(),

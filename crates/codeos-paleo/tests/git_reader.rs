@@ -49,7 +49,9 @@ fn measures_abstention_over_a_real_git_history() {
     git(&root, &["add", "-A"]).expect("git add");
     git(&root, &["commit", "-q", "-m", "api only"]).expect("git commit 2");
 
-    let commits = GitLog::new(root.as_path()).commits().expect("lettura git log");
+    let commits = GitLog::new(root.as_path())
+        .commits()
+        .expect("lettura git log");
     assert_eq!(commits.len(), 2, "due commit attesi: {commits:?}");
 
     // `GitLog` assolutizza i path rispetto alla radice del repo (per combaciare

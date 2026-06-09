@@ -116,7 +116,11 @@ async fn indexing_a_realistic_project_produces_no_false_positives() {
     // Attendi che il GraphActor abbia applicato il delta (un solo GraphUpdated:
     // IndexProject pubblica un unico FilesIndexed col batch completo).
     loop {
-        match events.recv().await.expect("bus chiuso prima di GraphUpdated") {
+        match events
+            .recv()
+            .await
+            .expect("bus chiuso prima di GraphUpdated")
+        {
             CodeOsEvent::GraphUpdated { .. } => break,
             _ => continue,
         }
@@ -223,7 +227,10 @@ async fn indexing_a_realistic_project_produces_no_false_positives() {
         q.external_entities >= 1,
         "tokio deve comparire fra le entità esterne tracciate: {q:?}"
     );
-    assert!(q.total_entities > q.external_entities, "ci sono anche entità reali");
+    assert!(
+        q.total_entities > q.external_entities,
+        "ci sono anche entità reali"
+    );
     // Le tre classi di fiducia partizionano esattamente le relazioni totali.
     assert_eq!(
         q.total_relations,
