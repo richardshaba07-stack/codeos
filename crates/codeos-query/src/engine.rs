@@ -35,6 +35,12 @@ const MAX_POSSIBLE_PER_ENTITY: usize = 5;
 /// ogni target costa una BFS sugli archi del grafo, e i percorsi sono contorno
 /// sulle entità centrali, non una mappa di tutto il sottografo.
 const PATH_FOCUS_TARGETS: usize = 3;
+/// Profondità massima della BFS a ritroso dell'impatto TRANSITIVO (chi raggiunge X
+/// seguendo archi `Calls` risolti). Oltre poche hop l'"impatto" è troppo diffuso
+/// per essere azionabile, e su grafi grandi la BFS sarebbe costosa; quando il tetto
+/// tronca un chiamante reale più lontano, [`TransitiveImpact::depth_capped`] lo
+/// dichiara invece di fingere completezza — astensione onesta, non silenzio.
+const MAX_IMPACT_DEPTH: u32 = 5;
 
 /// Parametri configurabili dell'espansione.
 #[derive(Debug, Clone)]
@@ -610,6 +616,95 @@ impl QueryEngine {
         }))
     }
 
+    /// Livello L2 — **impatto TRANSITIVO**: chi raggiunge X a ritroso seguendo SOLO
+    /// archi `Calls` RISOLTI, a QUALUNQUE distanza (non solo i chiamanti diretti di
+    /// [`QueryEngine::impact`]). È la risposta completa a "cosa cambia se tocco X?":
+    /// se `A` chiama `B` che chiama `X`, toccare `X` può rompere anche `A` — il raggio
+    /// d'impatto vero è transitivo, e fermarsi a 1 hop lo sottostima.
+    ///
+    /// BFS a ritroso dal target verso i chiamanti, hop dopo hop. Ogni chiamante porta
+    /// la sua distanza MINIMA in hop ([`TransitiveCaller::hops`]): `1` = chiama X
+    /// direttamente, `2` = chiama qualcosa che chiama X, e così via.
+    ///
+    /// Tesi anti-falso-positivo, in tre punti: (1) si compone **solo su archi
+    /// risolti** — un chiamante raggiunto attraverso un arco `Unresolved` NON è un
+    /// chiamante transitivo (sarebbe un ponte su un buco, esattamente ciò che
+    /// [`QueryEngine::call_path`] rifiuta); i "possibili" (match-di-nome) restano fuori
+    /// di proposito: non si compongono transitivamente senza moltiplicare l'incertezza
+    /// e mentire. (2) La profondità è limitata a [`MAX_IMPACT_DEPTH`], e se il tetto
+    /// taglia un chiamante reale più lontano lo si DICHIARA (`depth_capped`), non lo si
+    /// nasconde. (3) `None` SOLO se X non è nel grafo; un'entità che nessuno chiama dà
+    /// `Some` con `callers` vuoto — «niente la chiama» è una verità, non un'assenza.
+    pub async fn impact_transitive(
+        &self,
+        entity_id: EntityId,
+    ) -> anyhow::Result<Option<TransitiveImpact>> {
+        let Some(entity) = self.storage.get_entity_by_id(&entity_id).await? else {
+            return Ok(None);
+        };
+
+        // `distance[id]` = lunghezza minima della catena di chiamate da `id` fino a X
+        // (0 = X stesso). Visited-per-id sulla stessa mappa: ogni chiamante è contato
+        // una volta sola, alla sua distanza minima, e i cicli (ricorsione) non ciclano.
+        let mut distance: HashMap<EntityId, u32> = HashMap::new();
+        distance.insert(entity_id, 0);
+        let mut queue: VecDeque<(EntityId, u32)> = VecDeque::new();
+        queue.push_back((entity_id, 0));
+
+        let mut depth_capped = false;
+        while let Some((id, dist)) = queue.pop_front() {
+            let calls_in = self
+                .storage
+                .query_relations(RelationFilter {
+                    target_id: Some(id),
+                    kind: Some(RelationKind::Calls),
+                    ..Default::default()
+                })
+                .await?;
+            for rel in calls_in {
+                // Difensivo: un arco `Calls` ha sempre sorgente risolta; un nil scritto
+                // per errore non diventa un chiamante fantasma.
+                if rel.source_id.is_nil() || distance.contains_key(&rel.source_id) {
+                    continue;
+                }
+                if dist + 1 > MAX_IMPACT_DEPTH {
+                    // Un chiamante reale oltre il tetto: esiste ma non lo includiamo.
+                    // Lo dichiariamo, invece di affermarlo o ignorarlo in silenzio.
+                    depth_capped = true;
+                    continue;
+                }
+                distance.insert(rel.source_id, dist + 1);
+                queue.push_back((rel.source_id, dist + 1));
+            }
+        }
+
+        // Materializza i chiamanti (tutti tranne X stesso, a distanza 0), ordinati per
+        // distanza crescente poi per nome: output stabile e deterministico.
+        let mut callers: Vec<TransitiveCaller> = Vec::new();
+        for (id, hops) in &distance {
+            if *hops == 0 {
+                continue;
+            }
+            if let Some(caller) = self.storage.get_entity_by_id(id).await? {
+                callers.push(TransitiveCaller {
+                    entity: caller,
+                    hops: *hops,
+                });
+            }
+        }
+        callers.sort_by(|a, b| {
+            a.hops
+                .cmp(&b.hops)
+                .then_with(|| a.entity.qualified_name.cmp(&b.entity.qualified_name))
+        });
+
+        Ok(Some(TransitiveImpact {
+            entity,
+            callers,
+            depth_capped,
+        }))
+    }
+
     /// Risolve UN nome digitato dall'utente a un'unica entità del grafo, in modo
     /// **onesto**. Lo storage cerca per sottostringa (`LIKE %nome%`), perciò qui
     /// stringiamo ai soli match *precisi*: il nome qualificato è esattamente
@@ -843,6 +938,36 @@ pub struct PossibleCaller {
     pub source: Entity,
     /// Il riferimento testuale non risolto che combacia, dal sorgente.
     pub reference: String,
+}
+
+/// L'impatto **TRANSITIVO** di un'entità: chi la raggiunge a ritroso seguendo SOLO
+/// archi `Calls` risolti, a qualunque distanza — non solo i chiamanti diretti di
+/// [`Impact`]. Ogni chiamante porta la sua distanza in hop; tutti gli archi del
+/// cammino sono risolti ⇒ è una dipendenza CERTA, solo più o meno lontana (mai un
+/// "possibile": i match-di-nome non si compongono transitivamente senza mentire).
+/// `depth_capped` è la nota d'onestà: `true` se la BFS si è fermata al tetto
+/// [`MAX_IMPACT_DEPTH`] mentre oltre esisteva ancora un chiamante — dichiarato
+/// invece di fingere completezza. Restituito da [`QueryEngine::impact_transitive`].
+#[derive(Debug, Clone)]
+pub struct TransitiveImpact {
+    /// L'entità di cui si misura l'impatto transitivo.
+    pub entity: Entity,
+    /// I chiamanti transitivi confermati, ordinati per distanza crescente poi nome.
+    pub callers: Vec<TransitiveCaller>,
+    /// `true` se un chiamante reale oltre [`MAX_IMPACT_DEPTH`] è stato tagliato dal
+    /// tetto: il raggio mostrato è parziale, e lo si dice.
+    pub depth_capped: bool,
+}
+
+/// Un chiamante transitivo confermato, con la distanza MINIMA (in hop di chiamata)
+/// che lo separa dall'entità d'impatto: `hops == 1` la chiama direttamente, `2`
+/// chiama qualcosa che la chiama, e così via. Ogni hop è un arco `Calls` risolto.
+#[derive(Debug, Clone)]
+pub struct TransitiveCaller {
+    /// L'entità che (in)direttamente chiama l'entità d'impatto.
+    pub entity: Entity,
+    /// Distanza minima in hop di chiamata fino all'entità d'impatto (≥ 1).
+    pub hops: u32,
 }
 
 /// Esito interno della risoluzione onesta di UN nome a un'entità del grafo
@@ -2187,6 +2312,134 @@ mod tests {
         assert!(
             impact.is_none(),
             "un'entità sconosciuta non ha impatto calcolabile: None, non un Impact vuoto"
+        );
+    }
+
+    #[tokio::test]
+    async fn impact_transitive_lists_callers_with_their_hop_distance() {
+        // Catena `deep` → `mid` → `leaf`. Chi impatta `leaf`? `mid` lo chiama
+        // DIRETTAMENTE (1 hop), `deep` lo raggiunge ATTRAVERSO mid (2 hop). Entrambi
+        // sono chiamanti CERTI — ogni arco della catena è un `Calls` risolto — solo a
+        // distanza diversa, ed è proprio la distanza la cosa nuova rispetto a impact().
+        let storage = graph_from(
+            "app.py",
+            "def leaf():\n    pass\n\n\
+             def mid():\n    leaf()\n\n\
+             def deep():\n    mid()\n",
+        )
+        .await;
+        let leaf = id_of(&storage, "::leaf").await;
+        let engine = QueryEngine::new(storage);
+
+        let impact = engine
+            .impact_transitive(leaf)
+            .await
+            .unwrap()
+            .expect("leaf è nel grafo");
+
+        let mid = impact
+            .callers
+            .iter()
+            .find(|c| c.entity.qualified_name.ends_with("::mid"))
+            .expect("mid chiama leaf direttamente");
+        assert_eq!(mid.hops, 1, "mid chiama leaf direttamente: 1 hop");
+
+        let deep = impact
+            .callers
+            .iter()
+            .find(|c| c.entity.qualified_name.ends_with("::deep"))
+            .expect("deep raggiunge leaf via mid");
+        assert_eq!(deep.hops, 2, "deep raggiunge leaf in 2 hop (via mid)");
+
+        assert!(
+            !impact.depth_capped,
+            "la catena è corta: il tetto di profondità non è stato toccato"
+        );
+    }
+
+    #[tokio::test]
+    async fn impact_transitive_does_not_chain_through_an_unresolved_hop() {
+        // Il cuore anti-falso-positivo del transitivo. `mid` chiama `leaf` con una
+        // chiamata NUDA ⇒ arco `Calls` risolto. `outer` chiama `schema.mid(...)` su un
+        // receiver di tipo ignoto ⇒ il resolver lo lascia `Unresolved` (Fix #10): NON
+        // è un arco `Calls` verso `mid`. Quindi `outer` NON raggiunge `leaf` per archi
+        // risolti: non è un chiamante transitivo, e la BFS a ritroso non scavalca il
+        // buco per inventarlo. `mid` invece c'è, a 1 hop.
+        let storage = graph_from_ts(
+            "app.ts",
+            "export function leaf() {}\n\
+             export function mid() { leaf(); }\n\
+             export function outer(schema: any) { schema.mid(); }\n",
+        )
+        .await;
+        let leaf = id_of(&storage, "::leaf").await;
+        let engine = QueryEngine::new(storage);
+
+        let impact = engine
+            .impact_transitive(leaf)
+            .await
+            .unwrap()
+            .expect("leaf è nel grafo");
+        let names: Vec<&str> = impact
+            .callers
+            .iter()
+            .map(|c| c.entity.qualified_name.as_str())
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n.ends_with("::mid")),
+            "mid chiama leaf con un arco risolto: dev'essere un chiamante: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with("::outer")),
+            "outer raggiunge mid solo via un arco Unresolved: NON è un chiamante transitivo (niente ponti sui buchi): {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn impact_transitive_declares_when_the_depth_cap_truncates_the_radius() {
+        // Catena più lunga del tetto (MAX_IMPACT_DEPTH = 5): f6 → f5 → … → f1 → f0.
+        // Chi impatta f0? f1..f5 entro il tetto (hop 1..5); f6 sarebbe a 6 hop, OLTRE
+        // il tetto. Non lo affermiamo come chiamante (sarebbe oltre ciò che abbiamo
+        // davvero percorso) ma NON lo nascondiamo: `depth_capped` lo dichiara. È
+        // l'astensione onesta applicata al raggio d'impatto — un confine esplicito,
+        // non un troncamento silenzioso.
+        let storage = graph_from(
+            "app.py",
+            "def f0():\n    pass\n\n\
+             def f1():\n    f0()\n\n\
+             def f2():\n    f1()\n\n\
+             def f3():\n    f2()\n\n\
+             def f4():\n    f3()\n\n\
+             def f5():\n    f4()\n\n\
+             def f6():\n    f5()\n",
+        )
+        .await;
+        let f0 = id_of(&storage, "::f0").await;
+        let engine = QueryEngine::new(storage);
+
+        let impact = engine
+            .impact_transitive(f0)
+            .await
+            .unwrap()
+            .expect("f0 è nel grafo");
+        let names: Vec<&str> = impact
+            .callers
+            .iter()
+            .map(|c| c.entity.qualified_name.as_str())
+            .collect();
+
+        assert!(
+            impact.depth_capped,
+            "un chiamante reale (f6) è oltre il tetto: depth_capped deve dirlo: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("::f5")),
+            "f5 è al tetto (5 hop): dev'esserci: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with("::f6")),
+            "f6 è oltre il tetto (6 hop): NON va affermato come chiamante: {names:?}"
         );
     }
 }
