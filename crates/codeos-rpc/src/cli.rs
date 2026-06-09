@@ -111,6 +111,31 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        "impact" => {
+            if args.len() < 3 {
+                eprintln!("Errore: serve il nome dell'entità di cui misurare l'impatto.");
+                eprintln!("Uso: codeos impact <nome>");
+                std::process::exit(1);
+            }
+            let name = &args[2];
+
+            let mut client = connect_server().await?;
+            println!("⚡ Misuro l'impatto di \"{name}\" (chi la chiama)...");
+
+            let req = proto::ImpactRequest { name: name.clone() };
+            let response = client.impact(req).await?.into_inner();
+
+            println!("\n{}", response.formatted);
+
+            // Esito esplicito: esci con codice ≠0 quando il nome NON si è risolto a
+            // un'entità (unknown/ambiguous), così script e CI lo colgono senza
+            // analizzare il testo. Attenzione: "found" con liste vuote è comunque
+            // successo — l'entità esiste, semplicemente nessuno la chiama (per
+            // quanto noto): non lo confondiamo con «nome inesistente».
+            if response.status != "found" {
+                std::process::exit(1);
+            }
+        }
         "doctor" => {
             run_doctor().await;
         }
@@ -582,6 +607,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "path <da> <a>",
         "Mostra il cammino di chiamata onesto tra due entità (segue solo archi Calls risolti; mai inventato).",
+    ),
+    (
+        "impact <nome>",
+        "Mostra chi chiama un'entità, separando i chiamanti confermati (archi Calls risolti) dai possibili (riferimenti non risolti che combaciano).",
     ),
     (
         "doctor",
@@ -1114,8 +1143,8 @@ mod tests {
     fn usage_documents_every_implemented_command() {
         let usage = usage_text();
         for cmd in [
-            "index", "report", "query", "path", "doctor", "guard", "context", "mri", "why",
-            "simulate", "help",
+            "index", "report", "query", "path", "impact", "doctor", "guard", "context", "mri",
+            "why", "simulate", "help",
         ] {
             assert!(
                 usage.contains(cmd),

@@ -52,6 +52,15 @@ pub enum Command {
         to: String,
         reply_to: mpsc::Sender<anyhow::Result<CallPathReply>>,
     },
+    /// Livello L2 del context builder: l'**impatto** di un'entità nominata —
+    /// chi la chiama secondo il grafo. `name` è un nome (qualificato o solo il
+    /// segmento finale): il Query Engine lo risolve a un'unica entità — senza mai
+    /// indovinare — e poi separa i chiamanti CONFERMATI (archi `Calls` risolti)
+    /// dai POSSIBILI (riferimenti `Unresolved` il cui nome combacia).
+    Impact {
+        name: String,
+        reply_to: mpsc::Sender<anyhow::Result<ImpactReply>>,
+    },
     /// Registra una decisione architetturale nel Memory Engine.
     RecordDecision {
         decision: NewDecision,
@@ -185,6 +194,55 @@ pub struct CallPathReply {
     pub status: CallPathStatus,
     /// Il cammino, dalla sorgente alla destinazione, quando `status == Found`.
     pub steps: Vec<Entity>,
+    /// I candidati da disambiguare (`Ambiguous`) o i suggerimenti (`Unknown`).
+    pub candidates: Vec<Entity>,
+}
+
+/// Esito della misura d'impatto di un'entità (livello L2). Tre stati onesti e
+/// distinti. Nota: non esiste un `NoPath` — un'entità che esiste ma che nessuno
+/// chiama è comunque `Found`, con liste di chiamanti vuote. «Nessun chiamante
+/// noto» non è prova di assenza: un riferimento non risolto potrebbe nasconderne
+/// uno, ed è proprio ciò che `possible_callers` rende visibile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImpactStatus {
+    /// Il nome si è risolto a un'unica entità: l'impatto è stato calcolato.
+    Found,
+    /// Il nome non corrisponde ad alcuna entità del grafo.
+    Unknown,
+    /// Il nome corrisponde a più entità: serve disambiguare. Non scegliamo noi.
+    Ambiguous,
+}
+
+/// Un chiamante **possibile** sul bus: una sorgente con un riferimento non
+/// risolto il cui nome combacia (sull'ultimo segmento) col nome semplice
+/// dell'entità d'impatto. Specchio neutro di `codeos_query::PossibleCaller`,
+/// definito qui perché `codeos-types` non può dipendere dal Query Engine.
+#[derive(Debug, Clone)]
+pub struct PossibleCallerInfo {
+    /// L'entità sorgente che POTREBBE chiamare l'entità d'impatto.
+    pub source: Entity,
+    /// Il riferimento testuale non risolto che combacia, grezzo dal sorgente.
+    pub reference: String,
+}
+
+/// Risposta del Query Engine alla richiesta [`Command::Impact`].
+///
+/// Filosofia anti-falso-positivo applicata al lato dei chiamanti: i chiamanti
+/// `confirmed` portano un arco `Calls` realmente presente nel grafo, i
+/// `possible` solo una corrispondenza di nome non confermata — il confine tra
+/// «so che dipende» e «potrebbe dipendere» non viene mai collassato. `candidates`
+/// porta i nomi tra cui scegliere (stato `Ambiguous`) o i quasi-omonimi
+/// suggeriti (stato `Unknown`).
+#[derive(Debug, Clone)]
+pub struct ImpactReply {
+    /// Testo già formattato, pronto per il terminale o per un LLM.
+    pub formatted: String,
+    /// Lo stato esplicito dell'esito (vedi [`ImpactStatus`]). Sempre noto.
+    pub status: ImpactStatus,
+    /// I chiamanti certi (arco `Calls` risolto), quando `status == Found`.
+    pub confirmed: Vec<Entity>,
+    /// I chiamanti possibili (nome combaciante non confermato), quando `Found`.
+    pub possible: Vec<PossibleCallerInfo>,
     /// I candidati da disambiguare (`Ambiguous`) o i suggerimenti (`Unknown`).
     pub candidates: Vec<Entity>,
 }

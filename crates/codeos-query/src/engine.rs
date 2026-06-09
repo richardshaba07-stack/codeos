@@ -10,7 +10,10 @@ use std::sync::Arc;
 
 use codeos_memory::{Decision, DecisionStore, InMemoryDecisionStore};
 use codeos_storage::{GraphStorage, RelationFilter};
-use codeos_types::bus::{CallPathReply, CallPathStatus, QueryRequest, QueryResponse};
+use codeos_types::bus::{
+    CallPathReply, CallPathStatus, ImpactReply, ImpactStatus, PossibleCallerInfo, QueryRequest,
+    QueryResponse,
+};
 use codeos_types::{Entity, EntityId, Relation, RelationKind};
 
 /// Profondità massima della BFS (Passo 4).
@@ -588,6 +591,76 @@ impl QueryEngine {
             }),
         }
     }
+
+    /// Livello L2 (per nome): risolve onestamente `name` a un'unica entità, poi
+    /// delega a [`QueryEngine::impact`]. È il confine d'ingresso dell'analisi
+    /// d'impatto dal mondo esterno (CLI/gRPC), dove il nome è testo libero.
+    ///
+    /// Tesi anti-falso-positivo applicata all'ingresso: se il nome è ignoto o
+    /// ambiguo lo *dichiariamo* (con i candidati), invece di scegliere a caso
+    /// un'entità e misurare un impatto che nessuno ha chiesto.
+    pub async fn impact_by_name(&self, name: &str) -> anyhow::Result<ImpactReply> {
+        match self.resolve_one_name(name).await? {
+            NameResolution::Ambiguous(candidates) => {
+                let mut msg = format!(
+                    "Il nome \"{name}\" è ambiguo: {} entità corrispondono.\n",
+                    candidates.len()
+                );
+                msg.push_str("Specifica quale (nome qualificato completo):\n");
+                msg.push_str(&format_candidate_list(&candidates));
+                Ok(ImpactReply {
+                    formatted: msg,
+                    status: ImpactStatus::Ambiguous,
+                    confirmed: Vec::new(),
+                    possible: Vec::new(),
+                    candidates,
+                })
+            }
+            NameResolution::Unknown(suggestions) => {
+                let mut msg = format!("Nessuna entità di nome \"{name}\" nel grafo.\n");
+                if suggestions.is_empty() {
+                    msg.push_str("(nessun nome simile trovato)\n");
+                } else {
+                    msg.push_str("Forse intendevi:\n");
+                    msg.push_str(&format_candidate_list(&suggestions));
+                }
+                Ok(ImpactReply {
+                    formatted: msg,
+                    status: ImpactStatus::Unknown,
+                    confirmed: Vec::new(),
+                    possible: Vec::new(),
+                    candidates: suggestions,
+                })
+            }
+            NameResolution::Resolved(entity) => {
+                // L'entità è appena stata risolta dal grafo, perciò `impact` non
+                // può restituire None qui. In via difensiva trattiamo l'eventuale
+                // None come impatto vuoto sull'entità nota: mai un panico sul
+                // percorso utente, mai un chiamante inventato.
+                let impact = self.impact(entity.id).await?.unwrap_or_else(|| Impact {
+                    entity: entity.clone(),
+                    confirmed_callers: Vec::new(),
+                    possible_callers: Vec::new(),
+                });
+                let formatted = format_impact(&impact);
+                let possible = impact
+                    .possible_callers
+                    .into_iter()
+                    .map(|p| PossibleCallerInfo {
+                        source: p.source,
+                        reference: p.reference,
+                    })
+                    .collect();
+                Ok(ImpactReply {
+                    formatted,
+                    status: ImpactStatus::Found,
+                    confirmed: impact.confirmed_callers,
+                    possible,
+                    candidates: Vec::new(),
+                })
+            }
+        }
+    }
 }
 
 /// Un **cammino di chiamata** onesto: la sequenza ordinata di entità da una
@@ -949,6 +1022,74 @@ fn format_candidate_list(entities: &[Entity]) -> String {
     lines.dedup();
     let mut out = lines.join("\n");
     out.push('\n');
+    out
+}
+
+/// Rende l'impatto di un'entità in due sezioni *distinte*: i chiamanti CERTI e i
+/// POSSIBILI. È la tesi anti-falso-positivo resa visibile all'occhio: i certi
+/// (arco `Calls` risolto) col prefisso `-`, i possibili (sola corrispondenza di
+/// nome su un riferimento non risolto) col prefisso `?` e il riferimento grezzo
+/// dal sorgente — il PERCHÉ del sospetto. La chiusa ricorda che «possibile» non è
+/// «certo» e che l'assenza di chiamanti noti non è prova di assenza d'uso.
+fn format_impact(impact: &Impact) -> String {
+    let mut out = format!("Impatto di \"{}\":\n\n", impact.entity.qualified_name);
+
+    out.push_str(&format!(
+        "Chiamanti CONFERMATI ({}) — arco `Calls` risolto verso l'entità:\n",
+        impact.confirmed_callers.len()
+    ));
+    if impact.confirmed_callers.is_empty() {
+        out.push_str("  (nessuno noto)\n");
+    } else {
+        let mut lines: Vec<String> = impact
+            .confirmed_callers
+            .iter()
+            .map(|e| {
+                format!(
+                    "  - {} [{:?}] — {}",
+                    e.qualified_name, e.kind, e.location.file_path
+                )
+            })
+            .collect();
+        lines.sort();
+        lines.dedup();
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
+    out.push('\n');
+    out.push_str(&format!(
+        "Chiamanti POSSIBILI ({}) — un riferimento non risolto ne combacia il nome, da VERIFICARE:\n",
+        impact.possible_callers.len()
+    ));
+    if impact.possible_callers.is_empty() {
+        out.push_str("  (nessuno noto)\n");
+    } else {
+        let mut lines: Vec<String> = impact
+            .possible_callers
+            .iter()
+            .map(|p| {
+                format!(
+                    "  ? {} — via `{}` — {}",
+                    p.source.qualified_name, p.reference, p.source.location.file_path
+                )
+            })
+            .collect();
+        lines.sort();
+        lines.dedup();
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
+    out.push_str(
+        "\n(Confermati: arco `Calls` realmente presente nel grafo. Possibili: solo una\n\
+         corrispondenza di nome su un riferimento non risolto — potrebbe NON essere\n\
+         questa entità. Assenza di chiamanti noti non è prova di assenza d'uso.)\n",
+    );
     out
 }
 

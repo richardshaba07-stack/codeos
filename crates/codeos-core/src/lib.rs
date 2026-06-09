@@ -240,7 +240,9 @@ async fn dispatch_loop(mut commands: mpsc::Receiver<Command>, routes: Routes) {
             | Command::IndexFiles { .. }
             | Command::ReIndexFile { .. }
             | Command::RemoveFiles { .. } => (&routes.parser, "parser"),
-            Command::QueryGraph { .. } | Command::CallPath { .. } => (&routes.query, "query"),
+            Command::QueryGraph { .. } | Command::CallPath { .. } | Command::Impact { .. } => {
+                (&routes.query, "query")
+            }
             Command::RecordDecision { .. } => (&routes.memory, "memory"),
             Command::ArchitectureReport { .. }
             | Command::GuardBefore { .. }
@@ -349,6 +351,32 @@ mod tests {
             .expect("nessuna risposta dal query actor");
         let reply = reply.expect("il round-trip CallPath doveva riuscire");
         assert_eq!(reply.status, codeos_types::bus::CallPathStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn routes_impact_to_query_actor() {
+        // L'analisi d'impatto (L2) è competenza del Query Engine: il Dispatcher
+        // deve instradare anche Command::Impact all'attore query e riportare la
+        // risposta. Su un grafo vuoto il nome è ignoto: l'esito è un Ok con stato
+        // Unknown (non un errore) — il round-trip attraverso il bus regge.
+        let system = spawn();
+        let (reply_to, mut reply_rx) = reply_channel();
+
+        system
+            .commands
+            .send(Command::Impact {
+                name: "repo".to_string(),
+                reply_to,
+            })
+            .await
+            .expect("front door chiusa");
+
+        let reply = reply_rx
+            .recv()
+            .await
+            .expect("nessuna risposta dal query actor");
+        let reply = reply.expect("il round-trip Impact doveva riuscire");
+        assert_eq!(reply.status, codeos_types::bus::ImpactStatus::Unknown);
     }
 
     #[tokio::test]

@@ -76,6 +76,39 @@ message CallPathResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Impact — livello L2: "cosa dipende da X?" — chi chiama un'entità nominata.
+// Tiene separati i chiamanti CONFERMATI (archi `Calls` risolti) dai POSSIBILI
+// (riferimenti non risolti il cui nome combacia): il confine certo/possibile
+// resta esplicito sul filo, mai collassato in un numero o in un sì/no.
+// ---------------------------------------------------------------------------
+
+message ImpactRequest {
+  // Nome dell'entità di cui misurare l'impatto (qualificato o solo il segmento finale).
+  string name = 1;
+}
+
+// Un chiamante POSSIBILE: una sorgente con un riferimento non risolto il cui
+// nome combacia col nome semplice dell'entità. Non confermato, ma nemmeno nascosto.
+message PossibleCaller {
+  Entity source = 1;
+  // Il riferimento testuale grezzo dal sorgente (es. "schema.validate").
+  string reference = 2;
+}
+
+message ImpactResponse {
+  // Testo già formattato, pronto per il terminale o per un LLM.
+  string formatted = 1;
+  // Stato esplicito dell'esito: "found" | "unknown" | "ambiguous".
+  string status = 2;
+  // Chiamanti CERTI: per ciascuno esiste un arco `Calls` risolto verso l'entità.
+  repeated Entity confirmed_callers = 3;
+  // Chiamanti POSSIBILI: un riferimento non risolto ne combacia il nome.
+  repeated PossibleCaller possible_callers = 4;
+  // Candidati da disambiguare ("ambiguous") o suggerimenti ("unknown").
+  repeated Entity candidates = 5;
+}
+
+// ---------------------------------------------------------------------------
 // RecordDecision — "perché è scritto così?": registra una decisione storica.
 // ---------------------------------------------------------------------------
 
@@ -331,6 +364,7 @@ message WhyResponse {
 service CodeOs {
   rpc QueryGraph(QueryGraphRequest) returns (QueryGraphResponse);
   rpc CallPath(CallPathRequest) returns (CallPathResponse);
+  rpc Impact(ImpactRequest) returns (ImpactResponse);
   rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
   rpc IndexProject(IndexProjectRequest) returns (IndexProjectResponse);
   rpc IndexFiles(IndexFilesRequest) returns (IndexFilesResponse);

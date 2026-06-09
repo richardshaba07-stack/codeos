@@ -26,7 +26,8 @@ use std::pin::Pin;
 use codeos_core::DispatcherHandle;
 use codeos_types::bus::{
     ArchitecturalGapInfo, CallPathStatus, CodeOsEvent, Command, DecisionFossilInfo,
-    GraphQualityInfo, LayeringCandidateInfo, LayeringInvariantInfo, NewDecision, QueryRequest,
+    GraphQualityInfo, ImpactStatus, LayeringCandidateInfo, LayeringInvariantInfo, NewDecision,
+    PossibleCallerInfo, QueryRequest,
 };
 use codeos_types::{Entity, EntityId, EntityKind, Relation, RelationKind, SourceLocation};
 use tokio::sync::{broadcast, mpsc};
@@ -211,6 +212,40 @@ impl CodeOs for CodeOsService {
             formatted: reply.formatted,
             status: call_path_status_name(reply.status).to_string(),
             steps: reply.steps.into_iter().map(entity_to_proto).collect(),
+            candidates: reply.candidates.into_iter().map(entity_to_proto).collect(),
+        }))
+    }
+
+    async fn impact(
+        &self,
+        request: Request<proto::ImpactRequest>,
+    ) -> Result<Response<proto::ImpactResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::Impact {
+                name: req.name,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let reply = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal query actor"))?
+            .map_err(|e| Status::internal(format!("impact fallita: {e}")))?;
+
+        Ok(Response::new(proto::ImpactResponse {
+            formatted: reply.formatted,
+            status: impact_status_name(reply.status).to_string(),
+            confirmed_callers: reply.confirmed.into_iter().map(entity_to_proto).collect(),
+            possible_callers: reply
+                .possible
+                .into_iter()
+                .map(possible_caller_to_proto)
+                .collect(),
             candidates: reply.candidates.into_iter().map(entity_to_proto).collect(),
         }))
     }
@@ -644,6 +679,28 @@ fn call_path_status_name(status: CallPathStatus) -> &'static str {
     }
 }
 
+/// Nome stabile dello stato dell'analisi d'impatto per il filo gRPC. La CLI e gli
+/// agent lo leggono come stringa (`found`/`unknown`/`ambiguous`). Non c'è un
+/// `no_path`: un'entità che esiste ma che nessuno chiama è comunque `found`, con
+/// liste di chiamanti vuote — la verità «esiste, nessun chiamante noto» non si
+/// collassa con «non esiste».
+fn impact_status_name(status: ImpactStatus) -> &'static str {
+    match status {
+        ImpactStatus::Found => "found",
+        ImpactStatus::Unknown => "unknown",
+        ImpactStatus::Ambiguous => "ambiguous",
+    }
+}
+
+/// Converte un chiamante possibile dal bus al suo specchio proto, preservando il
+/// riferimento grezzo dal sorgente (il PERCHÉ del sospetto, mai inventato).
+fn possible_caller_to_proto(pc: PossibleCallerInfo) -> proto::PossibleCaller {
+    proto::PossibleCaller {
+        source: Some(entity_to_proto(pc.source)),
+        reference: pc.reference,
+    }
+}
+
 fn relation_to_proto(relation: Relation) -> proto::Relation {
     proto::Relation {
         id: relation.id.to_string(),
@@ -889,6 +946,27 @@ mod tests {
         // inventato per un'entità che non esiste.
         assert_eq!(response.status, "unknown");
         assert!(response.steps.is_empty());
+        assert!(!response.formatted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn impact_over_the_wire_is_unknown_on_empty_graph() {
+        let (mut client, _events) = start_server().await;
+
+        let response = client
+            .impact(proto::ImpactRequest {
+                name: "repo".to_string(),
+            })
+            .await
+            .expect("RPC Impact fallita")
+            .into_inner();
+
+        // Grafo vuoto: il nome è ignoto ⇒ stato "unknown" esplicito, nessun
+        // chiamante (né certo né possibile), ma un messaggio onesto è sempre
+        // prodotto. Mai un impatto inventato per un'entità che non esiste.
+        assert_eq!(response.status, "unknown");
+        assert!(response.confirmed_callers.is_empty());
+        assert!(response.possible_callers.is_empty());
         assert!(!response.formatted.is_empty());
     }
 

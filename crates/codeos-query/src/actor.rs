@@ -54,6 +54,13 @@ impl QueryActor {
                     }
                     let _ = reply_to.send(result).await;
                 }
+                Command::Impact { name, reply_to } => {
+                    let result = self.engine.impact_by_name(&name).await;
+                    if let Err(err) = &result {
+                        tracing::warn!(error = %err, "QueryActor: impact fallita");
+                    }
+                    let _ = reply_to.send(result).await;
+                }
                 other => {
                     tracing::warn!(?other, "query actor: comando non di sua competenza");
                 }
