@@ -376,6 +376,96 @@ impl QueryEngine {
         Ok(Some(CallPath { steps }))
     }
 
+    /// Livello L2 — **impatto**: *chi chiama X?* Risponde a "cosa cambia se tocco X?"
+    /// elencando i chiamanti dell'entità, tenuti in due verità distinte e mai mescolate:
+    ///
+    /// - **confermati**: esiste un arco `Calls` RISOLTO che punta a X. Il grafo ha
+    ///   già legato la chiamata — toccare X impatta questi chiamanti con certezza.
+    /// - **possibili**: un arco `Unresolved` il cui nome testuale combacia, sull'
+    ///   ultimo segmento, col nome semplice di X. Il resolver NON l'ha legato (tipo
+    ///   del receiver ignoto, omonimia…), ma il nome corrisponde: POTREBBE chiamare
+    ///   X. Non lo nascondiamo (sottostimerebbe il raggio d'impatto) né lo spacciamo
+    ///   per certo (sarebbe un arco che mente): lo mostriamo come *possibile*, col
+    ///   riferimento grezzo, da verificare.
+    ///
+    /// È la tesi anti-falso-positivo applicata all'analisi d'impatto: il confine tra
+    /// «so che dipende» e «potrebbe dipendere» resta esplicito, invece di collassare
+    /// in un sì/no che mentirebbe in una delle due direzioni.
+    ///
+    /// `None` SOLO se `entity_id` non è nel grafo (non si calcola l'impatto di
+    /// un'entità inventata). Un'entità che nessuno chiama dà `Some` con entrambe le
+    /// liste vuote: «niente la chiama» è una risposta onesta, non un'assenza di dato.
+    pub async fn impact(&self, entity_id: EntityId) -> anyhow::Result<Option<Impact>> {
+        let Some(entity) = self.storage.get_entity_by_id(&entity_id).await? else {
+            return Ok(None);
+        };
+
+        // Chiamanti CONFERMATI — archi `Calls` risolti che puntano a X. De-duplica
+        // per sorgente: più siti di chiamata nella stessa funzione = un chiamante.
+        let calls_in = self
+            .storage
+            .query_relations(RelationFilter {
+                target_id: Some(entity_id),
+                kind: Some(RelationKind::Calls),
+                ..Default::default()
+            })
+            .await?;
+        let mut confirmed_ids: HashSet<EntityId> = HashSet::new();
+        let mut confirmed_callers: Vec<Entity> = Vec::new();
+        for rel in calls_in {
+            if rel.source_id.is_nil() || !confirmed_ids.insert(rel.source_id) {
+                continue;
+            }
+            if let Some(source) = self.storage.get_entity_by_id(&rel.source_id).await? {
+                confirmed_callers.push(source);
+            }
+        }
+
+        // Chiamanti POSSIBILI — archi `Unresolved` il cui ultimo segmento combacia
+        // col nome semplice di X. Escludiamo le sorgenti già confermate (sappiamo
+        // già che chiamano X) e de-duplichiamo per sorgente. Saltiamo i target senza
+        // nome, e l'intera fase se X non ha un nome semplice (non si confronta col
+        // vuoto: matcherebbe qualunque buco anonimo, un falso positivo di massa).
+        let simple = last_segment(&entity.qualified_name);
+        let mut possible_callers: Vec<PossibleCaller> = Vec::new();
+        if !simple.is_empty() {
+            let unresolved = self
+                .storage
+                .query_relations(RelationFilter {
+                    kind: Some(RelationKind::Unresolved),
+                    ..Default::default()
+                })
+                .await?;
+            let mut possible_ids: HashSet<EntityId> = HashSet::new();
+            for rel in unresolved {
+                let Some(reference) = rel.metadata.get("unresolved_target") else {
+                    continue;
+                };
+                if last_segment(reference) != simple {
+                    continue;
+                }
+                if rel.source_id.is_nil()
+                    || confirmed_ids.contains(&rel.source_id)
+                    || !possible_ids.insert(rel.source_id)
+                {
+                    continue;
+                }
+                if let Some(source) = self.storage.get_entity_by_id(&rel.source_id).await? {
+                    possible_callers.push(PossibleCaller {
+                        source,
+                        reference: reference.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(Some(Impact {
+            entity,
+            confirmed_callers,
+            possible_callers,
+        }))
+    }
+
     /// Risolve UN nome digitato dall'utente a un'unica entità del grafo, in modo
     /// **onesto**. Lo storage cerca per sottostringa (`LIKE %nome%`), perciò qui
     /// stringiamo ai soli match *precisi*: il nome qualificato è esattamente
@@ -511,6 +601,36 @@ pub struct CallPath {
     pub steps: Vec<Entity>,
 }
 
+/// L'**impatto** di un'entità: chi la chiama, secondo il grafo. Tiene separate due
+/// verità che non vanno mai confuse — i chiamanti CONFERMATI (archi `Calls` risolti
+/// verso l'entità) dai chiamanti POSSIBILI (riferimenti `Unresolved` il cui nome
+/// combacia, non confermati). Restituito da [`QueryEngine::impact`]: è la risposta
+/// onesta a "cosa cambia se tocco X?", dove il confine tra certo e possibile resta
+/// visibile invece di collassare in un numero o in un sì/no che mente.
+#[derive(Debug, Clone)]
+pub struct Impact {
+    /// L'entità di cui si misura l'impatto.
+    pub entity: Entity,
+    /// Chiamanti certi: per ciascuno esiste un arco `Calls` risolto verso l'entità.
+    pub confirmed_callers: Vec<Entity>,
+    /// Chiamanti possibili: un riferimento `Unresolved` ne combacia il nome, ma il
+    /// grafo non l'ha legato. Da verificare, non da assumere né presenti né assenti.
+    pub possible_callers: Vec<PossibleCaller>,
+}
+
+/// Un chiamante **possibile**: una sorgente con un riferimento `Unresolved` il cui
+/// nome combacia (sull'ultimo segmento) col nome semplice dell'entità d'impatto. Il
+/// `reference` è il nome grezzo così com'era nel sorgente (es. `schema.validate`),
+/// mai inventato: dice all'utente PERCHÉ la sorgente è sospettata, senza spacciare
+/// la corrispondenza di nome per una chiamata certa.
+#[derive(Debug, Clone)]
+pub struct PossibleCaller {
+    /// L'entità sorgente che POTREBBE chiamare l'entità d'impatto.
+    pub source: Entity,
+    /// Il riferimento testuale non risolto che combacia, dal sorgente.
+    pub reference: String,
+}
+
 /// Esito interno della risoluzione onesta di UN nome a un'entità del grafo
 /// (vedi [`QueryEngine::resolve_one_name`]). Non collassa mai «ignoto» con
 /// «ambiguo»: sono due verità diverse, e l'utente ha bisogno di saperle distinte.
@@ -556,6 +676,19 @@ fn should_follow(kind: RelationKind) -> bool {
 /// `true` per le entità di librerie esterne, da cui non si espande.
 fn is_external(qualified_name: &str) -> bool {
     qualified_name.starts_with("std::") || qualified_name.contains("site-packages")
+}
+
+/// L'ultimo segmento di un nome di riferimento, separato da `.` o `:` (così copre
+/// sia la sintassi a punti di JS/TS/Python — `schema.validate` → `validate` — sia i
+/// path Rust `::` — `Repo::open` → `open`). È il "nome semplice" su cui l'analisi
+/// d'impatto confronta un riferimento non risolto col nome di un'entità: il match è
+/// sul leaf, non sull'intera espressione, così non ci si fa ingannare dal receiver o
+/// dal percorso. Salta i segmenti vuoti (es. la coppia `::`) e, su un nome senza
+/// separatori o solo separatori, ripiega sul nome stesso.
+fn last_segment(name: &str) -> &str {
+    name.rsplit(['.', ':'])
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(name)
 }
 
 /// Ordina per punteggio decrescente (a parità, per nome) e taglia a `limit`.
@@ -823,7 +956,7 @@ fn format_candidate_list(entities: &[Entity]) -> String {
 mod tests {
     use super::*;
     use codeos_graph::GraphResolver;
-    use codeos_parser::{LanguageParser, PythonParser};
+    use codeos_parser::{LanguageParser, PythonParser, TypeScriptParser};
     use codeos_storage::SqliteStorage;
     use std::path::Path;
 
@@ -832,6 +965,22 @@ mod tests {
         let parsed = PythonParser::new().parse_file(Path::new(path), src).await;
         let storage = SqliteStorage::in_memory().unwrap();
         let delta = GraphResolver::new(None)
+            .resolve(&[parsed], &storage)
+            .await
+            .unwrap();
+        storage.apply_delta(delta).await.unwrap();
+        Arc::new(storage)
+    }
+
+    /// Variante TypeScript: serve dove conta il guard "Fix #10" (un membro su
+    /// receiver foreign deve restare `Unresolved`, non legarsi a una funzione libera
+    /// omonima). Passa una project-root così i nomi qualificati sono `src::…::…`.
+    async fn graph_from_ts(path: &str, src: &str) -> Arc<SqliteStorage> {
+        let parsed = TypeScriptParser::new()
+            .parse_file(Path::new(path), src)
+            .await;
+        let storage = SqliteStorage::in_memory().unwrap();
+        let delta = GraphResolver::new(Some("/repo".to_string()))
             .resolve(&[parsed], &storage)
             .await
             .unwrap();
@@ -1385,6 +1534,167 @@ mod tests {
             reply.formatted.contains("ambiguo"),
             "atteso il messaggio di ambiguità, trovato:\n{}",
             reply.formatted
+        );
+    }
+
+    #[tokio::test]
+    async fn impact_lists_every_confirmed_caller() {
+        // Due funzioni chiamano `target`: entrambe sono chiamanti CONFERMATI (archi
+        // `Calls` risolti). Tutto si risolve ⇒ nessun chiamante possibile.
+        let storage = graph_from(
+            "app.py",
+            "def target():\n    pass\n\n\
+             def caller_one():\n    target()\n\n\
+             def caller_two():\n    target()\n",
+        )
+        .await;
+        let target = id_of(&storage, "::target").await;
+        let engine = QueryEngine::new(storage);
+
+        let impact = engine
+            .impact(target)
+            .await
+            .unwrap()
+            .expect("atteso un impatto per un'entità esistente");
+        let confirmed: Vec<&str> = impact
+            .confirmed_callers
+            .iter()
+            .map(|e| e.qualified_name.as_str())
+            .collect();
+        assert_eq!(
+            impact.confirmed_callers.len(),
+            2,
+            "attesi due chiamanti confermati: {confirmed:?}"
+        );
+        assert!(
+            confirmed.iter().any(|n| n.ends_with("::caller_one")),
+            "{confirmed:?}"
+        );
+        assert!(
+            confirmed.iter().any(|n| n.ends_with("::caller_two")),
+            "{confirmed:?}"
+        );
+        assert!(
+            impact.possible_callers.is_empty(),
+            "tutto è risolto: nessun chiamante possibile"
+        );
+    }
+
+    #[tokio::test]
+    async fn impact_separates_possible_callers_from_confirmed_ones() {
+        // Il cuore anti-falso-positivo del livello L2 dal lato dei chiamanti, sul
+        // caso reale di Fix #10. `validate` è una funzione libera; `callBare` la
+        // chiama NUDA (`validate(1)`) ⇒ arco `Calls` risolto ⇒ chiamante CONFERMATO.
+        // `parseInput` fa `schema.validate(data)`: receiver foreign di tipo ignoto, il
+        // resolver NON lega (un arco verso la funzione libera omonima mentirebbe),
+        // resta `Unresolved`. impact() lo deve mostrare come chiamante POSSIBILE —
+        // non confermato, ma nemmeno nascosto — col riferimento grezzo dal sorgente.
+        let storage = graph_from_ts(
+            "/repo/src/v.ts",
+            "export function validate(x: unknown): unknown {\n  return x;\n}\n\
+             export function parseInput(schema: any, data: unknown): unknown {\n  return schema.validate(data);\n}\n\
+             export function callBare(): unknown {\n  return validate(1);\n}\n",
+        )
+        .await;
+        let validate = id_of(&storage, "::validate").await;
+        let engine = QueryEngine::new(storage);
+
+        let impact = engine
+            .impact(validate)
+            .await
+            .unwrap()
+            .expect("atteso un impatto");
+
+        // Confermato: SOLO la call nuda di callBare.
+        let confirmed: Vec<&str> = impact
+            .confirmed_callers
+            .iter()
+            .map(|e| e.qualified_name.as_str())
+            .collect();
+        assert_eq!(
+            impact.confirmed_callers.len(),
+            1,
+            "atteso un solo chiamante confermato (callBare): {confirmed:?}"
+        );
+        assert!(
+            confirmed[0].ends_with("::callBare"),
+            "il chiamante confermato è callBare: {confirmed:?}"
+        );
+
+        // Possibile: parseInput, via il membro foreign `schema.validate` non risolto.
+        let possible: Vec<String> = impact
+            .possible_callers
+            .iter()
+            .map(|p| p.source.qualified_name.clone())
+            .collect();
+        assert_eq!(
+            impact.possible_callers.len(),
+            1,
+            "atteso un solo chiamante possibile (parseInput): {possible:?}"
+        );
+        let pc = &impact.possible_callers[0];
+        assert!(
+            pc.source.qualified_name.ends_with("::parseInput"),
+            "il chiamante possibile è parseInput: {}",
+            pc.source.qualified_name
+        );
+        assert_eq!(
+            last_segment(&pc.reference),
+            "validate",
+            "il riferimento possibile combacia sul leaf `validate`: {}",
+            pc.reference
+        );
+
+        // La prova anti-FP: parseInput NON è tra i confermati — Fix #10 ha evitato la
+        // bugia, e impact() non la reintroduce promuovendo un possibile a certo.
+        assert!(
+            !impact
+                .confirmed_callers
+                .iter()
+                .any(|e| e.qualified_name.ends_with("::parseInput")),
+            "parseInput non deve comparire tra i confermati: la sua call è un membro foreign non risolto"
+        );
+    }
+
+    #[tokio::test]
+    async fn impact_is_some_with_no_callers_for_an_uncalled_entity() {
+        // Una funzione che nessuno chiama: l'impatto esiste (l'entità c'è) ed è
+        // onestamente VUOTO. Non `None` (l'entità esiste) e non chiamanti inventati.
+        let storage = graph_from("app.py", "def lonely():\n    pass\n").await;
+        let lonely = id_of(&storage, "::lonely").await;
+        let engine = QueryEngine::new(storage);
+
+        let impact = engine
+            .impact(lonely)
+            .await
+            .unwrap()
+            .expect("un'entità esistente ma non chiamata ha comunque un impatto (vuoto)");
+        assert!(
+            impact.confirmed_callers.is_empty(),
+            "niente la chiama: nessun confermato"
+        );
+        assert!(
+            impact.possible_callers.is_empty(),
+            "niente la chiama: nessun possibile"
+        );
+        assert!(
+            impact.entity.qualified_name.ends_with("::lonely"),
+            "l'impatto riguarda l'entità giusta: {}",
+            impact.entity.qualified_name
+        );
+    }
+
+    #[tokio::test]
+    async fn impact_is_none_for_an_unknown_entity() {
+        // Un id che non è nel grafo ⇒ None onesto: non si calcola l'impatto di
+        // un'entità inventata, né si restituisce un Impact vuoto su un fantasma.
+        let storage = graph_from("app.py", "def something():\n    pass\n").await;
+        let engine = QueryEngine::new(storage);
+
+        let impact = engine.impact(EntityId::new()).await.unwrap();
+        assert!(
+            impact.is_none(),
+            "un'entità sconosciuta non ha impatto calcolabile: None, non un Impact vuoto"
         );
     }
 }
