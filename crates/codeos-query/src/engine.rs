@@ -1284,6 +1284,15 @@ fn is_callable(kind: EntityKind) -> bool {
     matches!(kind, EntityKind::Function | EntityKind::Method)
 }
 
+/// La "cartella" di un percorso file = il sottosistema (livello L1): tutto prima
+/// dell'ultimo `/`. Senza `/`, il file è nella root del progetto ⇒ `"."`.
+fn parent_dir(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(i) => &path[..i],
+        None => ".",
+    }
+}
+
 /// L'ultimo segmento di un nome di riferimento, separato da `.` o `:` (così copre
 /// sia la sintassi a punti di JS/TS/Python — `schema.validate` → `validate` — sia i
 /// path Rust `::` — `Repo::open` → `open`). È il "nome semplice" su cui l'analisi
@@ -1512,6 +1521,67 @@ fn format_context(
 
     let mut out = String::new();
     out.push_str(&format!("Contesto per: \"{text}\"\n\n"));
+
+    // Livello L1 — VISTA SOTTOSISTEMI: il raggruppamento dei moduli per CARTELLA, un
+    // gradino più in alto di PANORAMICA (che è per file). Compare solo quando AGGREGA
+    // davvero — ≥2 cartelle e meno cartelle che file (cioè almeno una cartella raccoglie
+    // più file): se ogni file sta in una cartella diversa, sarebbe PANORAMICA ridetta.
+    // Posta sopra L0 (zoom dal grosso al fine: sottosistemi → moduli → entità). Esclude
+    // gli `ExternalDependency`, come L0.
+    {
+        let mut files_seen: BTreeSet<&str> = BTreeSet::new();
+        let mut per_dir: BTreeMap<&str, (BTreeSet<&str>, usize)> = BTreeMap::new();
+        for e in entities {
+            if e.kind == EntityKind::ExternalDependency {
+                continue;
+            }
+            let f = e.location.file_path.as_str();
+            files_seen.insert(f);
+            let entry = per_dir.entry(parent_dir(f)).or_default();
+            entry.0.insert(f);
+            entry.1 += 1;
+        }
+        if per_dir.len() >= 2 && per_dir.len() < files_seen.len() {
+            out.push_str("VISTA SOTTOSISTEMI (le cartelle del progetto toccate dal sottografo):\n");
+            let mut dirs: Vec<(&str, usize, usize)> = per_dir
+                .iter()
+                .map(|(d, (fs, n))| (*d, fs.len(), *n))
+                .collect();
+            // Per numero di entità (desc), poi per nome: il sottosistema più centrale
+            // in testa, ordine deterministico.
+            dirs.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
+            for (dir, nfiles, nent) in &dirs {
+                out.push_str(&format!(
+                    "- {dir}/ ({nfiles} file, {nent} entità rilevanti)\n"
+                ));
+            }
+            // Dipendenze tra sottosistemi: archi cross-cartella fra entità non esterne.
+            let mut edges: BTreeSet<(&str, &str)> = BTreeSet::new();
+            for rel in relations {
+                if let (Some(s), Some(t)) = (by_id.get(&rel.source_id), by_id.get(&rel.target_id)) {
+                    if s.kind == EntityKind::ExternalDependency
+                        || t.kind == EntityKind::ExternalDependency
+                    {
+                        continue;
+                    }
+                    let (sd, td) = (
+                        parent_dir(s.location.file_path.as_str()),
+                        parent_dir(t.location.file_path.as_str()),
+                    );
+                    if sd != td {
+                        edges.insert((sd, td));
+                    }
+                }
+            }
+            if !edges.is_empty() {
+                out.push_str("  dipendenze tra sottosistemi:\n");
+                for (s, t) in &edges {
+                    out.push_str(&format!("  - {s}/ → {t}/\n"));
+                }
+            }
+            out.push('\n');
+        }
+    }
 
     // Livello L0 — PANORAMICA: la forma architetturale a colpo d'occhio. Su quali
     // moduli (file) del PROGETTO si distribuisce il sottografo rilevante, e come
@@ -2355,6 +2425,67 @@ mod tests {
         assert!(
             !ctx.contains("PANORAMICA"),
             "un solo modulo: niente sezione PANORAMICA d'eco:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vista_sottosistemi_groups_modules_by_folder() {
+        // Il livello L1. 3 file in 2 cartelle — auth/ (2 file) e data/ (1): la VISTA
+        // SOTTOSISTEMI raggruppa i moduli per cartella, un'ampiezza che PANORAMICA (per
+        // file) non dà. Compare perché aggrega davvero (2 cartelle < 3 file).
+        let storage = graph_from_files(&[
+            ("auth/login.py", "def login():\n    pass\n"),
+            ("auth/session.py", "def session():\n    pass\n"),
+            ("data/repo.py", "def repo():\n    pass\n"),
+        ])
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine
+            .query(&nl("login session repo"))
+            .await
+            .unwrap()
+            .formatted_context;
+
+        assert!(
+            ctx.contains("VISTA SOTTOSISTEMI"),
+            "il sottografo spazia su 2 cartelle con aggregazione: deve esserci L1:\n{ctx}"
+        );
+        let l1 = ctx
+            .split("VISTA SOTTOSISTEMI")
+            .nth(1)
+            .expect("la sezione L1 è appena stata verificata presente");
+        assert!(
+            l1.contains("auth/ (2 file") && l1.contains("data/ (1 file"),
+            "L1 deve raggruppare per cartella col conteggio dei file:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_vista_sottosistemi_when_each_file_is_its_own_folder() {
+        // 2 file in 2 cartelle diverse, 1 ciascuna: il raggruppamento L1 non aggrega
+        // nulla (sarebbe PANORAMICA ridetta) ⇒ niente sezione VISTA SOTTOSISTEMI. La
+        // PANORAMICA (per file) compare comunque, perché i moduli sono 2.
+        let storage = graph_from_files(&[
+            ("auth/login.py", "def login():\n    pass\n"),
+            ("data/repo.py", "def repo():\n    pass\n"),
+        ])
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine
+            .query(&nl("login repo"))
+            .await
+            .unwrap()
+            .formatted_context;
+
+        assert!(
+            !ctx.contains("VISTA SOTTOSISTEMI"),
+            "nessuna aggregazione (1 file per cartella): niente L1:\n{ctx}"
+        );
+        assert!(
+            ctx.contains("PANORAMICA"),
+            "i 2 moduli vanno comunque in PANORAMICA:\n{ctx}"
         );
     }
 
