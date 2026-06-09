@@ -25,8 +25,8 @@ use std::pin::Pin;
 
 use codeos_core::DispatcherHandle;
 use codeos_types::bus::{
-    ArchitecturalGapInfo, CodeOsEvent, Command, DecisionFossilInfo, GraphQualityInfo,
-    LayeringCandidateInfo, LayeringInvariantInfo, NewDecision, QueryRequest,
+    ArchitecturalGapInfo, CallPathStatus, CodeOsEvent, Command, DecisionFossilInfo,
+    GraphQualityInfo, LayeringCandidateInfo, LayeringInvariantInfo, NewDecision, QueryRequest,
 };
 use codeos_types::{Entity, EntityId, EntityKind, Relation, RelationKind, SourceLocation};
 use tokio::sync::{broadcast, mpsc};
@@ -182,6 +182,36 @@ impl CodeOs for CodeOsService {
                 .into_iter()
                 .map(relation_to_proto)
                 .collect(),
+        }))
+    }
+
+    async fn call_path(
+        &self,
+        request: Request<proto::CallPathRequest>,
+    ) -> Result<Response<proto::CallPathResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::CallPath {
+                from: req.from,
+                to: req.to,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let reply = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal query actor"))?
+            .map_err(|e| Status::internal(format!("call_path fallita: {e}")))?;
+
+        Ok(Response::new(proto::CallPathResponse {
+            formatted: reply.formatted,
+            status: call_path_status_name(reply.status).to_string(),
+            steps: reply.steps.into_iter().map(entity_to_proto).collect(),
+            candidates: reply.candidates.into_iter().map(entity_to_proto).collect(),
         }))
     }
 
@@ -602,6 +632,18 @@ fn entity_to_proto(entity: Entity) -> proto::Entity {
     }
 }
 
+/// Nome stabile dello stato del cammino di chiamata per il filo gRPC. La CLI e
+/// gli agent lo leggono come stringa (`found`/`no_path`/`unknown`/`ambiguous`):
+/// un contratto esplicito che non collassa i quattro esiti onesti in un booleano.
+fn call_path_status_name(status: CallPathStatus) -> &'static str {
+    match status {
+        CallPathStatus::Found => "found",
+        CallPathStatus::NoPath => "no_path",
+        CallPathStatus::Unknown => "unknown",
+        CallPathStatus::Ambiguous => "ambiguous",
+    }
+}
+
 fn relation_to_proto(relation: Relation) -> proto::Relation {
     proto::Relation {
         id: relation.id.to_string(),
@@ -827,6 +869,27 @@ mod tests {
         // Grafo vuoto: nessuna entità, ma il contesto formattato è sempre prodotto.
         assert!(response.entities.is_empty());
         assert!(!response.formatted_context.is_empty());
+    }
+
+    #[tokio::test]
+    async fn call_path_over_the_wire_is_unknown_on_empty_graph() {
+        let (mut client, _events) = start_server().await;
+
+        let response = client
+            .call_path(proto::CallPathRequest {
+                from: "handler".to_string(),
+                to: "repo".to_string(),
+            })
+            .await
+            .expect("RPC CallPath fallita")
+            .into_inner();
+
+        // Grafo vuoto: entrambi i nomi sono ignoti ⇒ stato "unknown" esplicito,
+        // nessun passo, ma un messaggio onesto è sempre prodotto. Mai un cammino
+        // inventato per un'entità che non esiste.
+        assert_eq!(response.status, "unknown");
+        assert!(response.steps.is_empty());
+        assert!(!response.formatted.is_empty());
     }
 
     #[tokio::test]

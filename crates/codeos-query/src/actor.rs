@@ -47,6 +47,13 @@ impl QueryActor {
                     }
                     let _ = reply_to.send(result).await;
                 }
+                Command::CallPath { from, to, reply_to } => {
+                    let result = self.engine.call_path_by_name(&from, &to).await;
+                    if let Err(err) = &result {
+                        tracing::warn!(error = %err, "QueryActor: call_path fallita");
+                    }
+                    let _ = reply_to.send(result).await;
+                }
                 other => {
                     tracing::warn!(?other, "query actor: comando non di sua competenza");
                 }

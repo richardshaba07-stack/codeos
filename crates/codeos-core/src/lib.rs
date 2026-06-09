@@ -240,7 +240,7 @@ async fn dispatch_loop(mut commands: mpsc::Receiver<Command>, routes: Routes) {
             | Command::IndexFiles { .. }
             | Command::ReIndexFile { .. }
             | Command::RemoveFiles { .. } => (&routes.parser, "parser"),
-            Command::QueryGraph { .. } => (&routes.query, "query"),
+            Command::QueryGraph { .. } | Command::CallPath { .. } => (&routes.query, "query"),
             Command::RecordDecision { .. } => (&routes.memory, "memory"),
             Command::ArchitectureReport { .. }
             | Command::GuardBefore { .. }
@@ -322,6 +322,33 @@ mod tests {
             .await
             .expect("nessuna risposta dal query actor");
         assert!(reply.is_ok());
+    }
+
+    #[tokio::test]
+    async fn routes_call_path_to_query_actor() {
+        // Il cammino di chiamata (L2) è competenza del Query Engine: il Dispatcher
+        // deve instradare anche Command::CallPath all'attore query e riportare la
+        // risposta. Su un grafo vuoto i due nomi sono ignoti: l'esito è un Ok con
+        // stato Unknown (non un errore) — il round-trip attraverso il bus regge.
+        let system = spawn();
+        let (reply_to, mut reply_rx) = reply_channel();
+
+        system
+            .commands
+            .send(Command::CallPath {
+                from: "handler".to_string(),
+                to: "repo".to_string(),
+                reply_to,
+            })
+            .await
+            .expect("front door chiusa");
+
+        let reply = reply_rx
+            .recv()
+            .await
+            .expect("nessuna risposta dal query actor");
+        let reply = reply.expect("il round-trip CallPath doveva riuscire");
+        assert_eq!(reply.status, codeos_types::bus::CallPathStatus::Unknown);
     }
 
     #[tokio::test]

@@ -84,6 +84,33 @@ async fn main() -> anyhow::Result<()> {
                 response.relations.len()
             );
         }
+        "path" => {
+            if args.len() < 4 {
+                eprintln!("Errore: servono due nomi: l'entità di partenza e quella di arrivo.");
+                eprintln!("Uso: codeos path <da> <a>");
+                std::process::exit(1);
+            }
+            let from = &args[2];
+            let to = &args[3];
+
+            let mut client = connect_server().await?;
+            println!("⚡ Cerco il cammino di chiamata da \"{from}\" a \"{to}\"...");
+
+            let req = proto::CallPathRequest {
+                from: from.clone(),
+                to: to.clone(),
+            };
+            let response = client.call_path(req).await?.into_inner();
+
+            println!("\n{}", response.formatted);
+
+            // Esito binario: esci con codice ≠0 quando NON c'è un cammino trovato
+            // (no_path/unknown/ambiguous), così script e CI lo colgono senza dover
+            // analizzare il testo. Lo stato resta esplicito e onesto.
+            if response.status != "found" {
+                std::process::exit(1);
+            }
+        }
         "doctor" => {
             run_doctor().await;
         }
@@ -551,6 +578,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "query \"<text>\"",
         "Interroga il grafo in linguaggio naturale e genera il contesto minimo per un LLM.",
+    ),
+    (
+        "path <da> <a>",
+        "Mostra il cammino di chiamata onesto tra due entità (segue solo archi Calls risolti; mai inventato).",
     ),
     (
         "doctor",
@@ -1083,8 +1114,8 @@ mod tests {
     fn usage_documents_every_implemented_command() {
         let usage = usage_text();
         for cmd in [
-            "index", "report", "query", "doctor", "guard", "context", "mri", "why", "simulate",
-            "help",
+            "index", "report", "query", "path", "doctor", "guard", "context", "mri", "why",
+            "simulate", "help",
         ] {
             assert!(
                 usage.contains(cmd),

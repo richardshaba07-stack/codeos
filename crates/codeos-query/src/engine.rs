@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use codeos_memory::{Decision, DecisionStore, InMemoryDecisionStore};
 use codeos_storage::{GraphStorage, RelationFilter};
-use codeos_types::bus::{QueryRequest, QueryResponse};
+use codeos_types::bus::{CallPathReply, CallPathStatus, QueryRequest, QueryResponse};
 use codeos_types::{Entity, EntityId, Relation, RelationKind};
 
 /// Profondità massima della BFS (Passo 4).
@@ -375,6 +375,129 @@ impl QueryEngine {
         }
         Ok(Some(CallPath { steps }))
     }
+
+    /// Risolve UN nome digitato dall'utente a un'unica entità del grafo, in modo
+    /// **onesto**. Lo storage cerca per sottostringa (`LIKE %nome%`), perciò qui
+    /// stringiamo ai soli match *precisi*: il nome qualificato è esattamente
+    /// `name`, oppure termina con `::name` (l'utente ha dato solo il segmento
+    /// finale, es. `charge` per `PaymentService::charge`).
+    ///
+    /// - esattamente 1 match preciso ⇒ [`NameResolution::Resolved`].
+    /// - più match precisi ⇒ [`NameResolution::Ambiguous`] (li elenca tutti: non
+    ///   scegliamo noi, sarebbe un'entità che l'utente non ha chiesto).
+    /// - nessun match preciso ⇒ [`NameResolution::Unknown`], con gli eventuali
+    ///   quasi-omonimi (i match per sola sottostringa) come suggerimento.
+    async fn resolve_one_name(&self, name: &str) -> anyhow::Result<NameResolution> {
+        let candidates = self.storage.find_entities_by_name_pattern(name).await?;
+        let tail = format!("::{name}");
+        let mut seen: HashSet<EntityId> = HashSet::new();
+        let precise: Vec<Entity> = candidates
+            .iter()
+            .filter(|e| e.qualified_name == name || e.qualified_name.ends_with(&tail))
+            .filter(|e| seen.insert(e.id))
+            .cloned()
+            .collect();
+
+        match precise.len() {
+            1 => Ok(NameResolution::Resolved(
+                precise.into_iter().next().expect("len == 1"),
+            )),
+            0 => Ok(NameResolution::Unknown(candidates)),
+            _ => Ok(NameResolution::Ambiguous(precise)),
+        }
+    }
+
+    /// Livello L2 (per nome): risolve onestamente `from` e `to` a un'unica entità
+    /// ciascuno, poi delega a [`QueryEngine::call_path`]. È il confine d'ingresso
+    /// del livello L2 dal mondo esterno (CLI/gRPC), dove i nomi sono testo libero.
+    ///
+    /// Tesi anti-falso-positivo applicata all'ingresso: se un nome è ignoto o
+    /// ambiguo lo *dichiariamo* (con i candidati), invece di scegliere a caso
+    /// un'entità e restituire un cammino che nessuno ha chiesto. L'ambiguità ha
+    /// precedenza sull'ignoto perché è più azionabile (l'utente disambigua).
+    pub async fn call_path_by_name(&self, from: &str, to: &str) -> anyhow::Result<CallPathReply> {
+        let rf = self.resolve_one_name(from).await?;
+        let rt = self.resolve_one_name(to).await?;
+
+        // 1) Ambiguità (prima: l'utente può risolverla scegliendo un candidato).
+        let mut ambiguous: Vec<Entity> = Vec::new();
+        let mut msg = String::new();
+        if let NameResolution::Ambiguous(c) = &rf {
+            msg.push_str(&format!(
+                "Il nome di partenza \"{from}\" è ambiguo: {} entità corrispondono.\n",
+                c.len()
+            ));
+            ambiguous.extend(c.iter().cloned());
+        }
+        if let NameResolution::Ambiguous(c) = &rt {
+            msg.push_str(&format!(
+                "Il nome di arrivo \"{to}\" è ambiguo: {} entità corrispondono.\n",
+                c.len()
+            ));
+            ambiguous.extend(c.iter().cloned());
+        }
+        if !ambiguous.is_empty() {
+            msg.push_str("Specifica quale (nome qualificato completo):\n");
+            msg.push_str(&format_candidate_list(&ambiguous));
+            return Ok(CallPathReply {
+                formatted: msg,
+                status: CallPathStatus::Ambiguous,
+                steps: Vec::new(),
+                candidates: ambiguous,
+            });
+        }
+
+        // 2) Ignoto (nessun nome corrispondente). Offriamo i quasi-omonimi.
+        let mut suggestions: Vec<Entity> = Vec::new();
+        let mut unknown = false;
+        let mut msg = String::new();
+        if let NameResolution::Unknown(s) = &rf {
+            unknown = true;
+            msg.push_str(&format!("Nessuna entità di nome \"{from}\" nel grafo.\n"));
+            suggestions.extend(s.iter().cloned());
+        }
+        if let NameResolution::Unknown(s) = &rt {
+            unknown = true;
+            msg.push_str(&format!("Nessuna entità di nome \"{to}\" nel grafo.\n"));
+            suggestions.extend(s.iter().cloned());
+        }
+        if unknown {
+            if suggestions.is_empty() {
+                msg.push_str("(nessun nome simile trovato)\n");
+            } else {
+                msg.push_str("Forse intendevi:\n");
+                msg.push_str(&format_candidate_list(&suggestions));
+            }
+            return Ok(CallPathReply {
+                formatted: msg,
+                status: CallPathStatus::Unknown,
+                steps: Vec::new(),
+                candidates: suggestions,
+            });
+        }
+
+        // 3) Entrambi risolti a un'unica entità: cerca il cammino reale.
+        let (NameResolution::Resolved(ef), NameResolution::Resolved(et)) = (rf, rt) else {
+            // Ambiguità e ignoto sono già stati gestiti e hanno fatto `return`.
+            unreachable!("rf e rt sono entrambi Resolved a questo punto");
+        };
+        let from_q = ef.qualified_name.clone();
+        let to_q = et.qualified_name.clone();
+        match self.call_path(ef.id, et.id).await? {
+            Some(path) => Ok(CallPathReply {
+                formatted: format_call_path_found(&from_q, &to_q, &path.steps),
+                status: CallPathStatus::Found,
+                steps: path.steps,
+                candidates: Vec::new(),
+            }),
+            None => Ok(CallPathReply {
+                formatted: format_no_path(&from_q, &to_q),
+                status: CallPathStatus::NoPath,
+                steps: Vec::new(),
+                candidates: Vec::new(),
+            }),
+        }
+    }
 }
 
 /// Un **cammino di chiamata** onesto: la sequenza ordinata di entità da una
@@ -386,6 +509,18 @@ impl QueryEngine {
 #[derive(Debug, Clone)]
 pub struct CallPath {
     pub steps: Vec<Entity>,
+}
+
+/// Esito interno della risoluzione onesta di UN nome a un'entità del grafo
+/// (vedi [`QueryEngine::resolve_one_name`]). Non collassa mai «ignoto» con
+/// «ambiguo»: sono due verità diverse, e l'utente ha bisogno di saperle distinte.
+enum NameResolution {
+    /// Un solo match preciso: l'entità.
+    Resolved(Entity),
+    /// Più match precisi: i candidati tra cui disambiguare.
+    Ambiguous(Vec<Entity>),
+    /// Nessun match preciso: i quasi-omonimi per sottostringa (può essere vuoto).
+    Unknown(Vec<Entity>),
 }
 
 /// Risultato dell'espansione BFS, prima della selezione finale.
@@ -633,6 +768,55 @@ fn format_context(
 /// Comprime il testo multilinea del razionale in una sola riga leggibile.
 fn one_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Rende il cammino di chiamata trovato: ogni passo su una riga, con la freccia
+/// `→` tra l'uno e il successivo. Ogni freccia è un arco `Calls` risolto.
+fn format_call_path_found(from_q: &str, to_q: &str, steps: &[Entity]) -> String {
+    let mut out = format!("Cammino di chiamata da \"{from_q}\" a \"{to_q}\":\n\n");
+    for (i, entity) in steps.iter().enumerate() {
+        if i == 0 {
+            out.push_str(&format!("  {}\n", entity.qualified_name));
+        } else {
+            out.push_str(&format!("    → {}\n", entity.qualified_name));
+        }
+    }
+    out.push_str(&format!(
+        "\n({} passi, ogni freccia è un arco `Calls` risolto del grafo.)\n",
+        steps.len()
+    ));
+    out
+}
+
+/// Rende l'assenza di cammino in modo onesto: ricorda che la ricerca segue i soli
+/// archi `Calls` risolti, quindi «nessun cammino noto» non è prova di «nessuna
+/// chiamata» — un riferimento non risolto potrebbe nasconderne uno.
+fn format_no_path(from_q: &str, to_q: &str) -> String {
+    format!(
+        "Nessun cammino di chiamata noto da \"{from_q}\" a \"{to_q}\".\n\n\
+         (Cercato solo lungo archi `Calls` risolti. Un riferimento non risolto — un\n\
+         BUCO NOTO — potrebbe nascondere un collegamento reale: assenza di cammino\n\
+         noto non è prova di assenza di chiamata.)\n"
+    )
+}
+
+/// Elenca delle entità candidate (per disambiguazione o suggerimento), una per
+/// riga, ordinate e deduplicate per stabilità dell'output.
+fn format_candidate_list(entities: &[Entity]) -> String {
+    let mut lines: Vec<String> = entities
+        .iter()
+        .map(|e| {
+            format!(
+                "  - {} [{:?}] — {}",
+                e.qualified_name, e.kind, e.location.file_path
+            )
+        })
+        .collect();
+    lines.sort();
+    lines.dedup();
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
 }
 
 #[cfg(test)]
@@ -1093,6 +1277,114 @@ mod tests {
             path.is_none(),
             "l'unica chiamata di handler è Unresolved: nessun cammino verso target, \
              non un collegamento inventato"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_path_by_name_resolves_short_names_and_finds_the_chain() {
+        // L'utente digita solo il segmento finale ("handler", "repo"): il confine
+        // d'ingresso li risolve all'unica entità e trova il cammino transitivo.
+        let storage = graph_from(
+            "app.py",
+            "def repo():\n    pass\n\ndef service():\n    repo()\n\ndef handler():\n    service()\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let reply = engine.call_path_by_name("handler", "repo").await.unwrap();
+        assert_eq!(reply.status, CallPathStatus::Found);
+        let names: Vec<String> = reply
+            .steps
+            .iter()
+            .map(|e| e.qualified_name.clone())
+            .collect();
+        assert_eq!(reply.steps.len(), 3, "cammino transitivo: {names:?}");
+        assert!(names[0].ends_with("::handler"), "sorgente: {names:?}");
+        assert!(names[2].ends_with("::repo"), "destinazione: {names:?}");
+        assert!(
+            reply.formatted.contains("Cammino di chiamata"),
+            "atteso il rendering del cammino, trovato:\n{}",
+            reply.formatted
+        );
+    }
+
+    #[tokio::test]
+    async fn call_path_by_name_reports_no_path_without_inventing_one() {
+        // Entrambi i nomi risolvono, ma non si chiamano: stato NoPath onesto, mai
+        // un cammino fabbricato per accontentare la domanda.
+        let storage = graph_from(
+            "app.py",
+            "def handler():\n    pass\n\ndef orphan():\n    pass\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let reply = engine.call_path_by_name("handler", "orphan").await.unwrap();
+        assert_eq!(reply.status, CallPathStatus::NoPath);
+        assert!(reply.steps.is_empty(), "NoPath non porta passi");
+        assert!(
+            reply.formatted.contains("Nessun cammino"),
+            "atteso il messaggio onesto di assenza, trovato:\n{}",
+            reply.formatted
+        );
+    }
+
+    #[tokio::test]
+    async fn call_path_by_name_declares_unknown_instead_of_guessing() {
+        // Un nome che non corrisponde ad alcuna entità ⇒ Unknown esplicito, nessun
+        // passo: non inventiamo un'entità per poterci appendere un cammino.
+        let storage = graph_from("app.py", "def handler():\n    pass\n").await;
+        let engine = QueryEngine::new(storage);
+
+        let reply = engine
+            .call_path_by_name("handler", "does_not_exist")
+            .await
+            .unwrap();
+        assert_eq!(reply.status, CallPathStatus::Unknown);
+        assert!(reply.steps.is_empty());
+        assert!(
+            reply
+                .formatted
+                .contains("Nessuna entità di nome \"does_not_exist\""),
+            "atteso il nome ignoto, trovato:\n{}",
+            reply.formatted
+        );
+    }
+
+    #[tokio::test]
+    async fn call_path_by_name_declares_ambiguous_instead_of_picking_one() {
+        // "charge" corrisponde a due metodi (A::charge, B::charge): NON ne scegliamo
+        // uno a caso — sarebbe un cammino che l'utente non ha chiesto. Stato
+        // Ambiguous, con entrambi i candidati elencati per disambiguare.
+        let storage = graph_from(
+            "app.py",
+            "class A:\n    def charge(self):\n        pass\n\n\
+             class B:\n    def charge(self):\n        pass\n\n\
+             def handler():\n    pass\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let reply = engine.call_path_by_name("charge", "handler").await.unwrap();
+        assert_eq!(reply.status, CallPathStatus::Ambiguous);
+        assert!(
+            reply.steps.is_empty(),
+            "un nome ambiguo non produce cammino"
+        );
+        assert_eq!(
+            reply.candidates.len(),
+            2,
+            "attesi i due metodi charge come candidati: {:?}",
+            reply
+                .candidates
+                .iter()
+                .map(|e| e.qualified_name.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            reply.formatted.contains("ambiguo"),
+            "atteso il messaggio di ambiguità, trovato:\n{}",
+            reply.formatted
         );
     }
 }

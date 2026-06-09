@@ -43,6 +43,15 @@ pub enum Command {
         query: QueryRequest,
         reply_to: mpsc::Sender<anyhow::Result<QueryResponse>>,
     },
+    /// Livello L2 del context builder: il **cammino di chiamata** onesto tra due
+    /// entità nominate dall'utente. `from`/`to` sono nomi (qualificati o solo il
+    /// segmento finale): il Query Engine li risolve a un'unica entità — senza mai
+    /// indovinare — e poi cerca il cammino lungo i soli archi `Calls` risolti.
+    CallPath {
+        from: String,
+        to: String,
+        reply_to: mpsc::Sender<anyhow::Result<CallPathReply>>,
+    },
     /// Registra una decisione architetturale nel Memory Engine.
     RecordDecision {
         decision: NewDecision,
@@ -141,6 +150,43 @@ pub struct QueryResponse {
     pub entities: Vec<Entity>,
     /// Relazioni tra le entità incluse.
     pub relations: Vec<Relation>,
+}
+
+/// Esito della ricerca di un cammino di chiamata (livello L2). I quattro stati
+/// sono *onesti e distinti*: non collassiamo «non trovato» con «non lo so».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallPathStatus {
+    /// Cammino trovato: ogni passo consecutivo è un arco `Calls` risolto.
+    Found,
+    /// Entrambi gli estremi sono noti, ma non esiste cammino lungo i soli archi
+    /// `Calls` risolti. NON è prova di assenza di chiamata: un riferimento non
+    /// risolto potrebbe nasconderne uno.
+    NoPath,
+    /// Almeno un nome non corrisponde ad alcuna entità del grafo.
+    Unknown,
+    /// Almeno un nome corrisponde a più entità: serve disambiguare. Non scegliamo
+    /// noi un'entità a caso (sarebbe un cammino che l'utente non ha chiesto).
+    Ambiguous,
+}
+
+/// Risposta del Query Engine alla richiesta [`Command::CallPath`].
+///
+/// Filosofia anti-falso-positivo applicata al livello L2: `steps` è valorizzato
+/// **solo** quando `status == Found`, e ogni freccia tra due passi consecutivi è
+/// un arco `Calls` realmente presente nel grafo. `candidates` porta i nomi tra
+/// cui scegliere (stato `Ambiguous`) o i quasi-omonimi suggeriti (stato
+/// `Unknown`), così l'utente sa *perché* non c'è un cammino, invece di ricevere
+/// un risultato inventato.
+#[derive(Debug, Clone)]
+pub struct CallPathReply {
+    /// Testo già formattato, pronto per il terminale o per un LLM.
+    pub formatted: String,
+    /// Lo stato esplicito dell'esito (vedi [`CallPathStatus`]). Sempre noto.
+    pub status: CallPathStatus,
+    /// Il cammino, dalla sorgente alla destinazione, quando `status == Found`.
+    pub steps: Vec<Entity>,
+    /// I candidati da disambiguare (`Ambiguous`) o i suggerimenti (`Unknown`).
+    pub candidates: Vec<Entity>,
 }
 
 /// Dati per registrare una nuova decisione. La `Decision` completa (con `id` e

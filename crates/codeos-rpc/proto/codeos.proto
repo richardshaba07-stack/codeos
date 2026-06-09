@@ -54,6 +54,28 @@ message QueryGraphResponse {
 }
 
 // ---------------------------------------------------------------------------
+// CallPath — livello L2: il cammino di chiamata onesto tra due entità nominate.
+// ---------------------------------------------------------------------------
+
+message CallPathRequest {
+  // Nome dell'entità di partenza (qualificato o solo il segmento finale).
+  string from = 1;
+  // Nome dell'entità di arrivo (qualificato o solo il segmento finale).
+  string to = 2;
+}
+
+message CallPathResponse {
+  // Testo già formattato, pronto per il terminale o per un LLM.
+  string formatted = 1;
+  // Stato esplicito dell'esito: "found" | "no_path" | "unknown" | "ambiguous".
+  string status = 2;
+  // Il cammino, dalla sorgente alla destinazione, valorizzato solo se "found".
+  repeated Entity steps = 3;
+  // Candidati da disambiguare ("ambiguous") o suggerimenti ("unknown").
+  repeated Entity candidates = 4;
+}
+
+// ---------------------------------------------------------------------------
 // RecordDecision — "perché è scritto così?": registra una decisione storica.
 // ---------------------------------------------------------------------------
 
@@ -308,6 +330,7 @@ message WhyResponse {
 
 service CodeOs {
   rpc QueryGraph(QueryGraphRequest) returns (QueryGraphResponse);
+  rpc CallPath(CallPathRequest) returns (CallPathResponse);
   rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
   rpc IndexProject(IndexProjectRequest) returns (IndexProjectResponse);
   rpc IndexFiles(IndexFilesRequest) returns (IndexFilesResponse);
