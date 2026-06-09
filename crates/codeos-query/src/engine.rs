@@ -14,7 +14,7 @@ use codeos_types::bus::{
     CallPathReply, CallPathStatus, ImpactReply, ImpactStatus, PossibleCallerInfo, QueryRequest,
     QueryResponse,
 };
-use codeos_types::{Entity, EntityId, Relation, RelationKind};
+use codeos_types::{Entity, EntityId, EntityKind, Relation, RelationKind};
 
 /// Profondità massima della BFS (Passo 4).
 const DEFAULT_MAX_DEPTH: u32 = 3;
@@ -30,6 +30,11 @@ const IMPACT_FOCUS_ENTITIES: usize = 3;
 /// (`new`, `get`) ne genererebbe a decine. Li tronciamo con un conteggio onesto
 /// del residuo, invece di inondare la context window o di nasconderli del tutto.
 const MAX_POSSIBLE_PER_ENTITY: usize = 5;
+/// Quante entità chiave collegare all'entità centrale coi PERCORSI DI CHIAMATA
+/// (catene `Calls` in avanti). Come [`IMPACT_FOCUS_ENTITIES`], tenuto piccolo:
+/// ogni target costa una BFS sugli archi del grafo, e i percorsi sono contorno
+/// sulle entità centrali, non una mappa di tutto il sottografo.
+const PATH_FOCUS_TARGETS: usize = 3;
 
 /// Parametri configurabili dell'espansione.
 #[derive(Debug, Clone)]
@@ -158,9 +163,25 @@ impl QueryEngine {
         // CHIAVE: ripeterli sarebbe rumore, non informazione).
         let impacts = self.collect_impact(&selected, &selected_ids).await?;
 
+        // Passo 5.6 — I PERCORSI DI CHIAMATA in avanti: come l'entità centrale
+        // RAGGIUNGE le altre entità chiave. È la metà gemella dell'IMPATTO (che è
+        // reverse): DIPENDENZE CHIAVE elenca archi singoli e di tipo misto, ma non
+        // mostra MAI la *catena* di chiamate `Calls` che collega due entità chiave
+        // attraverso passi intermedi. Questa sezione la rende esplicita, ereditando
+        // l'onestà di `call_path` (mai scavalca un `Unresolved`) e mostrando solo i
+        // cammini multi-hop — un cammino diretto è già una riga di DIPENDENZE CHIAVE.
+        let call_paths = self.collect_call_paths(&selected).await?;
+
         // Passo 6 — Formattazione del contesto.
-        let formatted_context =
-            format_context(text, &selected, &relations, &decisions, &holes, &impacts);
+        let formatted_context = format_context(
+            text,
+            &selected,
+            &relations,
+            &decisions,
+            &holes,
+            &impacts,
+            &call_paths,
+        );
 
         Ok(QueryResponse {
             formatted_context,
@@ -360,6 +381,53 @@ impl QueryEngine {
             });
         }
         Ok(summaries)
+    }
+
+    /// Raccoglie i PERCORSI DI CHIAMATA in avanti dall'entità CENTRALE (la prima,
+    /// massimo punteggio di rilevanza) verso le altre prime [`PATH_FOCUS_TARGETS`]
+    /// entità chiave: la catena di archi `Calls` risolti che le collega. È la metà
+    /// gemella dell'impatto reverse — qui in avanti (chi raggiunge chi).
+    ///
+    /// Tesi anti-falso-positivo, in tre modi: (1) eredita da [`QueryEngine::call_path`]
+    /// la garanzia che ogni passo è una chiamata reale già risolta — nessun cammino
+    /// indovinato, e `None` onesto quando non esiste invece di un ponte fabbricato;
+    /// (2) tiene SOLO i cammini multi-hop (≥ 3 passi, cioè con almeno un nodo
+    /// intermedio): un cammino diretto `centro → target` è già una riga di DIPENDENZE
+    /// CHIAVE, ri-mostrarlo qui sarebbe un'eco, non informazione; (3) niente cammino,
+    /// niente voce — la sezione non annuncia un percorso che non c'è.
+    ///
+    /// Il valore aggiunto rispetto a DIPENDENZE CHIAVE: quella elenca archi singoli e
+    /// di tipo misto, questa rende esplicita la *raggiungibilità transitiva* come
+    /// catena ordinata di sole chiamate, e può far emergere un nodo intermedio che il
+    /// cap di selezione aveva tagliato.
+    async fn collect_call_paths(&self, selected: &[Entity]) -> anyhow::Result<Vec<CallPath>> {
+        let mut paths = Vec::new();
+        // L'entità CENTRALE dev'essere un callable: un Module o una Class non hanno
+        // archi `Calls` uscenti e non potrebbero mai essere sorgente di un cammino.
+        // E nel sottografo il Module tende a ordinarsi PER PRIMO (gli arrivano i
+        // `BelongsTo` di tutti i membri, quindi punteggio alto, e il suo qualname
+        // — `pipeline` — precede quello dei membri — `pipeline::ingest`): senza
+        // questo filtro l'entità centrale sarebbe spesso un modulo da cui nessun
+        // cammino parte. Ancoriamo alla prima Function/Method per rilevanza.
+        let Some(focus) = selected.iter().find(|e| is_callable(e.kind)) else {
+            return Ok(paths);
+        };
+        for target in selected
+            .iter()
+            .filter(|e| is_callable(e.kind) && e.id != focus.id)
+            .take(PATH_FOCUS_TARGETS)
+        {
+            let Some(path) = self.call_path(focus.id, target.id).await? else {
+                continue;
+            };
+            // Solo multi-hop: un cammino di 2 passi (centro → target diretto) è già
+            // visibile in DIPENDENZE CHIAVE come singolo arco — qui sarebbe un'eco.
+            if path.steps.len() < 3 {
+                continue;
+            }
+            paths.push(path);
+        }
+        Ok(paths)
     }
 
     /// Cerca il **cammino di chiamata** più corto da `from` a `to` seguendo SOLO
@@ -838,6 +906,14 @@ fn is_external(qualified_name: &str) -> bool {
     qualified_name.starts_with("std::") || qualified_name.contains("site-packages")
 }
 
+/// `true` per le entità che possono stare sui due capi di un arco `Calls`
+/// (funzioni e metodi). I PERCORSI DI CHIAMATA si ancorano solo a queste: un
+/// Module o una Class non chiamano né sono chiamati, quindi non possono essere
+/// né l'origine né la destinazione di un cammino di sole chiamate.
+fn is_callable(kind: EntityKind) -> bool {
+    matches!(kind, EntityKind::Function | EntityKind::Method)
+}
+
 /// L'ultimo segmento di un nome di riferimento, separato da `.` o `:` (così copre
 /// sia la sintassi a punti di JS/TS/Python — `schema.validate` → `validate` — sia i
 /// path Rust `::` — `Repo::open` → `open`). È il "nome semplice" su cui l'analisi
@@ -967,6 +1043,7 @@ fn format_context(
     decisions: &[Decision],
     holes: &[UnresolvedHole],
     impacts: &[ImpactSummary],
+    call_paths: &[CallPath],
 ) -> String {
     let by_id: HashMap<EntityId, &Entity> = entities.iter().map(|e| (e.id, e)).collect();
 
@@ -1035,6 +1112,30 @@ fn format_context(
         }
         out.push_str(
             "  («-» chiamante confermato da arco `Calls`; «?» solo corrispondenza di nome su un\n   riferimento non risolto, da verificare — non è prova di chiamata.)\n",
+        );
+    }
+
+    // Passo 5.6 — PERCORSI DI CHIAMATA in avanti. La metà gemella dell'IMPATTO:
+    // quello mostra chi CHIAMA le entità chiave (reverse), questo mostra come
+    // l'entità centrale le RAGGIUNGE (forward), come catena ordinata di sole
+    // chiamate `Calls`. Diverso da DIPENDENZE CHIAVE, che elenca archi singoli e di
+    // tipo misto senza mai connetterli in un percorso. Compare solo coi cammini
+    // multi-hop (un cammino diretto è già un arco lì sopra: qui sarebbe un'eco) e
+    // mai con un passo indovinato — `call_path` non scavalca un `Unresolved`.
+    if !call_paths.is_empty() {
+        out.push_str(
+            "\nPERCORSI DI CHIAMATA (come l'entità centrale raggiunge le altre entità chiave):\n",
+        );
+        for path in call_paths {
+            let chain: Vec<&str> = path
+                .steps
+                .iter()
+                .map(|e| e.qualified_name.as_str())
+                .collect();
+            out.push_str(&format!("- {}\n", chain.join(" → ")));
+        }
+        out.push_str(
+            "  («→» catena di archi `Calls` risolti, passo per passo; nessun passo è indovinato —\n   se il grafo non conosce un cammino, la riga non compare.)\n",
         );
     }
 
@@ -1638,6 +1739,69 @@ mod tests {
         assert!(
             !ctx.contains("IMPATTO"),
             "l'unico chiamante (login) è già nel contesto: niente sezione IMPATTO d'eco:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_surfaces_the_multi_hop_call_route_under_percorsi() {
+        // Il senso dell'integrazione di `call_path` in `query()`. `ingest` (l'unico
+        // seme, quindi l'entità centrale) raggiunge `store` SOLO passando per
+        // `transform`. DIPENDENZE CHIAVE elenca i due archi `ingest CALLS transform`
+        // e `transform CALLS store` separati; la sezione PERCORSI li connette nella
+        // catena transitiva `ingest → transform → store`, che è l'informazione L2 che
+        // la lista piatta di archi non rende esplicita.
+        let storage = graph_from(
+            "pipeline.py",
+            "def store():\n    pass\n\n\
+             def transform():\n    store()\n\n\
+             def ingest():\n    transform()\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine.query(&nl("ingest")).await.unwrap().formatted_context;
+
+        assert!(
+            ctx.contains("PERCORSI DI CHIAMATA"),
+            "manca la sezione PERCORSI DI CHIAMATA:\n{ctx}"
+        );
+        let percorsi = ctx
+            .split("PERCORSI DI CHIAMATA")
+            .nth(1)
+            .expect("la sezione PERCORSI è appena stata verificata presente");
+        // La catena deve nominare tutti e tre i passi, intermedio compreso: è proprio
+        // il nodo intermedio a rendere il percorso più ricco di una singola riga di
+        // dipendenza.
+        assert!(
+            percorsi.contains("ingest")
+                && percorsi.contains("transform")
+                && percorsi.contains("store"),
+            "il percorso deve mostrare la catena ingest → transform → store:\n{ctx}"
+        );
+        assert!(
+            percorsi.contains('→'),
+            "i passi del percorso vanno connessi con la freccia di catena:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_percorsi_section_for_a_direct_call_already_in_dipendenze() {
+        // `ingest` → `store` è una chiamata DIRETTA: appare già come singolo arco in
+        // DIPENDENZE CHIAVE. Un cammino di 2 passi non aggiunge nulla, quindi la
+        // sezione PERCORSI (riservata ai cammini multi-hop) non deve comparire — la
+        // prova che il filtro multi-hop rende PERCORSI additivo, non un'eco.
+        let storage = graph_from(
+            "pipeline.py",
+            "def store():\n    pass\n\ndef ingest():\n    store()\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine.query(&nl("ingest")).await.unwrap().formatted_context;
+
+        assert!(
+            !ctx.contains("PERCORSI DI CHIAMATA"),
+            "una chiamata diretta è già in DIPENDENZE CHIAVE: niente sezione PERCORSI d'eco:\n{ctx}"
         );
     }
 
