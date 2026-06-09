@@ -20,6 +20,16 @@ use codeos_types::{Entity, EntityId, Relation, RelationKind};
 const DEFAULT_MAX_DEPTH: u32 = 3;
 /// Numero massimo di entità nel sottografo, per non sforare la context window.
 const DEFAULT_MAX_ENTITIES: usize = 50;
+/// Quante entità chiave (le più rilevanti) analizzare per il raggio d'impatto
+/// reverse (chi le chiama). Tenuto piccolo: l'impatto è informazione di contorno
+/// sulle entità centrali, non su tutto il sottografo — e ogni analisi costa una
+/// scansione degli archi non risolti.
+const IMPACT_FOCUS_ENTITIES: usize = 3;
+/// Tetto ai chiamanti POSSIBILI mostrati per entità nel contesto. I possibili
+/// sono solo corrispondenze di nome (vedi `impact`): un nome molto comune
+/// (`new`, `get`) ne genererebbe a decine. Li tronciamo con un conteggio onesto
+/// del residuo, invece di inondare la context window o di nasconderli del tutto.
+const MAX_POSSIBLE_PER_ENTITY: usize = 5;
 
 /// Parametri configurabili dell'espansione.
 #[derive(Debug, Clone)]
@@ -139,8 +149,18 @@ impl QueryEngine {
         // che lo nasconde.
         let holes = self.collect_unresolved(&selected_ids).await?;
 
+        // Passo 5.5 — Il RAGGIO D'IMPATTO reverse: chi DIPENDE dalle entità chiave.
+        // L'espansione BFS segue solo archi USCENTI (cosa USANO i semi), quindi il
+        // contesto è strutturalmente "in avanti": non mostra MAI chi CHIAMA le
+        // entità centrali — la metà mancante del "cosa cambia se tocco X?". Qui la
+        // aggiungiamo, ma solo per le entità più rilevanti e solo coi chiamanti
+        // FUORI dal set già selezionato (quelli dentro sono già in DIPENDENZE
+        // CHIAVE: ripeterli sarebbe rumore, non informazione).
+        let impacts = self.collect_impact(&selected, &selected_ids).await?;
+
         // Passo 6 — Formattazione del contesto.
-        let formatted_context = format_context(text, &selected, &relations, &decisions, &holes);
+        let formatted_context =
+            format_context(text, &selected, &relations, &decisions, &holes, &impacts);
 
         Ok(QueryResponse {
             formatted_context,
@@ -287,6 +307,59 @@ impl QueryEngine {
             }
         }
         Ok(holes)
+    }
+
+    /// Raccoglie il RAGGIO D'IMPATTO reverse per le prime [`IMPACT_FOCUS_ENTITIES`]
+    /// entità (le più rilevanti, già ordinate per punteggio): chi le CHIAMA, fuori
+    /// dal sottografo già selezionato. È la metà che la BFS in avanti non vede.
+    ///
+    /// Tesi anti-falso-positivo, qui in due modi: (1) escludiamo i chiamanti già
+    /// selezionati — sono visibili in DIPENDENZE CHIAVE, ripeterli gonfierebbe il
+    /// contesto senza aggiungere nulla; (2) teniamo i chiamanti CONFERMATI distinti
+    /// dai POSSIBILI (riferimenti non risolti omonimi) ereditando la separazione da
+    /// [`QueryEngine::impact`], e tronciamo i possibili a un tetto onesto registrando
+    /// quanti ne restano — mai inondare, mai nascondere. Le liste sono ordinate per
+    /// nome così l'output è stabile e il troncamento deterministico.
+    async fn collect_impact(
+        &self,
+        selected: &[Entity],
+        selected_ids: &HashSet<EntityId>,
+    ) -> anyhow::Result<Vec<ImpactSummary>> {
+        let mut summaries = Vec::new();
+        for entity in selected.iter().take(IMPACT_FOCUS_ENTITIES) {
+            let Some(impact) = self.impact(entity.id).await? else {
+                continue;
+            };
+
+            let mut confirmed: Vec<Entity> = impact
+                .confirmed_callers
+                .into_iter()
+                .filter(|c| !selected_ids.contains(&c.id))
+                .collect();
+            confirmed.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+
+            let mut possible: Vec<PossibleCaller> = impact
+                .possible_callers
+                .into_iter()
+                .filter(|p| !selected_ids.contains(&p.source.id))
+                .collect();
+            possible.sort_by(|a, b| a.source.qualified_name.cmp(&b.source.qualified_name));
+            let possible_truncated = possible.len().saturating_sub(MAX_POSSIBLE_PER_ENTITY);
+            possible.truncate(MAX_POSSIBLE_PER_ENTITY);
+
+            // Niente da aggiungere su quest'entità ⇒ niente voce (nessuna sezione
+            // vuota: non si annuncia un impatto che il contesto già mostra).
+            if confirmed.is_empty() && possible.is_empty() {
+                continue;
+            }
+            summaries.push(ImpactSummary {
+                entity: entity.clone(),
+                confirmed,
+                possible,
+                possible_truncated,
+            });
+        }
+        Ok(summaries)
     }
 
     /// Cerca il **cammino di chiamata** più corto da `from` a `to` seguendo SOLO
@@ -737,6 +810,20 @@ struct UnresolvedHole {
     original_kind: String,
 }
 
+/// Il RAGGIO D'IMPATTO reverse di UNA entità chiave: chi la chiama, fuori dal
+/// sottografo già selezionato. È ciò che la BFS in avanti (callee → callee) non
+/// può strutturalmente mostrare. Eredita da [`Impact`] la separazione fra
+/// `confirmed` (archi `Calls` risolti) e `possible` (riferimenti `Unresolved`
+/// omonimi, non confermati): il confine fra certo e sospetto resta visibile nel
+/// contesto. `possible_truncated` conta i possibili scartati dal tetto, così il
+/// troncamento è onesto invece che silenzioso.
+struct ImpactSummary {
+    entity: Entity,
+    confirmed: Vec<Entity>,
+    possible: Vec<PossibleCaller>,
+    possible_truncated: usize,
+}
+
 /// Le relazioni lungo cui la BFS scende (Passo 4). Le altre (es. `Unresolved`,
 /// `Implements`, `Extends`) non vengono attraversate per l'espansione di contesto.
 fn should_follow(kind: RelationKind) -> bool {
@@ -879,6 +966,7 @@ fn format_context(
     relations: &[Relation],
     decisions: &[Decision],
     holes: &[UnresolvedHole],
+    impacts: &[ImpactSummary],
 ) -> String {
     let by_id: HashMap<EntityId, &Entity> = entities.iter().map(|e| (e.id, e)).collect();
 
@@ -910,6 +998,44 @@ fn format_context(
     }
     if !wrote_dep {
         out.push_str("- (nessuna dipendenza interna tra le entità selezionate)\n");
+    }
+
+    // Passo 5.5 — IMPATTO reverse. DIPENDENZE CHIAVE qui sopra mostra da COSA
+    // dipendono le entità (archi in avanti, callee); questa sezione mostra il
+    // rovescio — CHI le chiama — che la BFS in avanti non può vedere. Compare solo
+    // quando c'è davvero un chiamante esterno al sottografo: niente sezione vuota.
+    // Tesi anti-falso-positivo resa visibile: i chiamanti CONFERMATI (`-`, arco
+    // `Calls` risolto) restano distinti dai POSSIBILI (`?`, sola corrispondenza di
+    // nome su un riferimento non risolto), e il troncamento dei possibili è contato,
+    // mai silenzioso.
+    if !impacts.is_empty() {
+        out.push_str(
+            "\nIMPATTO (chi CHIAMA le entità chiave — il rovescio delle DIPENDENZE CHIAVE):\n",
+        );
+        for summary in impacts {
+            out.push_str(&format!(
+                "- {} ← chiamato da:\n",
+                summary.entity.qualified_name
+            ));
+            for caller in &summary.confirmed {
+                out.push_str(&format!("    - {}\n", caller.qualified_name));
+            }
+            for caller in &summary.possible {
+                out.push_str(&format!(
+                    "    ? {} (via `{}`)\n",
+                    caller.source.qualified_name, caller.reference
+                ));
+            }
+            if summary.possible_truncated > 0 {
+                out.push_str(&format!(
+                    "    ? (+{} altri possibili, da verificare)\n",
+                    summary.possible_truncated
+                ));
+            }
+        }
+        out.push_str(
+            "  («-» chiamante confermato da arco `Calls`; «?» solo corrispondenza di nome su un\n   riferimento non risolto, da verificare — non è prova di chiamata.)\n",
+        );
     }
 
     // Passo 3 — Il *perché*. Mostrato solo se c'è davvero una memoria agganciata,
@@ -1451,6 +1577,67 @@ mod tests {
         assert!(
             !ctx.contains("BUCHI NOTI"),
             "tutto è risolto: la sezione dei buchi non deve comparire:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_surfaces_who_calls_the_key_entity_under_impatto() {
+        // Il senso dell'integrazione di `impact` in `query()`. `target` è chiamato da
+        // `caller_one` e `caller_two`, i cui nomi NON contengono la keyword "target":
+        // non sono semi, e la BFS in avanti (callee → callee) non li può raggiungere.
+        // L'unico modo in cui compaiono nel contesto è la sezione IMPATTO reverse,
+        // dove devono figurare come chiamanti CONFERMATI.
+        let storage = graph_from(
+            "app.py",
+            "def target():\n    pass\n\n\
+             def caller_one():\n    target()\n\n\
+             def caller_two():\n    target()\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine.query(&nl("target")).await.unwrap().formatted_context;
+
+        assert!(ctx.contains("IMPATTO"), "manca la sezione IMPATTO:\n{ctx}");
+        assert!(
+            ctx.contains("← chiamato da"),
+            "la sezione IMPATTO deve elencare i chiamanti dell'entità chiave:\n{ctx}"
+        );
+        // I chiamanti non sono semi né selezionati: compaiono SOLO grazie a IMPATTO.
+        let impatto = ctx
+            .split("IMPATTO")
+            .nth(1)
+            .expect("la sezione IMPATTO è appena stata verificata presente");
+        assert!(
+            impatto.contains("caller_one"),
+            "caller_one (chiamante confermato) dev'essere nominato sotto IMPATTO:\n{ctx}"
+        );
+        assert!(
+            impatto.contains("caller_two"),
+            "caller_two (chiamante confermato) dev'essere nominato sotto IMPATTO:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_impatto_section_when_the_only_caller_is_already_in_context() {
+        // `login` → `verify_password`: la BFS tira dentro verify_password. Chi chiama
+        // login? Nessuno. Chi chiama verify_password? Solo login — che è GIÀ
+        // selezionato e visibile in DIPENDENZE CHIAVE. Ripeterlo sotto IMPATTO sarebbe
+        // un'eco, non informazione nuova ⇒ la sezione non deve comparire. È la prova
+        // che il filtro sui chiamanti già selezionati rende IMPATTO additivo, non
+        // ridondante.
+        let storage = graph_from(
+            "auth.py",
+            "def verify_password():\n    pass\n\ndef login():\n    verify_password()\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine.query(&nl("login")).await.unwrap().formatted_context;
+
+        assert!(
+            !ctx.contains("IMPATTO"),
+            "l'unico chiamante (login) è già nel contesto: niente sezione IMPATTO d'eco:\n{ctx}"
         );
     }
 
