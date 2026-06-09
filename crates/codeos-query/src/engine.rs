@@ -11,8 +11,8 @@ use std::sync::Arc;
 use codeos_memory::{Decision, DecisionStore, InMemoryDecisionStore};
 use codeos_storage::{GraphStorage, RelationFilter};
 use codeos_types::bus::{
-    CallPathReply, CallPathStatus, ImpactReply, ImpactStatus, PossibleCallerInfo, QueryRequest,
-    QueryResponse,
+    CallPathReply, CallPathStatus, ImpactReply, ImpactStatus, ImpactTransitiveReply,
+    PossibleCallerInfo, QueryRequest, QueryResponse, TransitiveCallerInfo,
 };
 use codeos_types::{Entity, EntityId, EntityKind, Relation, RelationKind};
 
@@ -897,6 +897,79 @@ impl QueryEngine {
             }
         }
     }
+
+    /// Risolve `name` a un'unica entità (stessa onestà di [`QueryEngine::impact_by_name`]:
+    /// `Ambiguous`/`Unknown` espliciti coi candidati, mai un'entità indovinata) e ne
+    /// calcola l'impatto **TRANSITIVO**: i chiamanti a qualunque distanza, ciascuno
+    /// con i suoi hop, più il flag `depth_capped` quando il tetto tronca il raggio.
+    pub async fn impact_transitive_by_name(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<ImpactTransitiveReply> {
+        match self.resolve_one_name(name).await? {
+            NameResolution::Ambiguous(candidates) => {
+                let mut msg = format!(
+                    "Il nome \"{name}\" è ambiguo: {} entità corrispondono.\n",
+                    candidates.len()
+                );
+                msg.push_str("Specifica quale (nome qualificato completo):\n");
+                msg.push_str(&format_candidate_list(&candidates));
+                Ok(ImpactTransitiveReply {
+                    formatted: msg,
+                    status: ImpactStatus::Ambiguous,
+                    callers: Vec::new(),
+                    depth_capped: false,
+                    candidates,
+                })
+            }
+            NameResolution::Unknown(suggestions) => {
+                let mut msg = format!("Nessuna entità di nome \"{name}\" nel grafo.\n");
+                if suggestions.is_empty() {
+                    msg.push_str("(nessun nome simile trovato)\n");
+                } else {
+                    msg.push_str("Forse intendevi:\n");
+                    msg.push_str(&format_candidate_list(&suggestions));
+                }
+                Ok(ImpactTransitiveReply {
+                    formatted: msg,
+                    status: ImpactStatus::Unknown,
+                    callers: Vec::new(),
+                    depth_capped: false,
+                    candidates: suggestions,
+                })
+            }
+            NameResolution::Resolved(entity) => {
+                // L'entità è appena stata risolta dal grafo: `impact_transitive` non
+                // può restituire None qui. In via difensiva trattiamo l'eventuale None
+                // come raggio vuoto sull'entità nota — mai un panico sul percorso utente.
+                let impact =
+                    self.impact_transitive(entity.id)
+                        .await?
+                        .unwrap_or_else(|| TransitiveImpact {
+                            entity: entity.clone(),
+                            callers: Vec::new(),
+                            depth_capped: false,
+                        });
+                let formatted = format_transitive_impact(&impact);
+                let depth_capped = impact.depth_capped;
+                let callers = impact
+                    .callers
+                    .into_iter()
+                    .map(|c| TransitiveCallerInfo {
+                        source: c.entity,
+                        hops: c.hops,
+                    })
+                    .collect();
+                Ok(ImpactTransitiveReply {
+                    formatted,
+                    status: ImpactStatus::Found,
+                    callers,
+                    depth_capped,
+                    candidates: Vec::new(),
+                })
+            }
+        }
+    }
 }
 
 /// Un **cammino di chiamata** onesto: la sequenza ordinata di entità da una
@@ -1441,6 +1514,44 @@ fn format_impact(impact: &Impact) -> String {
         "\n(Confermati: arco `Calls` realmente presente nel grafo. Possibili: solo una\n\
          corrispondenza di nome su un riferimento non risolto — potrebbe NON essere\n\
          questa entità. Assenza di chiamanti noti non è prova di assenza d'uso.)\n",
+    );
+    out
+}
+
+/// Rende l'impatto TRANSITIVO per il terminale/LLM: i chiamanti in ordine di
+/// distanza crescente (già ordinati dalla capability), ognuno con i suoi hop, e —
+/// se il tetto ha troncato il raggio — una nota d'onestà che è parziale. Tutti i
+/// chiamanti sono CONFERMATI (ogni hop è un arco risolto): il testo lo dichiara, per
+/// non confonderli col confine certo/possibile dell'impatto diretto.
+fn format_transitive_impact(impact: &TransitiveImpact) -> String {
+    let mut out = format!(
+        "Impatto TRANSITIVO di \"{}\" (chi la raggiunge a ritroso, a qualunque distanza):\n\n",
+        impact.entity.qualified_name
+    );
+    out.push_str(&format!(
+        "Chiamanti CONFERMATI ({}) — ogni hop è un arco `Calls` risolto:\n",
+        impact.callers.len()
+    ));
+    if impact.callers.is_empty() {
+        out.push_str("  (nessuno noto)\n");
+    } else {
+        for c in &impact.callers {
+            out.push_str(&format!(
+                "  - {} [{:?}] — a {} hop — {}\n",
+                c.entity.qualified_name, c.entity.kind, c.hops, c.entity.location.file_path
+            ));
+        }
+    }
+    if impact.depth_capped {
+        out.push_str(&format!(
+            "\n  … oltre i {MAX_IMPACT_DEPTH} hop il raggio continua: esiste almeno un chiamante\n   \
+             più lontano, non elencato (tetto di profondità). Non lo nascondiamo.\n"
+        ));
+    }
+    out.push_str(
+        "\n(Tutti CONFERMATI: ogni passo del cammino a ritroso è un arco `Calls` realmente\n\
+         presente nel grafo; la distanza in hop dice quanto è lontano il chiamante.\n\
+         Assenza di chiamanti noti non è prova di assenza d'uso.)\n",
     );
     out
 }
@@ -2440,6 +2551,43 @@ mod tests {
         assert!(
             !names.iter().any(|n| n.ends_with("::f6")),
             "f6 è oltre il tetto (6 hop): NON va affermato come chiamante: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn impact_transitive_by_name_resolves_the_name_and_reports_distances() {
+        // Il wrapper by-name (usato dal wire): risolve il nome a un'unica entità e
+        // riporta il raggio transitivo coi chiamanti e la loro distanza, più un testo
+        // formattato che li dichiara CONFERMATI e ne nomina gli hop. deep→mid→leaf.
+        let storage = graph_from(
+            "app.py",
+            "def leaf():\n    pass\n\n\
+             def mid():\n    leaf()\n\n\
+             def deep():\n    mid()\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let reply = engine.impact_transitive_by_name("leaf").await.unwrap();
+
+        assert_eq!(reply.status, ImpactStatus::Found);
+        let mid = reply
+            .callers
+            .iter()
+            .find(|c| c.source.qualified_name.ends_with("::mid"))
+            .expect("mid è un chiamante diretto");
+        assert_eq!(mid.hops, 1, "mid chiama leaf direttamente");
+        let deep = reply
+            .callers
+            .iter()
+            .find(|c| c.source.qualified_name.ends_with("::deep"))
+            .expect("deep è un chiamante a 2 hop");
+        assert_eq!(deep.hops, 2, "deep raggiunge leaf via mid");
+        assert!(!reply.depth_capped);
+        assert!(
+            reply.formatted.contains("TRANSITIVO") && reply.formatted.contains("hop"),
+            "il testo deve dichiarare il raggio transitivo e le distanze:\n{}",
+            reply.formatted
         );
     }
 }

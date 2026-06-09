@@ -240,9 +240,10 @@ async fn dispatch_loop(mut commands: mpsc::Receiver<Command>, routes: Routes) {
             | Command::IndexFiles { .. }
             | Command::ReIndexFile { .. }
             | Command::RemoveFiles { .. } => (&routes.parser, "parser"),
-            Command::QueryGraph { .. } | Command::CallPath { .. } | Command::Impact { .. } => {
-                (&routes.query, "query")
-            }
+            Command::QueryGraph { .. }
+            | Command::CallPath { .. }
+            | Command::Impact { .. }
+            | Command::ImpactTransitive { .. } => (&routes.query, "query"),
             Command::RecordDecision { .. } => (&routes.memory, "memory"),
             Command::ArchitectureReport { .. }
             | Command::GuardBefore { .. }
@@ -376,6 +377,32 @@ mod tests {
             .await
             .expect("nessuna risposta dal query actor");
         let reply = reply.expect("il round-trip Impact doveva riuscire");
+        assert_eq!(reply.status, codeos_types::bus::ImpactStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn routes_impact_transitive_to_query_actor() {
+        // Anche l'impatto TRANSITIVO (L2) è competenza del Query Engine: il
+        // Dispatcher deve instradare Command::ImpactTransitive all'attore query e
+        // riportare la risposta. Su un grafo vuoto il nome è ignoto ⇒ Ok con stato
+        // Unknown (non un errore): il round-trip attraverso il bus regge.
+        let system = spawn();
+        let (reply_to, mut reply_rx) = reply_channel();
+
+        system
+            .commands
+            .send(Command::ImpactTransitive {
+                name: "repo".to_string(),
+                reply_to,
+            })
+            .await
+            .expect("front door chiusa");
+
+        let reply = reply_rx
+            .recv()
+            .await
+            .expect("nessuna risposta dal query actor");
+        let reply = reply.expect("il round-trip ImpactTransitive doveva riuscire");
         assert_eq!(reply.status, codeos_types::bus::ImpactStatus::Unknown);
     }
 

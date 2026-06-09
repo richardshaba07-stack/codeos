@@ -27,7 +27,7 @@ use codeos_core::DispatcherHandle;
 use codeos_types::bus::{
     ArchitecturalGapInfo, CallPathStatus, CodeOsEvent, Command, DecisionFossilInfo,
     GraphQualityInfo, ImpactStatus, LayeringCandidateInfo, LayeringInvariantInfo, NewDecision,
-    PossibleCallerInfo, QueryRequest,
+    PossibleCallerInfo, QueryRequest, TransitiveCallerInfo,
 };
 use codeos_types::{Entity, EntityId, EntityKind, Relation, RelationKind, SourceLocation};
 use tokio::sync::{broadcast, mpsc};
@@ -246,6 +246,40 @@ impl CodeOs for CodeOsService {
                 .into_iter()
                 .map(possible_caller_to_proto)
                 .collect(),
+            candidates: reply.candidates.into_iter().map(entity_to_proto).collect(),
+        }))
+    }
+
+    async fn impact_transitive(
+        &self,
+        request: Request<proto::ImpactTransitiveRequest>,
+    ) -> Result<Response<proto::ImpactTransitiveResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::ImpactTransitive {
+                name: req.name,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let reply = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal query actor"))?
+            .map_err(|e| Status::internal(format!("impact_transitive fallita: {e}")))?;
+
+        Ok(Response::new(proto::ImpactTransitiveResponse {
+            formatted: reply.formatted,
+            status: impact_status_name(reply.status).to_string(),
+            callers: reply
+                .callers
+                .into_iter()
+                .map(transitive_caller_to_proto)
+                .collect(),
+            depth_capped: reply.depth_capped,
             candidates: reply.candidates.into_iter().map(entity_to_proto).collect(),
         }))
     }
@@ -701,6 +735,15 @@ fn possible_caller_to_proto(pc: PossibleCallerInfo) -> proto::PossibleCaller {
     }
 }
 
+/// Converte un chiamante transitivo dal bus al suo specchio proto, preservando la
+/// distanza in hop (quanto è lontano il chiamante dall'entità d'impatto).
+fn transitive_caller_to_proto(tc: TransitiveCallerInfo) -> proto::TransitiveCaller {
+    proto::TransitiveCaller {
+        source: Some(entity_to_proto(tc.source)),
+        hops: tc.hops,
+    }
+}
+
 fn relation_to_proto(relation: Relation) -> proto::Relation {
     proto::Relation {
         id: relation.id.to_string(),
@@ -967,6 +1010,27 @@ mod tests {
         assert_eq!(response.status, "unknown");
         assert!(response.confirmed_callers.is_empty());
         assert!(response.possible_callers.is_empty());
+        assert!(!response.formatted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn impact_transitive_over_the_wire_is_unknown_on_empty_graph() {
+        let (mut client, _events) = start_server().await;
+
+        let response = client
+            .impact_transitive(proto::ImpactTransitiveRequest {
+                name: "repo".to_string(),
+            })
+            .await
+            .expect("RPC ImpactTransitive fallita")
+            .into_inner();
+
+        // Grafo vuoto: il nome è ignoto ⇒ stato "unknown" esplicito, nessun
+        // chiamante, `depth_capped` falso, ma un messaggio onesto è sempre prodotto.
+        // Mai un raggio d'impatto inventato per un'entità che non esiste.
+        assert_eq!(response.status, "unknown");
+        assert!(response.callers.is_empty());
+        assert!(!response.depth_capped);
         assert!(!response.formatted.is_empty());
     }
 

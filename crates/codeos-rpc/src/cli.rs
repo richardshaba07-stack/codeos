@@ -112,27 +112,39 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         "impact" => {
-            if args.len() < 3 {
+            // Flag opzionale --transitive (-t): il raggio TRANSITIVO (chi raggiunge
+            // l'entità a QUALUNQUE distanza) invece dei soli chiamanti diretti. Il
+            // nome è il primo argomento che non è un flag.
+            let transitive = args.iter().any(|a| a == "--transitive" || a == "-t");
+            let Some(name) = args.iter().skip(2).find(|a| !a.starts_with('-')).cloned() else {
                 eprintln!("Errore: serve il nome dell'entità di cui misurare l'impatto.");
-                eprintln!("Uso: codeos impact <nome>");
+                eprintln!("Uso: codeos impact <nome> [--transitive]");
                 std::process::exit(1);
-            }
-            let name = &args[2];
+            };
 
             let mut client = connect_server().await?;
-            println!("⚡ Misuro l'impatto di \"{name}\" (chi la chiama)...");
-
-            let req = proto::ImpactRequest { name: name.clone() };
-            let response = client.impact(req).await?.into_inner();
-
-            println!("\n{}", response.formatted);
+            let status = if transitive {
+                println!(
+                    "⚡ Misuro l'impatto TRANSITIVO di \"{name}\" (chi la raggiunge, a qualunque distanza)..."
+                );
+                let req = proto::ImpactTransitiveRequest { name: name.clone() };
+                let response = client.impact_transitive(req).await?.into_inner();
+                println!("\n{}", response.formatted);
+                response.status
+            } else {
+                println!("⚡ Misuro l'impatto di \"{name}\" (chi la chiama)...");
+                let req = proto::ImpactRequest { name: name.clone() };
+                let response = client.impact(req).await?.into_inner();
+                println!("\n{}", response.formatted);
+                response.status
+            };
 
             // Esito esplicito: esci con codice ≠0 quando il nome NON si è risolto a
             // un'entità (unknown/ambiguous), così script e CI lo colgono senza
             // analizzare il testo. Attenzione: "found" con liste vuote è comunque
             // successo — l'entità esiste, semplicemente nessuno la chiama (per
             // quanto noto): non lo confondiamo con «nome inesistente».
-            if response.status != "found" {
+            if status != "found" {
                 std::process::exit(1);
             }
         }
@@ -609,8 +621,8 @@ const COMMANDS: &[(&str, &str)] = &[
         "Mostra il cammino di chiamata onesto tra due entità (segue solo archi Calls risolti; mai inventato).",
     ),
     (
-        "impact <nome>",
-        "Mostra chi chiama un'entità, separando i chiamanti confermati (archi Calls risolti) dai possibili (riferimenti non risolti che combaciano).",
+        "impact <nome> [--transitive]",
+        "Mostra chi chiama un'entità, separando i chiamanti confermati (archi Calls risolti) dai possibili (riferimenti non risolti che combaciano). Con --transitive: chi la raggiunge a QUALUNQUE distanza (solo confermati), con la distanza in hop.",
     ),
     (
         "doctor",

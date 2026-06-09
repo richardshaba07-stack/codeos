@@ -61,6 +61,14 @@ pub enum Command {
         name: String,
         reply_to: mpsc::Sender<anyhow::Result<ImpactReply>>,
     },
+    /// Livello L2 del context builder: l'impatto **TRANSITIVO** di un'entità
+    /// nominata — chi la raggiunge a ritroso a QUALUNQUE distanza (non solo i
+    /// chiamanti diretti), seguendo i soli archi `Calls` risolti. `name` è risolto
+    /// a un'unica entità senza indovinare, come per [`Command::Impact`].
+    ImpactTransitive {
+        name: String,
+        reply_to: mpsc::Sender<anyhow::Result<ImpactTransitiveReply>>,
+    },
     /// Registra una decisione architetturale nel Memory Engine.
     RecordDecision {
         decision: NewDecision,
@@ -243,6 +251,40 @@ pub struct ImpactReply {
     pub confirmed: Vec<Entity>,
     /// I chiamanti possibili (nome combaciante non confermato), quando `Found`.
     pub possible: Vec<PossibleCallerInfo>,
+    /// I candidati da disambiguare (`Ambiguous`) o i suggerimenti (`Unknown`).
+    pub candidates: Vec<Entity>,
+}
+
+/// Un chiamante **transitivo** sul bus: una sorgente che raggiunge l'entità
+/// d'impatto a ritroso lungo archi `Calls` risolti, con la distanza minima in
+/// hop (`1` = chiamata diretta). Specchio neutro di `codeos_query::TransitiveCaller`,
+/// definito qui perché `codeos-types` non può dipendere dal Query Engine.
+#[derive(Debug, Clone)]
+pub struct TransitiveCallerInfo {
+    /// L'entità che (in)direttamente chiama l'entità d'impatto.
+    pub source: Entity,
+    /// Distanza minima in hop di chiamata fino all'entità d'impatto (≥ 1).
+    pub hops: u32,
+}
+
+/// Risposta del Query Engine alla richiesta [`Command::ImpactTransitive`].
+///
+/// Tutti i `callers` sono CONFERMATI (ogni hop è un arco `Calls` risolto): la
+/// transitività non compone i "possibili" (match-di-nome), che mentirebbero a
+/// catena. `depth_capped` è la nota d'onestà: `true` se un chiamante reale oltre
+/// il tetto di profondità è stato troncato — il raggio mostrato è parziale, e lo
+/// si dice. `candidates` porta i nomi tra cui scegliere (`Ambiguous`) o i
+/// quasi-omonimi suggeriti (`Unknown`).
+#[derive(Debug, Clone)]
+pub struct ImpactTransitiveReply {
+    /// Testo già formattato, pronto per il terminale o per un LLM.
+    pub formatted: String,
+    /// Lo stato esplicito dell'esito (vedi [`ImpactStatus`]). Sempre noto.
+    pub status: ImpactStatus,
+    /// I chiamanti transitivi confermati, quando `status == Found`.
+    pub callers: Vec<TransitiveCallerInfo>,
+    /// `true` se il tetto di profondità ha troncato un chiamante reale più lontano.
+    pub depth_capped: bool,
     /// I candidati da disambiguare (`Ambiguous`) o i suggerimenti (`Unknown`).
     pub candidates: Vec<Entity>,
 }

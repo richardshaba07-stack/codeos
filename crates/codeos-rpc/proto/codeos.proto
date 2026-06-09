@@ -109,6 +109,38 @@ message ImpactResponse {
 }
 
 // ---------------------------------------------------------------------------
+// ImpactTransitive — livello L2: l'impatto TRANSITIVO. Chi raggiunge X a ritroso
+// a QUALUNQUE distanza, non solo i chiamanti diretti, seguendo solo archi `Calls`
+// risolti (mai un ponte su un buco). Ogni chiamante porta la distanza in hop.
+// ---------------------------------------------------------------------------
+
+message ImpactTransitiveRequest {
+  // Nome dell'entità (qualificato o solo il segmento finale).
+  string name = 1;
+}
+
+// Un chiamante TRANSITIVO confermato e la sua distanza minima in hop di chiamata
+// (1 = chiama l'entità direttamente, 2 = chiama qualcosa che la chiama, …).
+message TransitiveCaller {
+  Entity source = 1;
+  uint32 hops = 2;
+}
+
+message ImpactTransitiveResponse {
+  // Testo già formattato, pronto per il terminale o per un LLM.
+  string formatted = 1;
+  // Stato esplicito dell'esito: "found" | "unknown" | "ambiguous".
+  string status = 2;
+  // I chiamanti transitivi confermati, ordinati per distanza crescente poi nome.
+  repeated TransitiveCaller callers = 3;
+  // `true` se un chiamante reale oltre il tetto di profondità è stato troncato:
+  // il raggio mostrato è parziale, e lo si dichiara invece di fingere completezza.
+  bool depth_capped = 4;
+  // Candidati da disambiguare ("ambiguous") o suggerimenti ("unknown").
+  repeated Entity candidates = 5;
+}
+
+// ---------------------------------------------------------------------------
 // RecordDecision — "perché è scritto così?": registra una decisione storica.
 // ---------------------------------------------------------------------------
 
@@ -365,6 +397,7 @@ service CodeOs {
   rpc QueryGraph(QueryGraphRequest) returns (QueryGraphResponse);
   rpc CallPath(CallPathRequest) returns (CallPathResponse);
   rpc Impact(ImpactRequest) returns (ImpactResponse);
+  rpc ImpactTransitive(ImpactTransitiveRequest) returns (ImpactTransitiveResponse);
   rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
   rpc IndexProject(IndexProjectRequest) returns (IndexProjectResponse);
   rpc IndexFiles(IndexFilesRequest) returns (IndexFilesResponse);

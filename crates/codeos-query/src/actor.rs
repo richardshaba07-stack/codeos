@@ -61,6 +61,13 @@ impl QueryActor {
                     }
                     let _ = reply_to.send(result).await;
                 }
+                Command::ImpactTransitive { name, reply_to } => {
+                    let result = self.engine.impact_transitive_by_name(&name).await;
+                    if let Err(err) = &result {
+                        tracing::warn!(error = %err, "QueryActor: impact_transitive fallita");
+                    }
+                    let _ = reply_to.send(result).await;
+                }
                 other => {
                     tracing::warn!(?other, "query actor: comando non di sua competenza");
                 }
