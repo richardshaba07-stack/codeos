@@ -1774,6 +1774,52 @@ fn format_context(
         );
     }
 
+    // Livello L3 — CONTESTO DI SVILUPPO: la dimensione TEMPORALE del contesto. Tra le
+    // entità rilevanti, quelle AGGIUNTE più di recente — cioè nate nel commit più
+    // recente (dato `born_commit`/`born_ts` del grafo temporale, pilastro 1, già nei
+    // metadata delle entità: nessun plumbing). Aiuta l'LLM a capire DOVE il codice
+    // rilevante è più nuovo, spesso dove il dev sta lavorando. Onestà: è la NASCITA
+    // (quando l'entità è apparsa), NON l'ultima modifica — il grafo timbra e conserva
+    // la nascita (anti-rumore, trap #3), quindi non vede i cambi a codice già esistente.
+    // Le entità senza nascita (indicizzate senza contesto git) non compaiono — niente
+    // tempo inventato. Compare solo se il dato distingue: se TUTTE le entità con
+    // nascita sono dell'ultimo commit, "più di recente" non separa nulla ⇒ niente.
+    {
+        let mut born: Vec<(&Entity, &str, i64)> = Vec::new();
+        for e in entities {
+            if let (Some(commit), Some(ts)) =
+                (e.metadata.get("born_commit"), e.metadata.get("born_ts"))
+            {
+                if let Ok(ts) = ts.parse::<i64>() {
+                    born.push((e, commit.as_str(), ts));
+                }
+            }
+        }
+        if let Some(latest) = born.iter().max_by_key(|(_, _, ts)| *ts) {
+            let latest_commit = latest.1;
+            let recent: Vec<&Entity> = born
+                .iter()
+                .filter(|(_, commit, _)| *commit == latest_commit)
+                .map(|(e, _, _)| *e)
+                .collect();
+            if recent.len() < born.len() {
+                let short = latest_commit.get(..10).unwrap_or(latest_commit);
+                out.push_str(&format!(
+                    "\nCONTESTO DI SVILUPPO (le entità rilevanti AGGIUNTE più di recente, dal commit {short}):\n"
+                ));
+                let mut names: Vec<&str> =
+                    recent.iter().map(|e| e.qualified_name.as_str()).collect();
+                names.sort();
+                for n in names {
+                    out.push_str(&format!("- {n}\n"));
+                }
+                out.push_str(
+                    "  («nascita» = quando l'entità è APPARSA nel grafo temporale, non l'ultima\n   modifica; le entità senza dato di nascita — indicizzate senza contesto git — non\n   compaiono.)\n",
+                );
+            }
+        }
+    }
+
     // Passo 3 — Il *perché*. Mostrato solo se c'è davvero una memoria agganciata,
     // per non aggiungere rumore quando non ci sono decisioni rilevanti.
     if !decisions.is_empty() {
@@ -2026,6 +2072,52 @@ mod tests {
             .await
             .unwrap();
         storage.apply_delta(delta).await.unwrap();
+        Arc::new(storage)
+    }
+
+    /// Indicizza lo STESSO file in due passi, a due commit diversi (col contesto git
+    /// che timbra la nascita): le entità del primo passo nascono a `commit1`, quelle
+    /// NUOVE del secondo a `commit2` (la nascita delle preesistenti è conservata). Serve
+    /// a testare il livello L3 (CONTESTO DI SVILUPPO), che distingue le aggiunte recenti.
+    async fn graph_with_two_commits(
+        path: &str,
+        src_v1: &str,
+        commit1: &str,
+        ts1: i64,
+        src_v2: &str,
+        commit2: &str,
+        ts2: i64,
+    ) -> Arc<SqliteStorage> {
+        use codeos_types::CommitContext;
+        let storage = SqliteStorage::in_memory().unwrap();
+        let d1 = GraphResolver::new(None)
+            .with_commit_context(Some(CommitContext {
+                commit: commit1.to_string(),
+                ts: ts1,
+            }))
+            .resolve(
+                &[PythonParser::new()
+                    .parse_file(Path::new(path), src_v1)
+                    .await],
+                &storage,
+            )
+            .await
+            .unwrap();
+        storage.apply_delta(d1).await.unwrap();
+        let d2 = GraphResolver::new(None)
+            .with_commit_context(Some(CommitContext {
+                commit: commit2.to_string(),
+                ts: ts2,
+            }))
+            .resolve(
+                &[PythonParser::new()
+                    .parse_file(Path::new(path), src_v2)
+                    .await],
+                &storage,
+            )
+            .await
+            .unwrap();
+        storage.apply_delta(d2).await.unwrap();
         Arc::new(storage)
     }
 
@@ -2486,6 +2578,62 @@ mod tests {
         assert!(
             ctx.contains("PANORAMICA"),
             "i 2 moduli vanno comunque in PANORAMICA:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_context_surfaces_the_most_recently_added_entities() {
+        // Il livello L3. `old_helper` esiste dal commit "oldc0mmit"; `new_feature` è
+        // AGGIUNTO in un commit successivo "newc0mmit" (e chiama old_helper, così la BFS
+        // da new_feature li seleziona entrambi). La nascita è CONSERVATA ⇒ old_helper
+        // resta "old". Il CONTESTO DI SVILUPPO deve segnalare new_feature (il più
+        // recente), non old_helper, ancorandosi al commit nuovo.
+        let v1 = "def old_helper():\n    pass\n";
+        let v2 = "def old_helper():\n    pass\n\ndef new_feature():\n    old_helper()\n";
+        let storage =
+            graph_with_two_commits("app.py", v1, "oldc0mmit", 1000, v2, "newc0mmit", 2000).await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine
+            .query(&nl("new_feature"))
+            .await
+            .unwrap()
+            .formatted_context;
+
+        assert!(
+            ctx.contains("CONTESTO DI SVILUPPO"),
+            "manca la sezione L3:\n{ctx}"
+        );
+        let dev = ctx
+            .split("CONTESTO DI SVILUPPO")
+            .nth(1)
+            .expect("la sezione L3 è appena stata verificata presente");
+        assert!(
+            dev.contains("newc0mmit"),
+            "L3 deve ancorarsi al commit più recente:\n{ctx}"
+        );
+        assert!(
+            dev.contains("::new_feature"),
+            "new_feature è l'aggiunta più recente: deve comparire:\n{ctx}"
+        );
+        assert!(
+            !dev.contains("::old_helper"),
+            "old_helper è nato in un commit vecchio: NON va tra le aggiunte recenti:\n{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_dev_context_without_git_birth_data() {
+        // Indicizzazione SENZA contesto git (graph_from non timbra nascita) ⇒ niente
+        // CONTESTO DI SVILUPPO: non si inventa un tempo che il grafo non conosce.
+        let storage = graph_from("app.py", "def a():\n    pass\n\ndef b():\n    a()\n").await;
+        let engine = QueryEngine::new(storage);
+
+        let ctx = engine.query(&nl("b")).await.unwrap().formatted_context;
+
+        assert!(
+            !ctx.contains("CONTESTO DI SVILUPPO"),
+            "nessuna nascita timbrata: niente L3:\n{ctx}"
         );
     }
 
