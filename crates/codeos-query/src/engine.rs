@@ -46,6 +46,15 @@ const PATH_FOCUS_TARGETS: usize = 3;
 /// tronca un chiamante reale più lontano, [`TransitiveImpact::depth_capped`] lo
 /// dichiara invece di fingere completezza — astensione onesta, non silenzio.
 const MAX_IMPACT_DEPTH: u32 = 5;
+/// Quanti cammini di chiamata ALTERNATIVI al più restituisce [`QueryEngine::call_paths`].
+/// Più vie tra due entità rivelano il coupling, ma poche bastano a mostrarlo; oltre
+/// è rumore.
+const MAX_ALT_PATHS: usize = 4;
+/// Lunghezza massima (in nodi) di un cammino esplorato da [`QueryEngine::call_paths`].
+/// Tiene bounded la BFS-sui-cammini (che senza tetto enumererebbe cammini semplici a
+/// crescita esponenziale) e riflette una verità d'uso: un cammino lunghissimo non è
+/// un "impatto" azionabile. Oltre questo limite non si cerca, e il doc lo dichiara.
+const MAX_PATH_LEN: usize = 8;
 
 /// Parametri configurabili dell'espansione.
 #[derive(Debug, Clone)]
@@ -546,6 +555,100 @@ impl QueryEngine {
             }
         }
         Ok(Some(CallPath { steps }))
+    }
+
+    /// Cerca FINO A [`MAX_ALT_PATHS`] cammini di chiamata DISTINTI da `from` a `to`,
+    /// dal più corto, seguendo SOLO archi `Calls` risolti. Generalizza
+    /// [`QueryEngine::call_path`] (che dà solo il più corto): più cammini rivelano
+    /// che `to` è raggiungibile da `from` per VIE diverse — un coupling che un solo
+    /// cammino nasconde («se tocco questo, lo raggiungo in due modi indipendenti»).
+    ///
+    /// BFS sui CAMMINI: ogni elemento in coda è un cammino intero, esteso aggiungendo
+    /// i callee non ancora presenti (cammini SEMPLICI, niente cicli). Poiché la BFS
+    /// procede per lunghezza crescente, i risultati escono dal più corto. Due limiti
+    /// onesti e dichiarati che la tengono bounded: al più [`MAX_ALT_PATHS`] cammini, e
+    /// nessun cammino oltre [`MAX_PATH_LEN`] nodi (oltre non si cerca — un cammino
+    /// lunghissimo non è un "impatto" azionabile, e senza tetto i cammini semplici
+    /// crescerebbero in modo esponenziale).
+    ///
+    /// Anti-falso-positivo come [`QueryEngine::call_path`]: ogni passo è un arco
+    /// `Calls` reale e risolto, mai un ponte su un `Unresolved`; un cammino con un
+    /// nodo non più nel grafo viene scartato (non mostrato monco). `Vec` vuoto =
+    /// nessun cammino noto, mai uno inventato. L'output è ordinato (lunghezza, poi
+    /// nomi) per essere deterministico.
+    pub async fn call_paths(&self, from: EntityId, to: EntityId) -> anyhow::Result<Vec<CallPath>> {
+        // Un'entità raggiunge se stessa con un cammino banale di un solo passo.
+        if from == to {
+            return Ok(self
+                .storage
+                .get_entity_by_id(&from)
+                .await?
+                .map(|e| vec![CallPath { steps: vec![e] }])
+                .unwrap_or_default());
+        }
+
+        let mut found: Vec<Vec<EntityId>> = Vec::new();
+        let mut queue: VecDeque<Vec<EntityId>> = VecDeque::new();
+        queue.push_back(vec![from]);
+
+        while let Some(path) = queue.pop_front() {
+            if found.len() >= MAX_ALT_PATHS {
+                break;
+            }
+            // Un cammino di MAX_PATH_LEN nodi non si allunga oltre: smetti di espanderlo.
+            if path.len() >= MAX_PATH_LEN {
+                continue;
+            }
+            let last = *path.last().expect("un cammino in coda non è mai vuoto");
+            let calls = self
+                .storage
+                .query_relations(RelationFilter {
+                    source_id: Some(last),
+                    kind: Some(RelationKind::Calls),
+                    ..Default::default()
+                })
+                .await?;
+            for rel in calls {
+                // Niente nil (difensivo) e niente cicli: i cammini restano semplici.
+                if rel.target_id.is_nil() || path.contains(&rel.target_id) {
+                    continue;
+                }
+                let mut next = path.clone();
+                next.push(rel.target_id);
+                if rel.target_id == to {
+                    found.push(next);
+                    if found.len() >= MAX_ALT_PATHS {
+                        break;
+                    }
+                } else {
+                    queue.push_back(next);
+                }
+            }
+        }
+
+        // Materializza ogni cammino in entità; scarta (non mostra monco) un cammino
+        // con un nodo non più nel grafo.
+        let mut paths: Vec<CallPath> = Vec::with_capacity(found.len());
+        'outer: for ids in found {
+            let mut steps = Vec::with_capacity(ids.len());
+            for id in ids {
+                match self.storage.get_entity_by_id(&id).await? {
+                    Some(entity) => steps.push(entity),
+                    None => continue 'outer,
+                }
+            }
+            paths.push(CallPath { steps });
+        }
+        // Ordine deterministico: prima i più corti, poi per sequenza di nomi.
+        paths.sort_by(|a, b| {
+            a.steps.len().cmp(&b.steps.len()).then_with(|| {
+                a.steps
+                    .iter()
+                    .map(|e| &e.qualified_name)
+                    .cmp(b.steps.iter().map(|e| &e.qualified_name))
+            })
+        });
+        Ok(paths)
     }
 
     /// Livello L2 — **impatto**: *chi chiama X?* Risponde a "cosa cambia se tocco X?"
@@ -2273,6 +2376,90 @@ mod tests {
             "l'unica chiamata di handler è Unresolved: nessun cammino verso target, \
              non un collegamento inventato"
         );
+    }
+
+    #[tokio::test]
+    async fn call_paths_finds_multiple_distinct_routes() {
+        // `a` raggiunge `b` per DUE vie indipendenti: a → via_x → b e a → via_y → b.
+        // `call_path` ne mostrerebbe una sola (la più corta); `call_paths` rivela che
+        // sono due — il coupling che un solo cammino nasconde.
+        let storage = graph_from(
+            "app.py",
+            "def b():\n    pass\n\n\
+             def via_x():\n    b()\n\n\
+             def via_y():\n    b()\n\n\
+             def a():\n    via_x()\n    via_y()\n",
+        )
+        .await;
+        let a = id_of(&storage, "::a").await;
+        let b = id_of(&storage, "::b").await;
+        let engine = QueryEngine::new(storage);
+
+        let paths = engine.call_paths(a, b).await.unwrap();
+        assert_eq!(paths.len(), 2, "ci sono esattamente due vie a → b");
+        for p in &paths {
+            assert_eq!(p.steps.len(), 3, "ogni via è a → intermedio → b");
+            assert!(p.steps[0].qualified_name.ends_with("::a"));
+            assert!(p.steps[2].qualified_name.ends_with("::b"));
+        }
+        let middles: Vec<&str> = paths
+            .iter()
+            .map(|p| p.steps[1].qualified_name.as_str())
+            .collect();
+        assert!(
+            middles.iter().any(|m| m.ends_with("::via_x"))
+                && middles.iter().any(|m| m.ends_with("::via_y")),
+            "le due vie passano per via_x e via_y: {middles:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_paths_returns_the_shortest_route_first() {
+        // `a` raggiunge `b` sia DIRETTAMENTE (a → b) sia via `m` (a → m → b). I due
+        // cammini devono uscire dal più corto: prima quello da 2 passi, poi quello da
+        // 3 — la garanzia d'ordine su cui si appoggerà la presentazione.
+        let storage = graph_from(
+            "app.py",
+            "def b():\n    pass\n\n\
+             def m():\n    b()\n\n\
+             def a():\n    b()\n    m()\n",
+        )
+        .await;
+        let a = id_of(&storage, "::a").await;
+        let b = id_of(&storage, "::b").await;
+        let engine = QueryEngine::new(storage);
+
+        let paths = engine.call_paths(a, b).await.unwrap();
+        assert_eq!(paths.len(), 2, "una via diretta e una via m");
+        assert_eq!(
+            paths[0].steps.len(),
+            2,
+            "prima la più corta (a → b diretto)"
+        );
+        assert_eq!(paths[1].steps.len(), 3, "poi la più lunga (a → m → b)");
+    }
+
+    #[tokio::test]
+    async fn call_paths_does_not_bridge_an_unresolved_hop() {
+        // Anti-falso-positivo, come per `call_path`: `a` chiama `b` (risolto) e fa
+        // anche una chiamata NON risolta (`missing()`). L'unico cammino è quello
+        // risolto a → b: la BFS sui cammini non scavalca il buco per inventarne altri.
+        let storage = graph_from(
+            "app.py",
+            "def b():\n    pass\n\ndef a():\n    b()\n    missing()\n",
+        )
+        .await;
+        let a = id_of(&storage, "::a").await;
+        let b = id_of(&storage, "::b").await;
+        let engine = QueryEngine::new(storage);
+
+        let paths = engine.call_paths(a, b).await.unwrap();
+        assert_eq!(
+            paths.len(),
+            1,
+            "solo il cammino risolto a → b; l'arco Unresolved non genera vie"
+        );
+        assert_eq!(paths[0].steps.len(), 2);
     }
 
     #[tokio::test]
