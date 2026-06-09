@@ -77,6 +77,66 @@ pub fn occasions(
         .count() as u32
 }
 
+/// Il **profilo temporale** delle occasioni di un invariante: non solo QUANTE (il
+/// conteggio di [`occasions`]) ma QUANDO — la prima e l'ultima volta che i due layer
+/// sono stati co-toccati. È la dimensione temporale del rischio (Guardian 2.0): una
+/// confidenza alta ma esercitata l'ultima volta molto tempo fa è "battle-tested ma
+/// forse stantia", diversa da una esercitata di recente.
+///
+/// NON sostituisce il Campo di Astensione (trap #2): lo **qualifica** col tempo,
+/// lasciando intatto il lower bound di Wilson. L'`occasions` qui dentro è identico a
+/// quello di [`occasions`]; ciò che aggiunge è `first_ts`/`last_ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OccasionWindow {
+    /// Quante occasioni (= [`occasions`]): la dimensione del campione.
+    pub occasions: u32,
+    /// Timestamp Unix dell'occasione più VECCHIA (la nascita del confine).
+    pub first_ts: i64,
+    /// Timestamp Unix dell'occasione più RECENTE (l'ultima volta esercitato).
+    pub last_ts: i64,
+}
+
+impl OccasionWindow {
+    /// Da quanti secondi l'invariante non è esercitato, rispetto a `now` (di solito
+    /// l'istante del commit più recente del repo). Saturante a 0: un'occasione "nel
+    /// futuro" rispetto a `now` non produce staleness negativa. Più alto ⇒ più
+    /// stantio: l'esposizione c'è stata, ma non di recente.
+    pub fn staleness_secs(&self, now: i64) -> i64 {
+        (now - self.last_ts).max(0)
+    }
+}
+
+/// Come [`occasions`], ma restituisce il **profilo temporale** delle occasioni:
+/// conteggio + timestamp della prima e dell'ultima. `None` se nessuna occasione —
+/// nessuna evidenza temporale, niente da datare e niente inventato (stessa onestà di
+/// [`occasions`] che ritorna 0, e dello 0.0 di [`Abstention::wilson_lower_bound`]
+/// senza esposizione).
+pub fn occasion_window(
+    layer_a: &str,
+    layer_b: &str,
+    file_layers: &HashMap<String, HashSet<String>>,
+    commits: &[Commit],
+) -> Option<OccasionWindow> {
+    let mut occasions = 0u32;
+    let mut first_ts = i64::MAX;
+    let mut last_ts = i64::MIN;
+    for commit in commits {
+        if co_touches(commit, layer_a, layer_b, file_layers) {
+            occasions += 1;
+            first_ts = first_ts.min(commit.timestamp);
+            last_ts = last_ts.max(commit.timestamp);
+        }
+    }
+    if occasions == 0 {
+        return None;
+    }
+    Some(OccasionWindow {
+        occasions,
+        first_ts,
+        last_ts,
+    })
+}
+
 /// `true` se il commit ha toccato almeno un file di `layer_a` **e** almeno uno di
 /// `layer_b`: la definizione di *occasione*. Condivisa col modulo
 /// [`crate::fossil`], che la usa per individuare la *nascita* di un confine.
@@ -171,5 +231,66 @@ mod tests {
     fn abstentions_never_underflow() {
         // Difesa: violazioni > occasioni non deve andare in underflow.
         assert_eq!(Abstention::new(3, 10).abstentions(), 0);
+    }
+
+    #[test]
+    fn occasion_window_reports_first_and_last_timestamps() {
+        // Il profilo temporale: conta le occasioni come `occasions`, ma riporta anche
+        // QUANDO. Tre occasioni a ts 100/300/200; un commit a ts 999 tocca SOLO api
+        // (non è un'occasione) e NON deve spostare l'ultimo timestamp a 999.
+        let fl = file_layers();
+        let commits = vec![
+            Commit::with_meta("a", 100, "", ["app/api/h.py", "app/core/s.py"]),
+            Commit::with_meta("b", 999, "", ["app/api/h.py"]), // solo api: non occasione
+            Commit::with_meta("c", 300, "", ["app/core/s.py", "app/api/h.py"]),
+            Commit::with_meta("d", 200, "", ["app/api/h.py", "app/core/s.py"]),
+        ];
+        let w =
+            occasion_window("app::api", "app::core", &fl, &commits).expect("ci sono tre occasioni");
+        assert_eq!(w.occasions, 3, "tre commit co-toccano i due layer");
+        assert_eq!(w.first_ts, 100, "la prima occasione è a 100");
+        assert_eq!(
+            w.last_ts, 300,
+            "l'ultima OCCASIONE è a 300 — il commit a 999 tocca solo api, non conta"
+        );
+    }
+
+    #[test]
+    fn occasion_window_is_none_without_occasions() {
+        // Nessun commit co-tocca i due layer ⇒ nessuna evidenza temporale ⇒ None
+        // onesto (niente timestamp inventato), coerente con `occasions` che dà 0.
+        let fl = file_layers();
+        let commits = vec![
+            Commit::with_meta("a", 100, "", ["app/api/h.py"]), // solo api
+            Commit::with_meta("b", 200, "", ["README.md"]),    // niente layer
+        ];
+        assert!(
+            occasion_window("app::api", "app::core", &fl, &commits).is_none(),
+            "nessuna co-occorrenza: None"
+        );
+        assert!(
+            occasion_window("app::api", "app::core", &fl, &[]).is_none(),
+            "nessuna storia: None"
+        );
+    }
+
+    #[test]
+    fn staleness_secs_measures_time_since_last_exercise() {
+        let w = OccasionWindow {
+            occasions: 5,
+            first_ts: 100,
+            last_ts: 1000,
+        };
+        assert_eq!(
+            w.staleness_secs(1500),
+            500,
+            "1500 - 1000 = 500 s di stantio"
+        );
+        assert_eq!(w.staleness_secs(1000), 0, "esercitato proprio a `now`: 0");
+        assert_eq!(
+            w.staleness_secs(800),
+            0,
+            "`now` prima dell'ultima occasione: saturato a 0, mai negativo"
+        );
     }
 }
