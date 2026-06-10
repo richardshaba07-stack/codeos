@@ -962,7 +962,7 @@ impl Guardian {
     pub async fn get_context_pack(
         &self,
         goal: &str,
-        _for_ai: bool,
+        for_ai: bool,
     ) -> anyhow::Result<codeos_types::bus::GetContextPackResponse> {
         let target_entities = self.select_target_entities(goal).await;
         // Goal non localizzato: nessuna entità del grafo corrisponde. blast_count
@@ -1107,45 +1107,70 @@ impl Guardian {
             )
         };
 
-        let mut markdown = format!("# AI Context Pack - goal: \"{}\"\n\n", goal);
-        markdown.push_str(&format!(
-            "**Stima del rischio:** {}\n\n",
-            estimated_risk.to_uppercase()
-        ));
-        if unlocalized {
-            markdown.push_str(
-                "> ⚠️ **Goal non localizzato**: nessuna entità del grafo corrisponde a \
-                 questo goal. Rischio «unknown» = «non valutabile», non «sicuro». Le \
-                 sezioni qui sotto sono vuote perché non c'è nulla da ancorare: rinomina \
-                 il goal con un modulo o una funzione concreti.\n\n",
-            );
-        }
-        markdown.push_str("## 1. Interpretazione del Goal\n");
-        markdown.push_str(&format!("{}\n\n", goal_interpretation));
-        markdown.push_str("## 2. File da Leggere / Modificare\n");
-        for f in &files_to_read {
-            markdown.push_str(&format!("- {}\n", f));
-        }
-        markdown.push_str("\n## 3. Entità Rilevanti nel Contesto\n");
-        for e in &relevant_entities {
-            markdown.push_str(&format!("- {}\n", e));
-        }
-        markdown.push_str("\n## 4. Dipendenze Chiave\n");
-        for dep in &key_dependencies {
-            markdown.push_str(&format!("- {}\n", dep));
-        }
-        markdown.push_str("\n## 5. Confini da Preservare\n");
-        for b in &boundaries_to_preserve {
-            markdown.push_str(&format!("- {}\n", b));
-        }
-        markdown.push_str("\n## 6. Pattern Locali\n");
-        for p in &local_patterns {
-            markdown.push_str(&format!("- {}\n", p));
-        }
-        markdown.push_str("\n## 7. Test Suggeriti\n");
-        for t in &suggested_tests {
-            markdown.push_str(&format!("- {}\n", t));
-        }
+        // `--for ai` produce un formato COMPATTO (chiave:valore, niente prosa/emoji/
+        // intestazioni numerate): meno token e più parsabile per un agente. Senza il
+        // flag, il formato Markdown ricco e leggibile da umano. Prima il flag era
+        // ignorato (output identico) — collaudo: `--for ai` no-op, ora differenziato.
+        let markdown = if for_ai {
+            let mut m = format!("GOAL: {}\nRISK: {}\n", goal, estimated_risk.to_uppercase());
+            if unlocalized {
+                m.push_str(
+                    "UNLOCALIZED: nessuna entità del grafo corrisponde (rischio non valutabile, non «sicuro»)\n",
+                );
+            }
+            m.push_str(&format!("GOAL_INTERP: {goal_interpretation}\n"));
+            m.push_str(&format!("FILES: {}\n", files_to_read.join(", ")));
+            m.push_str(&format!("ENTITIES: {}\n", relevant_entities.join(", ")));
+            m.push_str(&format!("DEPS: {}\n", key_dependencies.join("; ")));
+            m.push_str(&format!(
+                "BOUNDARIES: {}\n",
+                boundaries_to_preserve.join("; ")
+            ));
+            m.push_str(&format!("PATTERNS: {}\n", local_patterns.join("; ")));
+            m.push_str(&format!("TESTS: {}\n", suggested_tests.join("; ")));
+            m
+        } else {
+            let mut markdown = format!("# AI Context Pack - goal: \"{}\"\n\n", goal);
+            markdown.push_str(&format!(
+                "**Stima del rischio:** {}\n\n",
+                estimated_risk.to_uppercase()
+            ));
+            if unlocalized {
+                markdown.push_str(
+                    "> ⚠️ **Goal non localizzato**: nessuna entità del grafo corrisponde a \
+                     questo goal. Rischio «unknown» = «non valutabile», non «sicuro». Le \
+                     sezioni qui sotto sono vuote perché non c'è nulla da ancorare: rinomina \
+                     il goal con un modulo o una funzione concreti.\n\n",
+                );
+            }
+            markdown.push_str("## 1. Interpretazione del Goal\n");
+            markdown.push_str(&format!("{}\n\n", goal_interpretation));
+            markdown.push_str("## 2. File da Leggere / Modificare\n");
+            for f in &files_to_read {
+                markdown.push_str(&format!("- {}\n", f));
+            }
+            markdown.push_str("\n## 3. Entità Rilevanti nel Contesto\n");
+            for e in &relevant_entities {
+                markdown.push_str(&format!("- {}\n", e));
+            }
+            markdown.push_str("\n## 4. Dipendenze Chiave\n");
+            for dep in &key_dependencies {
+                markdown.push_str(&format!("- {}\n", dep));
+            }
+            markdown.push_str("\n## 5. Confini da Preservare\n");
+            for b in &boundaries_to_preserve {
+                markdown.push_str(&format!("- {}\n", b));
+            }
+            markdown.push_str("\n## 6. Pattern Locali\n");
+            for p in &local_patterns {
+                markdown.push_str(&format!("- {}\n", p));
+            }
+            markdown.push_str("\n## 7. Test Suggeriti\n");
+            for t in &suggested_tests {
+                markdown.push_str(&format!("- {}\n", t));
+            }
+            markdown
+        };
 
         Ok(codeos_types::bus::GetContextPackResponse {
             goal_interpretation,
@@ -2549,6 +2574,33 @@ mod tests {
         let (storage, _a, _c) = seeded_two_layer_graph().await;
         let guardian = Guardian::new(storage);
         assert!(guardian.invariant_staleness().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_pack_for_ai_uses_a_compact_format() {
+        // Il flag `--for ai` non è più un no-op (collaudo): produce un formato COMPATTO
+        // chiave:valore, diverso dal Markdown ricco per umano.
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let guardian = Guardian::new(storage);
+        let human = guardian.get_context_pack("qualcosa", false).await.unwrap();
+        let ai = guardian.get_context_pack("qualcosa", true).await.unwrap();
+
+        assert_ne!(
+            human.formatted_markdown, ai.formatted_markdown,
+            "i due formati devono differire: il flag non è più un no-op"
+        );
+        assert!(
+            human.formatted_markdown.contains("## 1."),
+            "il formato umano è Markdown ricco con intestazioni numerate"
+        );
+        assert!(
+            ai.formatted_markdown.contains("GOAL:") && ai.formatted_markdown.contains("FILES:"),
+            "il formato AI è compatto chiave:valore"
+        );
+        assert!(
+            !ai.formatted_markdown.contains("## 1."),
+            "il formato AI non ha intestazioni Markdown"
+        );
     }
 
     #[tokio::test]

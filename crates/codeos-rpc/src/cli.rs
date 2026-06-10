@@ -423,9 +423,19 @@ async fn run_doctor() {
                             r.gaps.len()
                         );
                         let calibrated = r.invariants.iter().any(|i| i.calibrated);
-                        if r.invariants.is_empty() {
+                        // "Grafo vuoto" SOLO se non ci sono entità: 0 invarianti su un
+                        // grafo popolato NON è un grafo vuoto, è semplicemente assenza
+                        // di confini di layering chiari (collaudo: 714 entità segnalate
+                        // come "vuoto" — falso allarme corretto).
+                        let entity_count =
+                            r.quality.as_ref().map(|q| q.total_entities).unwrap_or(0);
+                        if entity_count == 0 {
                             println!(
                                 "  [!] Grafo vuoto: esegui `codeos index <path>` per popolarlo"
+                            );
+                        } else if r.invariants.is_empty() {
+                            println!(
+                                "  [i] Grafo popolato ({entity_count} entità) ma nessun invariante di layering estratto (nessun confine asimmetrico chiaro, o manca la storia git)"
                             );
                         } else if !calibrated {
                             println!(
