@@ -15,6 +15,16 @@ use crate::traits::LanguageParser;
 use crate::typescript::TypeScriptParser;
 use crate::workspace::WorkspaceModel;
 
+/// Tetto di dimensione (byte) per file indicizzato. Oltre questa soglia un file è
+/// quasi certamente generato a macchina / vendored / minificato (binding FFI,
+/// bundle, fixture): parsarlo costa tempo super-lineare e ha fatto STALLARE
+/// l'indicizzazione nel collaudo (windows-rs, file da 3,2–4,2 MB → 0 entità dopo
+/// oltre 240 s). Lo saltiamo con un avviso esplicito, non blocchiamo l'indicizzazione:
+/// un file mancante e NOMINATO nei log è meglio di un'indicizzazione che non finisce.
+/// Soglia generosa: il più grande sorgente scritto a mano osservato (checker.ts di
+/// tsc, ~2,9 MB) resta sotto. (Il crash da profondità è gestito a parte da `stacker`.)
+const MAX_FILE_BYTES: u64 = 3 * 1024 * 1024;
+
 /// Attore che indicizza i file.
 ///
 /// Per ogni comando di indicizzazione: legge il sorgente, sceglie il parser per
@@ -111,6 +121,19 @@ impl ParserActor {
         let Some(parser) = self.parsers.iter().find(|p| p.can_parse(extension)) else {
             return Ok(None);
         };
+        // Guardia anti-stallo: salta i file enormi (generati/vendored/minificati)
+        // prima di leggerli e parsarli. `Ok(None)` = saltato pulito, non un errore.
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            if meta.len() > MAX_FILE_BYTES {
+                tracing::warn!(
+                    %file,
+                    bytes = meta.len(),
+                    limit = MAX_FILE_BYTES,
+                    "file oltre il limite di dimensione: saltato (probabile generato/vendored)"
+                );
+                return Ok(None);
+            }
+        }
         let source = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("lettura di {file} fallita"))?;
@@ -254,6 +277,37 @@ mod tests {
         drop(cmd_tx); // chiude il loop dell'attore
         let _ = handle.await;
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_file_is_skipped_not_parsed() {
+        // Regressione dello STALLO (collaudo windows-rs): un file enorme
+        // (generato/vendored) viene SALTATO prima di parsarlo. Controprova: un file
+        // piccolo viene parsato normalmente — la guardia è selettiva, non globale.
+        let actor = ParserActor::new(broadcast::channel(16).0);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let big = std::env::temp_dir().join(format!("codeos_big_{stamp}.py"));
+        let small = std::env::temp_dir().join(format!("codeos_small_{stamp}.py"));
+
+        let huge = format!("# {}\nx = 1\n", "a".repeat(MAX_FILE_BYTES as usize + 16));
+        tokio::fs::write(&big, &huge).await.unwrap();
+        let skipped = actor.index_one(&big.to_string_lossy()).await.unwrap();
+        assert!(
+            skipped.is_none(),
+            "un file oltre {MAX_FILE_BYTES} byte va saltato, non parsato"
+        );
+
+        tokio::fs::write(&small, "def f():\n    pass\n")
+            .await
+            .unwrap();
+        let parsed = actor.index_one(&small.to_string_lossy()).await.unwrap();
+        assert!(parsed.is_some(), "un file piccolo dev'essere parsato");
+
+        let _ = tokio::fs::remove_file(&big).await;
+        let _ = tokio::fs::remove_file(&small).await;
     }
 
     #[tokio::test]
