@@ -235,6 +235,13 @@ impl QueryEngine {
         let mut by_id: HashMap<EntityId, Entity> = HashMap::new();
         for keyword in keywords {
             for entity in self.storage.find_entities_by_name_pattern(keyword).await? {
+                // Le dipendenze esterne (std, tokio, react…) non sono dove si fa una
+                // modifica: non vanno mai come seme né nel contesto. `is_external` per
+                // qualname non le cattura (il loro nome è il pacchetto, non `std::`),
+                // quindi escludiamo per KIND — stesso discrimine di L0/L1.
+                if entity.kind == EntityKind::ExternalDependency {
+                    continue;
+                }
                 by_id.entry(entity.id).or_insert(entity);
             }
         }
@@ -280,8 +287,13 @@ impl QueryEngine {
                             None => continue,
                         },
                     };
-                    // Non scendere nelle dipendenze esterne (std, site-packages…).
-                    if is_external(&target_entity.qualified_name) {
+                    // Non scendere nelle dipendenze esterne (std, site-packages…) né
+                    // includerle nel contesto: non sono dove si fa una modifica. Sia
+                    // per KIND (i nodi `ExternalDependency` sintetici) sia per qualname
+                    // (`std::`, site-packages) — il primo è il discrimine robusto.
+                    if target_entity.kind == EntityKind::ExternalDependency
+                        || is_external(&target_entity.qualified_name)
+                    {
                         continue;
                     }
 
