@@ -98,10 +98,9 @@ impl QueryActor {
                 }
                 Command::Impact { name, reply_to } => {
                     let engine = Arc::clone(&self.engine);
-                    let result = Self::isolate("impact", async move {
-                        engine.impact_by_name(&name).await
-                    })
-                    .await;
+                    let result =
+                        Self::isolate("impact", async move { engine.impact_by_name(&name).await })
+                            .await;
                     if let Err(err) = &result {
                         tracing::warn!(error = %err, "QueryActor: impact fallita");
                     }
