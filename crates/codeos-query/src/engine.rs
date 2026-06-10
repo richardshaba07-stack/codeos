@@ -133,8 +133,11 @@ impl QueryEngine {
         // si interroga il Memory solo sulle entità davvero selezionate.)
         let keywords = extract_keywords(text);
 
-        // Passo 2 — Semi: entità il cui qualified_name contiene una keyword.
-        let seeds = self.find_seeds(&keywords).await?;
+        // Passo 2 — Semi: entità il cui qualified_name contiene una keyword. Ogni seme
+        // porta un peso di SPECIFICITÀ: una keyword rara (matcha poche entità, es.
+        // `compress`) è un segnale forte; una comune (matcha tante entità, tipica della
+        // prosa) è rumore. Serve a NON far diluire il seme giusto tra molti semi-rumore.
+        let (seeds, seed_specificity) = self.find_seeds(&keywords).await?;
         if seeds.is_empty() {
             return Ok(QueryResponse {
                 formatted_context: format!(
@@ -152,7 +155,7 @@ impl QueryEngine {
         }
 
         // Passi 4-5 — Espansione BFS con punteggio di rilevanza.
-        let expansion = self.expand(&seeds).await?;
+        let expansion = self.expand(&seeds, &seed_specificity).await?;
 
         // Seleziona le entità più rilevanti (punteggio decrescente, cap a max).
         let mut selected = select_top(
@@ -231,24 +234,47 @@ impl QueryEngine {
         })
     }
 
-    async fn find_seeds(&self, keywords: &[String]) -> anyhow::Result<Vec<Entity>> {
+    /// Ritorna i semi (entità il cui qualified_name contiene una keyword) E una mappa di
+    /// SPECIFICITÀ per seme. Una keyword che matcha POCHE entità è un segnale forte
+    /// (`compress` → `compress_context`); una che ne matcha tante è rumore (parola comune
+    /// di prosa). Peso ∝ 1/match_count, sommato sui keyword: un'entità che combacia con
+    /// PIÙ parole della query, o con parole più rare, ha specificità maggiore — così in
+    /// `select_top` il seme GIUSTO non viene diluito tra molti semi-rumore equi-boostati.
+    async fn find_seeds(
+        &self,
+        keywords: &[String],
+    ) -> anyhow::Result<(Vec<Entity>, HashMap<EntityId, u32>)> {
         let mut by_id: HashMap<EntityId, Entity> = HashMap::new();
+        let mut specificity: HashMap<EntityId, u32> = HashMap::new();
         for keyword in keywords {
-            for entity in self.storage.find_entities_by_name_pattern(keyword).await? {
-                // Le dipendenze esterne (std, tokio, react…) non sono dove si fa una
-                // modifica: non vanno mai come seme né nel contesto. `is_external` per
-                // qualname non le cattura (il loro nome è il pacchetto, non `std::`),
-                // quindi escludiamo per KIND — stesso discrimine di L0/L1.
-                if entity.kind == EntityKind::ExternalDependency {
-                    continue;
-                }
+            // Le dipendenze esterne (std, tokio, react…) non sono dove si fa una modifica:
+            // non vanno mai come seme né nel contesto. `is_external` per qualname non le
+            // cattura (il loro nome è il pacchetto, non `std::`), quindi escludiamo per
+            // KIND — stesso discrimine di L0/L1.
+            let matches: Vec<Entity> = self
+                .storage
+                .find_entities_by_name_pattern(keyword)
+                .await?
+                .into_iter()
+                .filter(|e| e.kind != EntityKind::ExternalDependency)
+                .collect();
+            if matches.is_empty() {
+                continue;
+            }
+            let weight = (SPEC_SCALE / matches.len() as u32).max(1);
+            for entity in matches {
+                *specificity.entry(entity.id).or_insert(0) += weight;
                 by_id.entry(entity.id).or_insert(entity);
             }
         }
-        Ok(by_id.into_values().collect())
+        Ok((by_id.into_values().collect(), specificity))
     }
 
-    async fn expand(&self, seeds: &[Entity]) -> anyhow::Result<Expansion> {
+    async fn expand(
+        &self,
+        seeds: &[Entity],
+        seed_specificity: &HashMap<EntityId, u32>,
+    ) -> anyhow::Result<Expansion> {
         let mut entities: HashMap<EntityId, Entity> = HashMap::new();
         let mut scores: HashMap<EntityId, u32> = HashMap::new();
         let mut relations: HashMap<EntityId, Relation> = HashMap::new();
@@ -306,15 +332,18 @@ impl QueryEngine {
             }
         }
 
-        // I SEMI sono il match ESATTO sul nome cercato: il segnale di rilevanza più
-        // forte che abbiamo. Senza un bonus condividerebbero il punteggio (1) coi nodi
-        // di sola espansione e `select_top` li ordinerebbe per nome ALFABETICO —
-        // seppellendo l'entità cercata sotto hub a nome «basso» (Entity, GraphStorage)
-        // e facendola tagliare dal limite. La Fase 0 (eval/localization.sh) ha misurato
-        // questo: query col nome esatto di una funzione NON ne mostravano il file.
-        // Garantiamo che ogni seme superi qualunque nodo di pura espansione.
+        // I SEMI sono il match sul nome cercato: il segnale di rilevanza più forte che
+        // abbiamo. Senza un bonus condividerebbero il punteggio (1) coi nodi di sola
+        // espansione e `select_top` li ordinerebbe per nome ALFABETICO — seppellendo
+        // l'entità cercata sotto hub a nome «basso» (Entity, GraphStorage) e facendola
+        // tagliare dal limite. La Fase 0 (eval/localization.sh) ha misurato questo: query
+        // col nome esatto di una funzione NON ne mostravano il file. Il `SEED_BONUS` (uno
+        // zoccolo comune) garantisce che ogni seme superi qualunque nodo di pura
+        // espansione; la SPECIFICITÀ (sopra lo zoccolo) ordina i semi TRA loro, così un
+        // match raro/preciso batte i semi-rumore di una keyword comune di prosa.
         for seed in seeds {
-            *scores.entry(seed.id).or_insert(0) += SEED_BONUS;
+            let spec = seed_specificity.get(&seed.id).copied().unwrap_or(0);
+            *scores.entry(seed.id).or_insert(0) += SEED_BONUS + spec;
         }
 
         Ok(Expansion {
@@ -1334,6 +1363,11 @@ fn last_segment(name: &str) -> &str {
 /// l'entità cercata è SEMPRE in cima a FILE RILEVANTI, mai tagliata dal limite.
 const SEED_BONUS: u32 = 1_000_000;
 
+/// Scala della SPECIFICITÀ di un seme (vedi `find_seeds`): aggiunta SOPRA `SEED_BONUS`
+/// per ordinare i semi TRA loro senza mai farli scendere sotto un nodo di pura
+/// espansione. Deve restare ≪ `SEED_BONUS` per preservare lo zoccolo «seme > espansione».
+const SPEC_SCALE: u32 = 100_000;
+
 /// Ordina per punteggio decrescente (a parità, per nome) e taglia a `limit`.
 fn select_top(
     entities: HashMap<EntityId, Entity>,
@@ -2245,6 +2279,46 @@ mod tests {
             response.formatted_context.contains("apexseedtarget"),
             "il seme dev'essere in FILE RILEVANTI:\n{}",
             response.formatted_context
+        );
+    }
+
+    #[tokio::test]
+    async fn specific_seed_beats_noisy_common_keyword_seeds() {
+        // Regressione (Fase 0): una keyword RARA (matcha poche entità) è un segnale più
+        // forte di una keyword COMUNE (matcha tante entità, tipica della prosa). Senza il
+        // peso di specificità tutti i semi sono equi-boostati e `select_top` li ordina
+        // per nome: il match preciso ma alfabeticamente «alto» (zylophone) verrebbe
+        // tagliato dal limite a favore dei semi-rumore «bassi» (common_*).
+        let storage = graph_from(
+            "app.py",
+            "def zylophone_unique():\n    pass\n\n\
+             def common_task_a():\n    pass\n\n\
+             def common_task_b():\n    pass\n\n\
+             def common_task_c():\n    pass\n\n\
+             def common_task_d():\n    pass\n",
+        )
+        .await;
+        let config = QueryConfig {
+            max_entities: 2,
+            ..QueryConfig::default()
+        };
+        let engine = QueryEngine::with_config(storage, config);
+
+        // "zylophone" matcha 1 entità (raro ⇒ specifico); "common" ne matcha 4 (rumore).
+        let response = engine.query(&nl("zylophone common task")).await.unwrap();
+
+        assert!(
+            response
+                .entities
+                .iter()
+                .any(|e| e.qualified_name.contains("zylophone_unique")),
+            "il match raro/specifico dev'essere selezionato malgrado il limite e il nome \
+             alfabeticamente alto: {:?}",
+            response
+                .entities
+                .iter()
+                .map(|e| &e.qualified_name)
+                .collect::<Vec<_>>()
         );
     }
 
