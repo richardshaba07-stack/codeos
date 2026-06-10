@@ -187,13 +187,17 @@ impl<'src> FileWalk<'src> {
     }
 
     fn walk_children(&mut self, node: Node, scope: &Scope) {
-        let mut cursor = node.walk();
-        // Raccogliamo i figli per rilasciare il prestito del cursore prima di
-        // richiamare `walk` (che vuole `&mut self`). `Node` è `Copy`.
-        let children: Vec<Node> = node.children(&mut cursor).collect();
-        for child in children {
-            self.walk(child, scope);
-        }
+        // Cresci lo stack nell'heap se sta per finire: evita lo stack overflow sul
+        // walk ricorsivo di un AST profondamente annidato (vedi STACK_RED_ZONE).
+        stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_GROW_BY, || {
+            let mut cursor = node.walk();
+            // Raccogliamo i figli per rilasciare il prestito del cursore prima di
+            // richiamare `walk` (che vuole `&mut self`). `Node` è `Copy`.
+            let children: Vec<Node> = node.children(&mut cursor).collect();
+            for child in children {
+                self.walk(child, scope);
+            }
+        })
     }
 
     fn handle_class(&mut self, node: Node, scope: &Scope) {
@@ -424,6 +428,23 @@ def top_level():
         assert!(
             !result.errors.is_empty(),
             "ci aspettavamo errori di sintassi"
+        );
+    }
+
+    #[tokio::test]
+    async fn deeply_nested_input_does_not_overflow_the_stack() {
+        // Regressione del crash GRAVE (Abort trap: 6) visto sul collaudo Microsoft:
+        // un'espressione profondamente annidata fa traboccare lo stack del walk
+        // ricorsivo. Senza `stacker` questo test ABORTIREBBE il processo (lo stack del
+        // worker tokio è ~2 MB); con `stacker` lo stack cresce nell'heap e completa.
+        // Il solo RITORNO senza crash è la prova: l'annidamento è di sole parentesi,
+        // non asseriamo entità, solo la sopravvivenza del processo.
+        let depth = 40_000;
+        let src = format!("x = {}1{}\n", "(".repeat(depth), ")".repeat(depth));
+        let result = parse(&src).await;
+        assert!(
+            !result.entities.is_empty(),
+            "deve restare almeno il Module dopo un parse profondo, senza crash"
         );
     }
 }

@@ -186,11 +186,15 @@ impl<'src> FileWalk<'src> {
     }
 
     fn walk_children(&mut self, node: Node, scope: &Scope) {
-        let mut cursor = node.walk();
-        let children: Vec<Node> = node.children(&mut cursor).collect();
-        for child in children {
-            self.walk(child, scope);
-        }
+        // Cresci lo stack nell'heap se sta per finire: evita lo stack overflow sul
+        // walk ricorsivo di un AST profondamente annidato (vedi STACK_RED_ZONE).
+        stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_GROW_BY, || {
+            let mut cursor = node.walk();
+            let children: Vec<Node> = node.children(&mut cursor).collect();
+            for child in children {
+                self.walk(child, scope);
+            }
+        })
     }
 
     fn handle_type_spec(&mut self, node: Node, scope: &Scope) {

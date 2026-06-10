@@ -14,6 +14,16 @@
 //! (invariante 1.4): il name resolution e gli `EntityId` sono compito del
 //! `GraphResolver` (Blocco 3).
 
+/// Margine di stack (byte) sotto il quale `stacker` alloca un nuovo segmento nello
+/// heap PRIMA di scendere ancora nel walk ricorsivo dell'AST. Un albero
+/// profondamente annidato (fixture patologiche, file giganti generati) farebbe
+/// altrimenti traboccare lo stack e ABBATTERE l'intero server (`Abort trap: 6`).
+pub(crate) const STACK_RED_ZONE: usize = 128 * 1024;
+/// Dimensione (byte) di ogni nuovo segmento di stack allocato da `stacker` quando si
+/// scende sotto [`STACK_RED_ZONE`]. Approccio di rust-analyzer: walk ricorsivo
+/// pulito, ma senza crash a qualsiasi profondità.
+pub(crate) const STACK_GROW_BY: usize = 2 * 1024 * 1024;
+
 mod actor;
 mod go;
 mod java_lang;
