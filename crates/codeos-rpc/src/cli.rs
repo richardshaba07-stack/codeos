@@ -276,6 +276,92 @@ async fn main() -> anyhow::Result<()> {
                 println!("  • {}", t);
             }
         }
+        "decide" => {
+            // La PORTA di scrittura del ledger di intento — lo strato non-derivabile
+            // del moat: un umano (o un agente) registra il PERCHÉ che git non dice.
+            // `why "A|B"` lo ritrova per titolo/tag; persiste in <repo>/.codeos/decisions.
+            let mut title = String::new();
+            let mut rationale = String::new();
+            let mut context = String::new();
+            let mut author = "human:cli".to_string();
+            let mut tags: Vec<String> = Vec::new();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--title" if i + 1 < args.len() => {
+                        title = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--why" | "--rationale" if i + 1 < args.len() => {
+                        rationale = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--context" if i + 1 < args.len() => {
+                        context = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--author" if i + 1 < args.len() => {
+                        author = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--tags" if i + 1 < args.len() => {
+                        tags.extend(
+                            args[i + 1]
+                                .split(',')
+                                .map(|t| t.trim().to_string())
+                                .filter(|t| !t.is_empty()),
+                        );
+                        i += 2;
+                    }
+                    "--boundary" if i + 1 < args.len() => {
+                        // Comodità: "A|B" (o "A->B") → A e B diventano tag, così
+                        // `why "A|B"` lo trova. Split SOLO sul separatore di confine,
+                        // mai su '-' (i nomi sono kebab-case: `codeos-storage`).
+                        let raw = &args[i + 1];
+                        let parts: Vec<&str> = if raw.contains("->") {
+                            raw.split("->").collect()
+                        } else {
+                            raw.split('|').collect()
+                        };
+                        for part in parts {
+                            let p = part.trim();
+                            if !p.is_empty() {
+                                tags.push(p.to_string());
+                            }
+                        }
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            if title.is_empty() || rationale.is_empty() {
+                eprintln!("Errore: servono almeno --title e --why (il razionale).");
+                eprintln!("Uso: codeos decide --title \"core non deve dipendere da rpc\" \\");
+                eprintln!(
+                    "                   --why \"core è il kernel, agnostico al trasporto\" \\"
+                );
+                eprintln!("                   [--boundary \"core|rpc\"] [--context \"…\"] \\");
+                eprintln!("                   [--author \"human:Marco\"] [--tags \"core,rpc\"]");
+                std::process::exit(1);
+            }
+            let mut client = connect_server().await?;
+            let req = proto::RecordDecisionRequest {
+                author,
+                title: title.clone(),
+                context,
+                rationale,
+                related_entity_ids: Vec::new(),
+                related_decision_ids: Vec::new(),
+                tags,
+                supersedes: Vec::new(),
+                deprecates: Vec::new(),
+            };
+            let res = client.record_decision(req).await?.into_inner();
+            println!("✅ Decisione registrata nel ledger di intento.");
+            println!("   id:    {}", res.decision_id);
+            println!("   «{title}»");
+            println!("   Ritrovala con  codeos why \"A|B\"  o nel contesto di  codeos query.");
+        }
         "why" => {
             if args.len() < 3 {
                 eprintln!("Errore: specifica l'espressione (es. 'modulo_a|modulo_b').");
@@ -649,6 +735,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "mri [--base <ref>] [--head <ref>]",
         "\"MRI\" architetturale di un PR: confronta due ref git (default: main..HEAD) e misura il rischio.",
+    ),
+    (
+        "decide --title \"…\" --why \"…\" [--boundary \"a|b\"] [--tags …]",
+        "Registra una decisione architetturale nel ledger di intento (lo strato non-derivabile): il PERCHÉ che git non dice. Persiste in <repo>/.codeos/decisions e riemerge in `why` e `query`.",
     ),
     (
         "why \"<a>|<b>\"",

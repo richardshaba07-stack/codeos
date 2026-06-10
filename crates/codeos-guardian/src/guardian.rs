@@ -1544,12 +1544,17 @@ impl Guardian {
             if let Some(store) = &self.decisions {
                 if let Ok(all_decisions) = store.all().await {
                     for dec in all_decisions {
-                        if (dec.title.contains(&upstream) && dec.title.contains(&downstream))
-                            || dec
-                                .tags
-                                .iter()
-                                .any(|t| t.contains(&upstream) || t.contains(&downstream))
-                        {
+                        // Una decisione spiega il confine A↔B solo se cita ENTRAMBI gli
+                        // estremi (nel titolo O nei tag). La vecchia condizione accettava
+                        // UNO QUALSIASI dei due nei tag (OR) → un `why "A|B"` veniva
+                        // inondato da OGNI invariante che toccava A *oppure* B,
+                        // seppellendo la decisione umana specifica (il moat). Richiedere
+                        // ENTRAMBI isola il confine giusto.
+                        let mentions = |needle: &str| {
+                            dec.title.contains(needle)
+                                || dec.tags.iter().any(|t| t.contains(needle))
+                        };
+                        if mentions(&upstream) && mentions(&downstream) {
                             markdown_decisions.push(format!(
                                 "### {}\n\n**Autore:** {}\n\n**Razionale:** {}\n\n**Contesto:** {}",
                                 dec.title, dec.author, dec.rationale, dec.context
@@ -3006,29 +3011,42 @@ mod tests {
 
         let storage = Arc::new(SqliteStorage::in_memory().unwrap());
         let store = Arc::new(InMemoryDecisionStore::new());
-        // Una decisione del tutto estranea a "foo": né il titolo né il tag lo contengono.
+        let mk = |title: &str, tags: Vec<String>| Decision {
+            id: EntityId::new(),
+            kind: DecisionKind::Decision,
+            author: "human:Marco".to_string(),
+            title: title.to_string(),
+            context: String::new(),
+            rationale: "isolare il dominio".to_string(),
+            related_entity_ids: vec![],
+            related_decision_ids: vec![],
+            supersedes: vec![],
+            deprecates: vec![],
+            evidence: vec![],
+            tags,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+        };
+        // (a) cita UN SOLO estremo del confine ("payments"): NON è una decisione "del
+        //     confine payments↔orders". Col contratto largo (OR) inondava `why`.
         store
-            .record(&Decision {
-                id: EntityId::new(),
-                kind: DecisionKind::Decision,
-                author: "human:Marco".to_string(),
-                title: "Adottare l'architettura esagonale".to_string(),
-                context: String::new(),
-                rationale: "isolare il dominio".to_string(),
-                related_entity_ids: vec![],
-                related_decision_ids: vec![],
-                supersedes: vec![],
-                deprecates: vec![],
-                evidence: vec![],
-                tags: vec!["payments".to_string()],
-                timestamp: "2024-01-01T00:00:00Z".to_string(),
-            })
+            .record(&mk(
+                "Adottare l'architettura esagonale",
+                vec!["payments".into()],
+            ))
+            .await
+            .unwrap();
+        // (b) cita ENTRAMBI gli estremi (via tag): È la decisione del confine.
+        store
+            .record(&mk(
+                "payments non deve dipendere da orders a runtime",
+                vec!["payments".into(), "orders".into()],
+            ))
             .await
             .unwrap();
         let guardian = Guardian::with_memory(storage, store);
 
-        // Un solo nome → downstream vuoto. Col vecchio `contains("")` questa
-        // decisione (e ogni altra con un tag qualsiasi) finiva fra le "correlate".
+        // Un solo nome → downstream vuoto. Col vecchio `contains("")` ogni decisione con
+        // un tag qualsiasi finiva fra le "correlate".
         let single = guardian.why("foo").await.unwrap();
         assert!(
             single.markdown_decisions.is_empty(),
@@ -3041,13 +3059,21 @@ mod tests {
             single.explanation
         );
 
-        // Espressione ben formata: il tag che combacia continua a far emergere la
-        // decisione — il filtro più severo non spegne i match legittimi.
+        // Contratto CORRETTO (anti-flood): `why "payments|orders"` emerge SOLO la
+        // decisione che cita ENTRAMBI gli estremi (b), non quella che ne cita uno (a).
+        // La vecchia regola (un tag qualsiasi combacia) inondava col crescere del ledger
+        // (es. ogni invariante auto-promosso che toccava un estremo) — verificato sul
+        // reale: `why` di un confine mostrava 8 decisioni invece di 1.
         let paired = guardian.why("payments|orders").await.unwrap();
         assert_eq!(
             paired.markdown_decisions.len(),
             1,
-            "un estremo che combacia col tag deve ancora trovare la decisione: {:?}",
+            "deve emergere SOLO la decisione che cita entrambi gli estremi: {:?}",
+            paired.markdown_decisions
+        );
+        assert!(
+            paired.markdown_decisions[0].contains("payments non deve dipendere da orders"),
+            "la decisione del confine (entrambi gli estremi) è quella giusta: {:?}",
             paired.markdown_decisions
         );
     }

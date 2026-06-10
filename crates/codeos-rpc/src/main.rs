@@ -43,16 +43,35 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Memoria storica: Markdown versionabile se `CODEOS_DECISIONS` è impostata.
+    // Memoria storica (il LEDGER DI INTENTO — lo strato non-derivabile del moat).
+    // Precedenza: CODEOS_DECISIONS esplicito → poi, se c'è un repo, il default
+    // PERSISTENTE `<repo>/.codeos/decisions` (versionabile col codice) → infine
+    // effimero. Il default persistente è ciò che rende `why` NON inerte
+    // out-of-the-box: l'intento registrato sopravvive ai riavvii e vive accanto al
+    // sorgente, invece di evaporare in memoria (era questo il motivo per cui il
+    // ledger restava vuoto nei collaudi).
     let decisions: Arc<dyn DecisionStore> = match std::env::var("CODEOS_DECISIONS") {
         Ok(dir) => {
-            tracing::info!(dir, "memoria storica: Markdown ispezionabile");
+            tracing::info!(
+                dir,
+                "memoria storica: Markdown ispezionabile (CODEOS_DECISIONS)"
+            );
             Arc::new(codeos_memory::MarkdownDecisionStore::new(dir).await?)
         }
-        Err(_) => {
-            tracing::info!("memoria storica: effimera (in memoria)");
-            Arc::new(InMemoryDecisionStore::new())
-        }
+        Err(_) => match std::env::var("CODEOS_REPO") {
+            Ok(root) => {
+                let dir = PathBuf::from(&root).join(".codeos").join("decisions");
+                tracing::info!(
+                    dir = %dir.display(),
+                    "memoria storica: ledger persistente in <repo>/.codeos/decisions (default)"
+                );
+                Arc::new(codeos_memory::MarkdownDecisionStore::new(dir).await?)
+            }
+            Err(_) => {
+                tracing::info!("memoria storica: effimera (né CODEOS_DECISIONS né CODEOS_REPO)");
+                Arc::new(InMemoryDecisionStore::new())
+            }
+        },
     };
 
     // Storia git per il Guardian: se `CODEOS_REPO` punta a un repo, abilita la
