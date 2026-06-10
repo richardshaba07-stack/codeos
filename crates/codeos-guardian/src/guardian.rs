@@ -31,6 +31,25 @@ fn resolve_repo_root() -> PathBuf {
 /// con un conteggio del residuo — mai in silenzio, l'onestà del passo Compress.
 const MAX_GUARD_ITEMS: usize = 3000;
 
+/// Il **profilo temporale del rischio** di UN invariante (Guardian 2.0): da quanto il
+/// confine non è esercitato. Un invariante CONFIDENTE (alta confidenza Wilson) ma
+/// STANTIO (ultimo esercizio molto vecchio rispetto a HEAD) è "battle-tested ma forse
+/// non più attivamente mantenuto" — la dimensione TEMPORALE che ESTENDE il Campo di
+/// Astensione senza toccare il lower bound di Wilson (trap #2): il confine resta
+/// confidente, ma il tempo qualifica quanto è "fresco".
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleStaleness {
+    pub upstream: String,
+    pub downstream: String,
+    /// La confidenza (Wilson) dell'invariante — NON modificata dal tempo.
+    pub confidence: f32,
+    /// Timestamp Unix dell'ULTIMA occasione (ultima volta esercitato il confine).
+    pub last_exercised_unix: i64,
+    /// Secondi tra l'ultimo esercizio e il commit più recente (HEAD). Più alto ⇒ più
+    /// stantio: l'esposizione c'è stata, ma non di recente.
+    pub staleness_secs: i64,
+}
+
 /// Tronca `items` a `max` aggiungendo una riga di nota col residuo (mai nascosto),
 /// per non sforare il limite di trasporto gRPC di 4 MB.
 fn truncate_with_note(mut items: Vec<String>, max: usize, what: &str) -> Vec<String> {
@@ -64,7 +83,9 @@ fn repo_root_from(env_repo: Option<String>, cwd: &Path) -> PathBuf {
 }
 
 use codeos_memory::{Decision, DecisionKind, DecisionStore, Evidence, Proposal};
-use codeos_paleo::{excavate, occasions, Abstention, CommitHistory, DecisionFossil, Z_95};
+use codeos_paleo::{
+    excavate, occasion_window, occasions, Abstention, CommitHistory, DecisionFossil, Z_95,
+};
 use codeos_storage::{GraphStorage, RelationFilter};
 use codeos_types::bus::{ArchitectureViolation, NewDecision};
 use codeos_types::{Entity, EntityId, EntityKind, Relation};
@@ -282,6 +303,61 @@ impl Guardian {
             rule.confidence = Abstention::new(occ, 0).wilson_lower_bound(Z_95) as f32;
         }
         Ok(rules)
+    }
+
+    /// **Rischio temporale (Guardian 2.0):** per ogni invariante calibrato (non
+    /// dichiarato), da quanto il confine non è esercitato — il profilo temporale del
+    /// Campo di Astensione ([`RuleStaleness`]). Fa emergere gli invarianti
+    /// *confidenti ma stantii*: alta confidenza Wilson, ma ultimo esercizio molto
+    /// vecchio rispetto a HEAD.
+    ///
+    /// ESTENDE, non sostituisce (trap #2): la confidenza di Wilson resta intatta, il
+    /// tempo la *qualifica*. Vuoto senza storia git, o per i confini i cui layer non
+    /// si sono mai co-toccati (nessun'occasione ⇒ niente da datare). Ordinato dal più
+    /// stantio.
+    pub async fn invariant_staleness(&self) -> anyhow::Result<Vec<RuleStaleness>> {
+        let rules = self.mine_rules_calibrated().await?;
+        let Some(history) = self.history.clone() else {
+            return Ok(Vec::new());
+        };
+        let commits = tokio::task::spawn_blocking(move || history.commits()).await??;
+        // HEAD = il commit più recente (la storia è newest-first). Senza commit non c'è
+        // un "adesso" rispetto a cui misurare la staleness.
+        let Some(now) = commits.first().map(|c| c.timestamp) else {
+            return Ok(Vec::new());
+        };
+        let relations = self
+            .storage
+            .query_relations(RelationFilter::default())
+            .await?;
+        let file_layers = self.build_file_layers(&relations).await?;
+
+        let mut out = Vec::new();
+        for rule in &rules {
+            // Le regole dichiarate valgono per decreto: niente analisi temporale.
+            if rule.origin == codeos_types::bus::RuleOrigin::Declared {
+                continue;
+            }
+            if let Some(window) =
+                occasion_window(&rule.upstream.0, &rule.downstream.0, &file_layers, &commits)
+            {
+                out.push(RuleStaleness {
+                    upstream: rule.upstream.0.clone(),
+                    downstream: rule.downstream.0.clone(),
+                    confidence: rule.confidence,
+                    last_exercised_unix: window.last_ts,
+                    staleness_secs: window.staleness_secs(now),
+                });
+            }
+        }
+        // Il più stantio in cima: è quello su cui il "confidente ma forse non più
+        // mantenuto" pesa di più.
+        out.sort_by(|a, b| {
+            b.staleness_secs
+                .cmp(&a.staleness_secs)
+                .then_with(|| a.upstream.cmp(&b.upstream))
+        });
+        Ok(out)
     }
 
     /// **Fossili di Decisione.** Per ogni regola scoperta, scava nella storia git
@@ -2431,6 +2507,48 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn invariant_staleness_measures_time_since_last_exercise() {
+        // Rischio temporale (Guardian 2.0). Il confine api↔core è esercitato
+        // (co-toccato) al commit di nascita a ts 100; il commit più recente (HEAD, ts
+        // 500) tocca SOLO api ⇒ NON è un'occasione. Staleness = 500 - 100 = 400: alta
+        // confidenza, ma non esercitato di recente.
+        use codeos_paleo::{Commit, InMemoryHistory};
+        let (storage, api, core) = seeded_two_layer_graph().await;
+        let api_file = api[0].location.file_path.clone();
+        let core_file = core[0].location.file_path.clone();
+        let history = InMemoryHistory::new(vec![
+            Commit::with_meta("recentHEAD", 500, "touch api only", [api_file.clone()]),
+            Commit::with_meta("birth", 100, "draw boundary", [api_file, core_file]),
+        ]);
+        let guardian = Guardian::new(storage).with_commit_history(Arc::new(history));
+
+        let stale = guardian.invariant_staleness().await.unwrap();
+        let entry = stale
+            .iter()
+            .find(|s| {
+                (s.upstream == "app::core" && s.downstream == "app::api")
+                    || (s.upstream == "app::api" && s.downstream == "app::core")
+            })
+            .expect("il confine api↔core deve avere un profilo temporale");
+        assert_eq!(
+            entry.last_exercised_unix, 100,
+            "ultimo esercizio = il commit di nascita (HEAD tocca solo api, non è occasione)"
+        );
+        assert_eq!(entry.staleness_secs, 400, "now(500) - last(100) = 400");
+        assert!(
+            entry.confidence > 0.0,
+            "la confidenza Wilson resta intatta, il tempo la qualifica soltanto"
+        );
+    }
+
+    #[tokio::test]
+    async fn invariant_staleness_is_empty_without_history() {
+        let (storage, _a, _c) = seeded_two_layer_graph().await;
+        let guardian = Guardian::new(storage);
+        assert!(guardian.invariant_staleness().await.unwrap().is_empty());
     }
 
     #[tokio::test]
