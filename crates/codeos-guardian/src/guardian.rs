@@ -357,6 +357,30 @@ impl Guardian {
         Ok(out)
     }
 
+    /// Scava il Fossile di Decisione per UN confine ARBITRARIO (`upstream`↔`downstream`),
+    /// non solo per gli invarianti scoperti: trova nella storia git il commit più
+    /// vecchio che ha co-toccato i due layer, col suo intento (il messaggio). È ciò
+    /// che de-inerta `why` — un agente con grep dovrebbe rifare quest'archeologia ogni
+    /// volta; qui è pre-calcolata e ancorata al confine. `None` senza storia git o se i
+    /// due layer non si sono MAI co-toccati (nessun confine ⇒ niente da spiegare, mai
+    /// inventato).
+    async fn excavate_boundary(
+        &self,
+        upstream: &str,
+        downstream: &str,
+    ) -> anyhow::Result<Option<DecisionFossil>> {
+        let Some(history) = self.history.clone() else {
+            return Ok(None);
+        };
+        let commits = tokio::task::spawn_blocking(move || history.commits()).await??;
+        let relations = self
+            .storage
+            .query_relations(RelationFilter::default())
+            .await?;
+        let file_layers = self.build_file_layers(&relations).await?;
+        Ok(excavate(upstream, downstream, &file_layers, &commits))
+    }
+
     /// **Spazio negativo del secondo ordine.** Punta l'algoritmo dello spazio
     /// negativo un livello più in alto, sulla griglia *layer × layer*, e segnala gli
     /// invarianti che *mancano dove dovrebbero esserci*: un layer-fondazione,
@@ -1261,7 +1285,18 @@ impl Guardian {
                     || (f.upstream == downstream && f.downstream == upstream)
             });
 
-            if let Some(f) = matching_fossil {
+            // Se nessun INVARIANTE scoperto combacia, scava il confine ARBITRARIO
+            // direttamente dalla storia: `why` spiega QUALSIASI confine nato in git
+            // (il commit che l'ha creato + l'intento), non solo gli invarianti — è ciò
+            // che lo rende NON inerte sui confini reali che l'utente chiede.
+            let fossil = match matching_fossil {
+                Some(f) => Some(f),
+                None => self
+                    .excavate_boundary(&upstream, &downstream)
+                    .await
+                    .unwrap_or(None),
+            };
+            if let Some(f) = fossil {
                 fossil_found = true;
                 born_commit = f.born_at.clone();
                 born_date = chrono::DateTime::from_timestamp(f.born_at_unix, 0)
@@ -2358,6 +2393,44 @@ mod tests {
         let (storage, _api, _core) = seeded_two_layer_graph().await;
         let guardian = Guardian::new(storage);
         assert!(guardian.fossils().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn excavate_boundary_recovers_an_arbitrary_boundary_from_history() {
+        // Il MOAT: `why` non è più inerte sui confini arbitrari. `excavate_boundary`
+        // scava il confine api↔core dalla storia — il commit che l'ha disegnato + il
+        // suo intento — anche quando NON lo si interroga come invariante scoperto.
+        use codeos_paleo::{Commit, InMemoryHistory};
+        let (storage, api, core) = seeded_two_layer_graph().await;
+        let api_file = api[0].location.file_path.clone();
+        let core_file = core[0].location.file_path.clone();
+        let history = InMemoryHistory::new(vec![Commit::with_meta(
+            "birthC0mmit",
+            100,
+            "draw the boundary",
+            [api_file, core_file],
+        )]);
+        let guardian = Guardian::new(storage).with_commit_history(Arc::new(history));
+
+        let fossil = guardian
+            .excavate_boundary("app::api", "app::core")
+            .await
+            .unwrap()
+            .expect("il confine è co-toccato dal commit: deve esserci un fossile");
+        assert_eq!(fossil.born_at, "birthC0mmit");
+        assert_eq!(fossil.intent, "draw the boundary");
+    }
+
+    #[tokio::test]
+    async fn excavate_boundary_is_none_without_history_or_co_touch() {
+        let (storage, _a, _c) = seeded_two_layer_graph().await;
+        // Senza storia git: niente da datare, None onesto (non un confine inventato).
+        let guardian = Guardian::new(storage);
+        assert!(guardian
+            .excavate_boundary("app::api", "app::core")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
