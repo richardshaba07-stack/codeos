@@ -1491,7 +1491,17 @@ fn compress_context(
     // NON rispettare il budget e di svuotare la sezione più utile (misurato dall'eval
     // Fase 0: su veri commit, FILE RILEVANTI ridotto a 1 entità, contesto ancora 59k).
     let note = "\n[… contesto troncato al budget: sezioni di coda meno prioritarie omesse]\n";
-    let budget = max_chars.saturating_sub(note.len()).min(full.len());
+    let mut budget = max_chars.saturating_sub(note.len()).min(full.len());
+    // `budget` è un offset in BYTE. Se cade DENTRO un carattere multibyte (« » — é,
+    // comunissimi nei messaggi di commit e nel testo della query echeggiato in cima),
+    // lo slice `full[..budget]` va in PANIC (`slice_error` su confine non-char) e
+    // UCCIDE il query actor per TUTTE le richieste successive (canale chiuso → «attore
+    // non raggiungibile»). Riportiamo `budget` al confine di carattere valido più vicino
+    // verso il basso PRIMA di tagliare. (Bug trovato dalla Fase 0: la sequenza di query
+    // reali abbatteva il server alla 7ª, corrompendo la misura stessa.)
+    while budget > 0 && !full.is_char_boundary(budget) {
+        budget -= 1;
+    }
     let cut = full[..budget].rfind('\n').unwrap_or(budget);
     let mut out = full[..cut].to_string();
     out.push_str(note);
@@ -2450,6 +2460,23 @@ mod tests {
         assert!(response
             .formatted_context
             .contains("Nessuna entità rilevante"));
+    }
+
+    #[test]
+    fn compress_context_never_panics_across_multibyte_budgets() {
+        // REGRESSIONE (Fase 0): il troncamento al budget NON deve mai cadere DENTRO un
+        // carattere multibyte (« » — é, comuni nei messaggi di commit e nella query
+        // echeggiata in cima al contesto). Lo slice `full[..budget]` su un confine
+        // non-char andava in PANIC, uccidendo il query actor per TUTTE le richieste
+        // successive (canale chiuso). La sequenza di query reali abbatteva il server
+        // alla 7ª — e così CORROMPEVA il metro stesso. Qui spazziamo OGNI budget: senza
+        // il clamp al confine di carattere, almeno uno cadrebbe a metà char e panicherebbe.
+        let text = "«àèìòù—é decisione storica» ".repeat(30);
+        for max_chars in 1..=text.len() + 40 {
+            // Un panic qui FA fallire il test; il risultato resta UTF-8 valido.
+            let out = compress_context(max_chars, &text, &[], &[], &[], &[], &[], &[]);
+            assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        }
     }
 
     #[tokio::test]
