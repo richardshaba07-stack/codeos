@@ -1446,60 +1446,28 @@ fn compress_context(
     impacts: &[ImpactSummary],
     call_paths: &[TargetRoutes],
 ) -> String {
-    let total = entities.len();
-    // Formatta il sottografo delle prime `k` entità, restringendo OGNI sezione
-    // per-entità al loro insieme così che tutto scali insieme a `k`.
-    let render = |k: usize| -> String {
-        let kept: HashSet<EntityId> = entities[..k].iter().map(|e| e.id).collect();
-        let holes_k: Vec<UnresolvedHole> = holes
-            .iter()
-            .filter(|h| kept.contains(&h.source_id))
-            .cloned()
-            .collect();
-        let impacts_k: Vec<ImpactSummary> = impacts
-            .iter()
-            .filter(|s| kept.contains(&s.entity.id))
-            .cloned()
-            .collect();
-        let paths_k: Vec<TargetRoutes> = call_paths
-            .iter()
-            .filter(|g| {
-                g.routes
-                    .first()
-                    .and_then(|p| p.steps.last())
-                    .is_some_and(|e| kept.contains(&e.id))
-            })
-            .cloned()
-            .collect();
-        format_context(
-            text,
-            &entities[..k],
-            relations,
-            decisions,
-            &holes_k,
-            &impacts_k,
-            &paths_k,
-            total - k,
-        )
-    };
-
-    let full = render(total); // k == total ⇒ omitted 0, nessuna nota
-    if full.len() <= max_chars || total <= 1 {
+    let full = format_context(
+        text, entities, relations, decisions, holes, impacts, call_paths, 0,
+    );
+    if full.len() <= max_chars {
         return full;
     }
 
-    // Ricerca binaria del massimo k ∈ [1, total-1] entro il budget (la nota
-    // d'omissione è inclusa nella misura, così il risultato la conta).
-    let (mut lo, mut hi) = (1usize, total - 1);
-    while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        if render(mid).len() <= max_chars {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    render(lo)
+    // Oltre il budget: tronca dalla CODA su un confine di riga. Le sezioni sono in
+    // ordine di priorità (PANORAMICA/SOTTOSISTEMI, FILE RILEVANTI, DIPENDENZE,
+    // IMPATTO, PERCORSI, CONTESTO DI SVILUPPO, DECISIONI, BUCHI): tagliando dal fondo
+    // si PRESERVA ciò che serve di più all'LLM per localizzare il lavoro (quali file
+    // toccare), e si sacrificano prima le sezioni più accessorie. Sostituisce la
+    // vecchia ricerca binaria sulle entità, che invece sforbiciava proprio FILE
+    // RILEVANTI lasciando intatte le sezioni pesanti (DECISIONI) — col risultato di
+    // NON rispettare il budget e di svuotare la sezione più utile (misurato dall'eval
+    // Fase 0: su veri commit, FILE RILEVANTI ridotto a 1 entità, contesto ancora 59k).
+    let note = "\n[… contesto troncato al budget: sezioni di coda meno prioritarie omesse]\n";
+    let budget = max_chars.saturating_sub(note.len()).min(full.len());
+    let cut = full[..budget].rfind('\n').unwrap_or(budget);
+    let mut out = full[..cut].to_string();
+    out.push_str(note);
+    out
 }
 
 /// Passo 6: genera il prompt strutturato per l'LLM. `omitted` è il numero di entità
@@ -2417,9 +2385,9 @@ mod tests {
     #[tokio::test]
     async fn context_is_compressed_when_it_exceeds_the_budget() {
         // 15 funzioni che combaciano tutte con la keyword ⇒ tutte selezionate: il
-        // contesto pieno è grande. Con un budget piccolo, il passo Compress tiene le
-        // più rilevanti (in testa all'ordine) e DICHIARA quante ne ha omesse — mai un
-        // taglio silenzioso.
+        // contesto pieno è grande. Con un budget piccolo, il passo Compress lo tronca
+        // dalla CODA (sezioni meno prioritarie) DICHIARANDO il taglio — mai silenzioso
+        // — ma PRESERVA le sezioni in cima (FILE RILEVANTI): è ciò che serve di più.
         let mut src = String::new();
         for i in 0..15 {
             src.push_str(&format!("def task_{i}():\n    pass\n\n"));
@@ -2439,13 +2407,19 @@ mod tests {
             ctx.len()
         );
         assert!(
-            ctx.contains("OMESSE"),
+            ctx.contains("troncato al budget"),
             "il taglio dev'essere DICHIARATO, non silenzioso:\n{ctx}"
+        );
+        // Il nucleo (FILE RILEVANTI) NON viene svuotato: la regressione che l'eval ha
+        // trovato era proprio questa (1 sola entità mostrata). Ora la cima è preservata.
+        assert!(
+            ctx.contains("FILE RILEVANTI"),
+            "FILE RILEVANTI (sezione prioritaria) dev'essere preservato:\n{ctx}"
         );
         let shown = ctx.matches("[Function]").count();
         assert!(
-            shown < 15,
-            "alcune entità devono essere state omesse: mostrate {shown}/15\n{ctx}"
+            (1..15).contains(&shown),
+            "alcune entità mostrate (non svuotate a 0/1) ma non tutte: {shown}/15\n{ctx}"
         );
     }
 
