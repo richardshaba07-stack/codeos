@@ -733,11 +733,25 @@ impl Guardian {
     /// l'impatto all'intero grafo (un falso positivo). Le entità sono deduplicate
     /// per id. Condiviso da `guard_before` e `get_context_pack`.
     async fn select_target_entities(&self, goal: &str) -> Vec<Entity> {
-        let keywords: Vec<String> = goal
+        // Specificità IDF-like (stesso principio del query engine): una keyword RARA
+        // (matcha poche entità) è un segnale forte; una comune è rumore. Peso ∝ 1/match.
+        const SPEC_SCALE: u64 = 1_000_000;
+        // Cap del pacchetto agent-facing: per un contesto destinato a un'AI la PRECISIONE
+        // batte il recall — meglio le 24 entità più specifiche che un elenco di omonimi.
+        const MAX_CONTEXT_ENTITIES: usize = 24;
+
+        let mut keywords: Vec<String> = goal
             .split(|c: char| !c.is_alphanumeric())
             .filter(|s| s.len() >= 3)
             .map(|s| s.to_lowercase())
             .collect();
+        // Il goal INTERO (normalizzato) come keyword aggiuntiva: un match sull'intera
+        // frase (es. `select_top`) è molto più MIRATO dei singoli frammenti (`select`,
+        // `top`) — quindi prende la specificità più alta e domina gli omonimi parziali.
+        let whole = goal.trim().to_lowercase();
+        if whole.len() >= 3 && !keywords.contains(&whole) {
+            keywords.push(whole);
+        }
 
         let total_entities = self
             .storage
@@ -746,8 +760,8 @@ impl Guardian {
             .map(|q| q.total_entities)
             .unwrap_or(0);
 
-        let mut target_entities = Vec::new();
-        let mut seen_entity_ids = HashSet::new();
+        let mut by_id: HashMap<EntityId, Entity> = HashMap::new();
+        let mut specificity: HashMap<EntityId, u64> = HashMap::new();
         for kw in &keywords {
             let Ok(ents) = self.storage.find_entities_by_name_pattern(kw).await else {
                 continue;
@@ -757,13 +771,29 @@ impl Guardian {
             if total_entities > 0 && (ents.len() as u64) * 2 > total_entities {
                 continue;
             }
+            if ents.is_empty() {
+                continue;
+            }
+            let weight = (SPEC_SCALE / ents.len() as u64).max(1);
             for ent in ents {
-                if seen_entity_ids.insert(ent.id) {
-                    target_entities.push(ent);
-                }
+                *specificity.entry(ent.id).or_insert(0) += weight;
+                by_id.entry(ent.id).or_insert(ent);
             }
         }
-        target_entities
+
+        // Ordina per specificità decrescente (a parità, nome — deterministico) e cappa:
+        // così il context pack è FOCALIZZATO sull'entità cercata, non annacquato dagli
+        // omonimi di una keyword comune (prima il goal "select_top" tirava dentro
+        // select_target_entities, split_top_level_commas, is_stopword…).
+        let mut ranked: Vec<Entity> = by_id.into_values().collect();
+        ranked.sort_by(|a, b| {
+            let sa = specificity.get(&a.id).copied().unwrap_or(0);
+            let sb = specificity.get(&b.id).copied().unwrap_or(0);
+            sb.cmp(&sa)
+                .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+        });
+        ranked.truncate(MAX_CONTEXT_ENTITIES);
+        ranked
     }
 
     pub async fn guard_before(
@@ -971,19 +1001,25 @@ impl Guardian {
         // «sicuro»: meglio dichiararlo «unknown» e dirlo a chiare lettere.
         let unlocalized = target_entities.is_empty();
 
-        let mut files_to_read: Vec<String> = target_entities
-            .iter()
-            .map(|e| e.location.file_path.clone())
-            .collect();
-        files_to_read.sort();
-        files_to_read.dedup();
+        // Preserva l'ORDINE di specificità (da `select_target_entities`): l'entità più
+        // mirata — e il suo file — vanno in CIMA, così l'AI legge per prima la cosa più
+        // rilevante. Dedup che CONSERVA l'ordine (un sort alfabetico distruggerebbe il
+        // ranking, riportando il rumore in testa).
+        let mut files_to_read: Vec<String> = Vec::new();
+        for e in &target_entities {
+            let f = e.location.file_path.clone();
+            if !files_to_read.contains(&f) {
+                files_to_read.push(f);
+            }
+        }
 
-        let mut relevant_entities: Vec<String> = target_entities
-            .iter()
-            .map(|e| e.qualified_name.clone())
-            .collect();
-        relevant_entities.sort();
-        relevant_entities.dedup();
+        let mut relevant_entities: Vec<String> = Vec::new();
+        for e in &target_entities {
+            let q = e.qualified_name.clone();
+            if !relevant_entities.contains(&q) {
+                relevant_entities.push(q);
+            }
+        }
 
         let mut key_dependencies = Vec::new();
         let selected_ids: HashSet<EntityId> = target_entities.iter().map(|e| e.id).collect();
