@@ -757,6 +757,7 @@ fn report_to_json(report: &proto::GetArchitectureReportResponse) -> serde_json::
             "calibrated": i.calibrated,
             "severity": i.severity,
             "origin": i.origin,
+            "staleness_secs": i.staleness_secs,
         })).collect::<Vec<_>>(),
         // Gli invarianti in formazione (stadio 1): niente confidence/severity — un
         // confine non ancora formato non si stima (trap #3); `needed` dice quanto manca.
@@ -959,18 +960,19 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &R
                     "strutturale / statico"
                 };
                 println!(
-                    "  • {} '{}' NON deve dipendere da '{}'\n    [Origine: {} | Supporto: {} archi | Confidenza: {}% | Calibrato: {}]",
-                    severity_badge(&inv.severity), inv.upstream, inv.downstream, origin_label(&inv.origin), inv.support, conf_pct, source
+                    "  • {} '{}' NON deve dipendere da '{}'\n    [Origine: {} | Supporto: {} archi | Confidenza: {}% | Calibrato: {}]{}",
+                    severity_badge(&inv.severity), inv.upstream, inv.downstream, origin_label(&inv.origin), inv.support, conf_pct, source, staleness_note(inv.staleness_secs)
                 );
             } else {
                 println!(
-                    "  {} '{}' NON deve dipendere da '{}'  [sup {} · conf {}% · {}]",
+                    "  {} '{}' NON deve dipendere da '{}'  [sup {} · conf {}% · {}]{}",
                     severity_badge(&inv.severity),
                     inv.upstream,
                     inv.downstream,
                     inv.support,
                     conf_pct,
-                    origin_label(&inv.origin)
+                    origin_label(&inv.origin),
+                    staleness_note(inv.staleness_secs)
                 );
             }
         }
@@ -1129,6 +1131,20 @@ fn origin_label(origin: &str) -> &'static str {
     }
 }
 
+/// Nota di rischio TEMPORALE per un invariante: vuota se manca il dato (niente storia
+/// git, o confine mai co-toccato) o se è stato esercitato di recente; altrimenti
+/// segnala da quanti giorni il confine non è esercitato. È il "confidente ma stantio"
+/// reso visibile — la dimensione temporale del rischio (Guardian 2.0).
+fn staleness_note(staleness_secs: Option<i64>) -> String {
+    const STALE_THRESHOLD_SECS: i64 = 180 * 24 * 60 * 60; // ~6 mesi
+    match staleness_secs {
+        Some(s) if s > STALE_THRESHOLD_SECS => {
+            format!(" · ⏳ stantio: ultimo esercizio {}g fa", s / (24 * 60 * 60))
+        }
+        _ => String::new(),
+    }
+}
+
 /// Ordine di priorità per l'ordinamento (più alto = mostrato prima).
 fn severity_rank(severity: &str) -> u8 {
     match severity {
@@ -1163,6 +1179,21 @@ mod tests {
                 "comando '{cmd}' gestito da main ma assente dall'help (usage_text)"
             );
         }
+    }
+
+    #[test]
+    fn staleness_note_appears_only_when_meaningfully_stale() {
+        use super::staleness_note;
+        // Nessun dato (niente storia git / mai co-toccato) ⇒ nota vuota.
+        assert_eq!(staleness_note(None), "");
+        // Esercitato di recente (sotto ~6 mesi) ⇒ vuota: niente rumore.
+        assert_eq!(staleness_note(Some(30 * 24 * 60 * 60)), "");
+        // Stantio (oltre ~6 mesi) ⇒ nota con l'età in giorni.
+        let note = staleness_note(Some(400 * 24 * 60 * 60));
+        assert!(
+            note.contains("stantio") && note.contains("400g"),
+            "atteso «stantio … 400g»: {note}"
+        );
     }
 
     /// `doctor` deve segnalare `CODEOS_REPO` solo quando è *impostata ma rotta*.

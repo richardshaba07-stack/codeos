@@ -202,6 +202,10 @@ message LayeringInvariant {
   // Provenienza della regola: "discovered" (dedotta dal grafo) | "declared"
   // (imposta a mano in .codeos/config.yaml).
   string origin = 7;
+  // Rischio TEMPORALE: secondi dall'ultimo esercizio del confine (ultima
+  // co-occorrenza dei due layer in un commit) rispetto a HEAD. Assente se non c'è
+  // storia git o il confine non si è mai co-toccato. Alto ⇒ "confidente ma stantio".
+  optional int64 staleness_secs = 8;
 }
 
 // Un invariante *in formazione*: la stessa asimmetria pura di un LayeringInvariant,

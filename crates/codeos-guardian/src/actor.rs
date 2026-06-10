@@ -206,10 +206,24 @@ impl GuardianActor {
         // Qualità del grafo (P2-7): quanto fidarsi del referto appena costruito.
         let quality = self.guardian.graph_quality().await?;
 
+        // Rischio temporale (Guardian 2.0): mappa (upstream, downstream) → staleness,
+        // così ogni invariante porta da quanto NON è esercitato. Vuota senza storia git.
+        let staleness_map: std::collections::HashMap<(String, String), i64> = self
+            .guardian
+            .invariant_staleness()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| ((s.upstream, s.downstream), s.staleness_secs))
+            .collect();
+
         let invariants = rules
             .into_iter()
             .map(|rule| {
                 let confidence = rule.confidence as f64;
+                let staleness_secs = staleness_map
+                    .get(&(rule.upstream.0.clone(), rule.downstream.0.clone()))
+                    .copied();
                 LayeringInvariantInfo {
                     upstream: rule.upstream.0,
                     downstream: rule.downstream.0,
@@ -218,6 +232,7 @@ impl GuardianActor {
                     calibrated,
                     severity: Severity::for_invariant(confidence),
                     origin: rule.origin,
+                    staleness_secs,
                 }
             })
             .collect();

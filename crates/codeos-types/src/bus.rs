@@ -514,6 +514,11 @@ pub struct LayeringInvariantInfo {
     pub severity: Severity,
     /// Se l'invariante è stato scoperto dai dati o dichiarato a mano nella config.
     pub origin: RuleOrigin,
+    /// Rischio TEMPORALE (Guardian 2.0): secondi dall'ULTIMO esercizio del confine
+    /// rispetto a HEAD. `None` senza storia git o se i layer non si sono mai
+    /// co-toccati. Alto ⇒ "confidente ma stantio" — Wilson resta intatto, il tempo
+    /// qualifica soltanto.
+    pub staleness_secs: Option<i64>,
 }
 
 /// Un invariante **in formazione** in forma piatta per il trasporto: la stessa
