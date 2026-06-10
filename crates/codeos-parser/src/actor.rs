@@ -170,8 +170,88 @@ impl ParserActor {
                 }
             }
         }
-        found
+        filter_generated(found, Path::new(root))
     }
+}
+
+/// Toglie dalla lista i file marcati `linguist-generated` nel `.gitattributes` della
+/// root: il fix PRECISO ai file generati a macchina (binding FFI, bundle), che
+/// inquinano il grafo e fanno stallare l'indicizzazione. È deterministico e a zero
+/// falsi positivi (a differenza di un'euristica sull'entropia): salta solo ciò che il
+/// repo stesso dichiara generato. Complementare al backstop per-dimensione
+/// (`MAX_FILE_BYTES`), che resta per i generati NON dichiarati. No-op senza
+/// `.gitattributes` o senza pattern generati.
+fn filter_generated(files: Vec<String>, root: &Path) -> Vec<String> {
+    let patterns = load_generated_patterns(root);
+    if patterns.is_empty() {
+        return files;
+    }
+    files
+        .into_iter()
+        .filter(|f| {
+            let rel = Path::new(f)
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| f.clone());
+            let generated = patterns.iter().any(|p| gitattr_matches(p, &rel));
+            if generated {
+                tracing::info!(file = %f, "saltato: marcato linguist-generated in .gitattributes");
+            }
+            !generated
+        })
+        .collect()
+}
+
+/// Estrae dal `.gitattributes` della root i pattern marcati `linguist-generated`
+/// (settato; non `-linguist-generated` né `=false`). Vuoto se il file non c'è.
+fn load_generated_patterns(root: &Path) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(root.join(".gitattributes")) else {
+        return Vec::new();
+    };
+    let mut patterns = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        let Some(pattern) = tokens.next() else {
+            continue;
+        };
+        let generated = tokens.any(|a| a == "linguist-generated" || a == "linguist-generated=true");
+        if generated {
+            patterns.push(pattern.to_string());
+        }
+    }
+    patterns
+}
+
+/// Match SEMPLIFICATO di un pattern stile `.gitattributes`/`.gitignore` contro un
+/// path relativo alla root. Copre i casi comuni dei file generati (`*.ext`, `dir/**`,
+/// `**/name`, `path/to/file`, basename nudo); pattern più esotici possono non
+/// combaciare e quei file ricadono sul backstop per-dimensione — onesto, non
+/// completo, e senza dipendenze nuove.
+fn gitattr_matches(pattern: &str, rel_path: &str) -> bool {
+    let pat = pattern.trim_start_matches('/');
+    // `*.ext` / `*suffisso` ⇒ suffisso, ovunque.
+    if let Some(suffix) = pat.strip_prefix('*') {
+        if !suffix.contains('*') && !suffix.contains('/') {
+            return rel_path.ends_with(suffix);
+        }
+    }
+    // `prefix/**` o `prefix/*` ⇒ tutto sotto prefix.
+    if let Some(prefix) = pat.strip_suffix("/**").or_else(|| pat.strip_suffix("/*")) {
+        return rel_path == prefix || rel_path.starts_with(&format!("{prefix}/"));
+    }
+    // `**/name` ⇒ basename o sottopath.
+    if let Some(tail) = pat.strip_prefix("**/") {
+        return rel_path == tail || rel_path.ends_with(&format!("/{tail}"));
+    }
+    // Senza `/`: combacia il basename ovunque. Altrimenti path esatto.
+    if !pat.contains('/') {
+        return rel_path.rsplit('/').next() == Some(pat);
+    }
+    rel_path == pat
 }
 
 /// Timbra il pacchetto di appartenenza (`package`) sui metadata di ogni entità del
@@ -308,6 +388,69 @@ mod tests {
 
         let _ = tokio::fs::remove_file(&big).await;
         let _ = tokio::fs::remove_file(&small).await;
+    }
+
+    #[test]
+    fn gitattr_matches_common_generated_patterns() {
+        assert!(gitattr_matches("*.gen.rs", "src/api.gen.rs"));
+        assert!(gitattr_matches("generated/**", "generated/x/y.rs"));
+        assert!(gitattr_matches("generated/**", "generated"));
+        assert!(gitattr_matches("**/mod.rs", "a/b/mod.rs"));
+        assert!(gitattr_matches("crates/foo/bar.rs", "crates/foo/bar.rs"));
+        assert!(gitattr_matches("bindings.rs", "deep/bindings.rs")); // basename nudo
+                                                                     // Non devono combaciare:
+        assert!(!gitattr_matches("*.gen.rs", "src/api.rs"));
+        assert!(!gitattr_matches("generated/**", "src/x.rs"));
+        assert!(!gitattr_matches("**/mod.rs", "a/lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn gitattributes_generated_files_are_skipped() {
+        // Il fix preciso: i file dichiarati `linguist-generated` nel `.gitattributes`
+        // vengono saltati a priori; i sorgenti normali restano.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codeos_gitattr_{stamp}"));
+        let sub = root.join("generated");
+        tokio::fs::create_dir_all(&sub).await.unwrap();
+        tokio::fs::write(
+            root.join(".gitattributes"),
+            "# generati\ngenerated/** linguist-generated\n*.gen.rs linguist-generated=true\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(sub.join("bindings.rs"), "pub fn x() {}\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("api.gen.rs"), "pub fn y() {}\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("main.rs"), "pub fn z() {}\n")
+            .await
+            .unwrap();
+
+        let actor = ParserActor::new(broadcast::channel(16).0);
+        let files = actor.collect_source_files(&root.to_string_lossy());
+        let names: Vec<String> = files
+            .iter()
+            .filter_map(|f| f.rsplit('/').next().map(String::from))
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n == "main.rs"),
+            "il sorgente normale resta: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "bindings.rs"),
+            "generated/** saltato: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "api.gen.rs"),
+            "*.gen.rs saltato: {names:?}"
+        );
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[tokio::test]
