@@ -758,6 +758,7 @@ fn report_to_json(report: &proto::GetArchitectureReportResponse) -> serde_json::
             "severity": i.severity,
             "origin": i.origin,
             "staleness_secs": i.staleness_secs,
+            "temporal_risk": temporal_risk(i.confidence, &i.severity, i.staleness_secs),
         })).collect::<Vec<_>>(),
         // Gli invarianti in formazione (stadio 1): niente confidence/severity — un
         // confine non ancora formato non si stima (trap #3); `needed` dice quanto manca.
@@ -953,6 +954,8 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &R
         };
         for inv in &invariants[..cap] {
             let conf_pct = (inv.confidence * 100.0).round();
+            let risk_pct =
+                (temporal_risk(inv.confidence, &inv.severity, inv.staleness_secs) * 100.0).round();
             if opts.verbose {
                 let source = if inv.calibrated {
                     "tempo / git log"
@@ -960,17 +963,18 @@ fn render_terminal_report(report: proto::GetArchitectureReportResponse, opts: &R
                     "strutturale / statico"
                 };
                 println!(
-                    "  • {} '{}' NON deve dipendere da '{}'\n    [Origine: {} | Supporto: {} archi | Confidenza: {}% | Calibrato: {}]{}",
-                    severity_badge(&inv.severity), inv.upstream, inv.downstream, origin_label(&inv.origin), inv.support, conf_pct, source, staleness_note(inv.staleness_secs)
+                    "  • {} '{}' NON deve dipendere da '{}'\n    [Origine: {} | Supporto: {} archi | Confidenza: {}% | Rischio temporale: {}% | Calibrato: {}]{}",
+                    severity_badge(&inv.severity), inv.upstream, inv.downstream, origin_label(&inv.origin), inv.support, conf_pct, risk_pct, source, staleness_note(inv.staleness_secs)
                 );
             } else {
                 println!(
-                    "  {} '{}' NON deve dipendere da '{}'  [sup {} · conf {}% · {}]{}",
+                    "  {} '{}' NON deve dipendere da '{}'  [sup {} · conf {}% · 🎯 risk {}% · {}]{}",
                     severity_badge(&inv.severity),
                     inv.upstream,
                     inv.downstream,
                     inv.support,
                     conf_pct,
+                    risk_pct,
                     origin_label(&inv.origin),
                     staleness_note(inv.staleness_secs)
                 );
@@ -1145,6 +1149,34 @@ fn staleness_note(staleness_secs: Option<i64>) -> String {
     }
 }
 
+/// **Rischio TEMPORALE** di un invariante (Guardian 2.0): un singolo numero in `[0,1]`
+/// che combina i fattori GIÀ calibrati — quanto è REALE il confine (confidenza
+/// Wilson), quanto è IMPORTANTE (severità) e quanto è ATTIVO (freschezza). NON
+/// sostituisce nulla (trap #2): è una DERIVATA mostrata accanto a confidenza/severità,
+/// non al posto loro. La freschezza è `1.0` se il confine è esercitato di recente O se
+/// manca il dato temporale (l'assenza di evidenza NON penalizza); decade in modo
+/// esponenziale (mezza-vita ~1 anno) quando è stantio.
+///
+/// Interpretazione onesta v1: alto ⇒ confine reale, importante e ATTIVO ⇒ massima
+/// attenzione toccandolo ORA. Un confine stantio pesa meno perché meno conteso di
+/// recente — NON perché sia sicuro violarlo: la confidenza resta alta e visibile a
+/// parte. È una scelta di modello v1, dichiarata, facile da rivedere.
+fn temporal_risk(confidence: f64, severity: &str, staleness_secs: Option<i64>) -> f64 {
+    let sev = match severity {
+        "high_risk" => 1.0,
+        "warning" => 0.6,
+        _ => 0.3, // info
+    };
+    let freshness = match staleness_secs {
+        Some(s) if s > 0 => {
+            const HALF_LIFE_SECS: f64 = 365.0 * 24.0 * 60.0 * 60.0;
+            0.5_f64.powf(s as f64 / HALF_LIFE_SECS)
+        }
+        _ => 1.0, // niente dato temporale o esercitato adesso ⇒ freschezza piena
+    };
+    (confidence * sev * freshness).clamp(0.0, 1.0)
+}
+
 /// Ordine di priorità per l'ordinamento (più alto = mostrato prima).
 fn severity_rank(severity: &str) -> u8 {
     match severity {
@@ -1179,6 +1211,27 @@ mod tests {
                 "comando '{cmd}' gestito da main ma assente dall'help (usage_text)"
             );
         }
+    }
+
+    #[test]
+    fn temporal_risk_combines_confidence_severity_and_freshness() {
+        use super::temporal_risk;
+        let yr = 365 * 24 * 60 * 60;
+        // Confine reale (conf 1.0), importante (high_risk) e FRESCO (nessuna staleness)
+        // ⇒ rischio massimo.
+        assert!((temporal_risk(1.0, "high_risk", None) - 1.0).abs() < 1e-9);
+        // La staleness fa decadere (mezza-vita ~1 anno): a 1 anno ≈ metà.
+        let fresh = temporal_risk(1.0, "high_risk", Some(0));
+        let one_year = temporal_risk(1.0, "high_risk", Some(yr));
+        assert!(
+            one_year < fresh,
+            "stantio ⇒ rischio più basso: {one_year} < {fresh}"
+        );
+        assert!((one_year - 0.5).abs() < 0.02, "a 1 anno ≈ 0.5: {one_year}");
+        // La severità pesa: a parità di tutto, 'info' < 'high_risk'.
+        assert!(temporal_risk(1.0, "info", None) < temporal_risk(1.0, "high_risk", None));
+        // Assenza di dato temporale NON penalizza (freschezza piena, trap #2).
+        assert!((temporal_risk(0.8, "warning", None) - 0.8 * 0.6).abs() < 1e-9);
     }
 
     #[test]
