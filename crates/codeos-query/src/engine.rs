@@ -306,6 +306,17 @@ impl QueryEngine {
             }
         }
 
+        // I SEMI sono il match ESATTO sul nome cercato: il segnale di rilevanza più
+        // forte che abbiamo. Senza un bonus condividerebbero il punteggio (1) coi nodi
+        // di sola espansione e `select_top` li ordinerebbe per nome ALFABETICO —
+        // seppellendo l'entità cercata sotto hub a nome «basso» (Entity, GraphStorage)
+        // e facendola tagliare dal limite. La Fase 0 (eval/localization.sh) ha misurato
+        // questo: query col nome esatto di una funzione NON ne mostravano il file.
+        // Garantiamo che ogni seme superi qualunque nodo di pura espansione.
+        for seed in seeds {
+            *scores.entry(seed.id).or_insert(0) += SEED_BONUS;
+        }
+
         Ok(Expansion {
             entities,
             scores,
@@ -1318,6 +1329,11 @@ fn last_segment(name: &str) -> &str {
         .unwrap_or(name)
 }
 
+/// Bonus additivo dato a ogni SEME (match esatto del nome sulla query). Deve essere
+/// più grande di qualunque punteggio di espansione plausibile (≈ numero di semi), così
+/// l'entità cercata è SEMPRE in cima a FILE RILEVANTI, mai tagliata dal limite.
+const SEED_BONUS: u32 = 1_000_000;
+
 /// Ordina per punteggio decrescente (a parità, per nome) e taglia a `limit`.
 fn select_top(
     entities: HashMap<EntityId, Entity>,
@@ -2178,6 +2194,48 @@ mod tests {
         assert!(!response
             .formatted_context
             .contains("DECISIONI ARCHITETTURALI"));
+    }
+
+    #[tokio::test]
+    async fn seed_outranks_alphabetically_earlier_expansion_nodes() {
+        // Regressione della Fase 0 (eval/localization.sh): il SEME (match esatto del
+        // nome cercato) deve restare in FILE RILEVANTI anche quando chiama nodi dal nome
+        // alfabeticamente ANTERIORE. Senza `SEED_BONUS` tutti avrebbero punteggio 1 e
+        // `select_top` ordinerebbe per nome — sfrattando l'entità cercata col limite.
+        let storage = graph_from(
+            "app.py",
+            "def aardvark():\n    pass\n\n\
+             def beacon():\n    pass\n\n\
+             def apexseedtarget():\n    aardvark()\n    beacon()\n",
+        )
+        .await;
+        // Limite stretto: senza il bonus, aardvark/beacon (nome più «basso») vincono
+        // e il seme viene tagliato. Col bonus, il seme è SEMPRE in cima.
+        let config = QueryConfig {
+            max_entities: 2,
+            ..QueryConfig::default()
+        };
+        let engine = QueryEngine::with_config(storage, config);
+
+        let response = engine.query(&nl("apexseedtarget")).await.unwrap();
+
+        assert!(
+            response
+                .entities
+                .iter()
+                .any(|e| e.qualified_name.contains("apexseedtarget")),
+            "il seme cercato dev'essere selezionato nonostante il limite: {:?}",
+            response
+                .entities
+                .iter()
+                .map(|e| &e.qualified_name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            response.formatted_context.contains("apexseedtarget"),
+            "il seme dev'essere in FILE RILEVANTI:\n{}",
+            response.formatted_context
+        );
     }
 
     #[tokio::test]
