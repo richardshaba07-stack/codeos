@@ -25,6 +25,25 @@ fn resolve_repo_root() -> PathBuf {
     repo_root_from(std::env::var("CODEOS_REPO").ok(), &cwd)
 }
 
+/// Tetto di elementi per lista nella risposta di `guard --after`. Nel collaudo
+/// DeepSpeed la risposta era 6,5 MB (dump di ~72k relazioni candidate) e sforava il
+/// limite gRPC di 4 MB → `OutOfRange`, comando fallito. Tronchiamo le liste lunghe
+/// con un conteggio del residuo — mai in silenzio, l'onestà del passo Compress.
+const MAX_GUARD_ITEMS: usize = 3000;
+
+/// Tronca `items` a `max` aggiungendo una riga di nota col residuo (mai nascosto),
+/// per non sforare il limite di trasporto gRPC di 4 MB.
+fn truncate_with_note(mut items: Vec<String>, max: usize, what: &str) -> Vec<String> {
+    let extra = items.len().saturating_sub(max);
+    if extra > 0 {
+        items.truncate(max);
+        items.push(format!(
+            "(+{extra} {what} non mostrati: troncati per il limite di trasporto gRPC di 4 MB)"
+        ));
+    }
+    items
+}
+
 /// Versione PURA (testabile senza toccare l'ambiente) di [`resolve_repo_root`].
 fn repo_root_from(env_repo: Option<String>, cwd: &Path) -> PathBuf {
     if let Some(repo) = env_repo {
@@ -792,7 +811,7 @@ impl Guardian {
             }
         }
 
-        let violations = self.check(&candidate_relations).await.unwrap_or_default();
+        let mut violations = self.check(&candidate_relations).await.unwrap_or_default();
 
         let mut new_relations = Vec::new();
         for rel in &candidate_relations {
@@ -818,6 +837,20 @@ impl Guardian {
                 proposed_fixes.push(format!("Riferimento illegale. Dettaglio: {}", vio.message));
             }
         }
+
+        // Troncamento onesto per non sforare il limite gRPC di 4 MB (collaudo
+        // DeepSpeed: 6,5 MB). Le violazioni (il segnale) e i fix in parallelo; il dump
+        // informativo delle relazioni candidate separatamente. Il residuo è sempre
+        // CONTATO, mai nascosto.
+        let vio_extra = violations.len().saturating_sub(MAX_GUARD_ITEMS);
+        violations.truncate(MAX_GUARD_ITEMS);
+        proposed_fixes.truncate(MAX_GUARD_ITEMS);
+        if vio_extra > 0 {
+            proposed_fixes.push(format!(
+                "(+{vio_extra} violazioni non mostrate: troncate per il limite di trasporto gRPC di 4 MB)"
+            ));
+        }
+        let new_relations = truncate_with_note(new_relations, MAX_GUARD_ITEMS, "relazioni");
 
         Ok(codeos_types::bus::GuardAfterResponse {
             new_relations,
@@ -1650,6 +1683,22 @@ mod tests {
             "CODEOS_REPO whitespace ignorato, risale al root"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn truncate_with_note_caps_long_lists_and_counts_the_rest() {
+        // Sotto il tetto: invariato (nessuna nota).
+        let short: Vec<String> = (0..3).map(|i| i.to_string()).collect();
+        assert_eq!(truncate_with_note(short.clone(), 5, "relazioni"), short);
+        // Sopra il tetto: troncato a `max` + 1 riga di nota col residuo.
+        let long: Vec<String> = (0..10).map(|i| i.to_string()).collect();
+        let capped = truncate_with_note(long, 4, "relazioni");
+        assert_eq!(capped.len(), 5, "4 elementi + 1 nota");
+        assert!(
+            capped[4].contains("+6") && capped[4].contains("4 MB"),
+            "la nota conta il residuo (10-4=6) e cita il limite: {:?}",
+            capped[4]
+        );
     }
 
     fn entity(qname: &str) -> Entity {
