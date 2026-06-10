@@ -251,9 +251,80 @@ impl CommitHistory for InMemoryHistory {
     }
 }
 
+/// Avvolge una [`CommitHistory`] cache-ando il risultato di `commits()` finché HEAD
+/// non si muove. Una sola `report`/`why` interroga la storia MOLTE volte (occasioni,
+/// fossili, staleness, calibrazione…): senza cache è un `git log` completo ogni volta.
+/// Qui il `git log` pieno avviene solo quando HEAD cambia; altrimenti basta un cheap
+/// `git log -1` di controllo ([`head_commit`]). Corretto: un nuovo commit sposta HEAD
+/// e invalida la cache, quindi non serve mai una storia stantia.
+pub struct CachedHistory {
+    inner: std::sync::Arc<dyn CommitHistory>,
+    repo_root: PathBuf,
+    cache: std::sync::Mutex<Option<(String, Vec<Commit>)>>,
+}
+
+impl CachedHistory {
+    pub fn new(inner: std::sync::Arc<dyn CommitHistory>, repo_root: impl Into<PathBuf>) -> Self {
+        Self {
+            inner,
+            repo_root: repo_root.into(),
+            cache: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl CommitHistory for CachedHistory {
+    fn commits(&self) -> anyhow::Result<Vec<Commit>> {
+        // HEAD a basso costo: se non è cambiato, la storia è la stessa. `None` (dir
+        // non-git) ⇒ chiave stabile "" ⇒ si cache-a comunque entro la sessione.
+        let head = head_commit(&self.repo_root)
+            .map(|c| c.hash)
+            .unwrap_or_default();
+        if let Ok(guard) = self.cache.lock() {
+            if let Some((cached_head, commits)) = guard.as_ref() {
+                if *cached_head == head {
+                    return Ok(commits.clone());
+                }
+            }
+        }
+        let commits = self.inner.commits()?;
+        if let Ok(mut guard) = self.cache.lock() {
+            *guard = Some((head, commits.clone()));
+        }
+        Ok(commits)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_history_calls_inner_once_while_head_is_stable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Counting(Arc<AtomicUsize>);
+        impl CommitHistory for Counting {
+            fn commits(&self) -> anyhow::Result<Vec<Commit>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![Commit::new(["a.rs"])])
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Root non-git ⇒ `head_commit` None ⇒ HEAD stabile ("") ⇒ la cache regge:
+        // l'inner (costoso) è invocato UNA sola volta per più `commits()`.
+        let cached = CachedHistory::new(Arc::new(Counting(calls.clone())), "/non/esiste/repo");
+        assert_eq!(cached.commits().unwrap().len(), 1);
+        let _ = cached.commits().unwrap();
+        let _ = cached.commits().unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "l'inner va chiamato una sola volta finché HEAD non cambia"
+        );
+    }
 
     #[test]
     fn parses_commits_and_their_files() {

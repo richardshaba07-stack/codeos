@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codeos_memory::DecisionStore;
-use codeos_paleo::GitLog;
+use codeos_paleo::{CachedHistory, GitLog};
 use codeos_storage::GraphStorage;
 use codeos_types::bus::{
     ArchitecturalGapInfo, ArchitectureReport, CodeOsEvent, Command, DecisionFossilInfo,
@@ -73,7 +73,12 @@ impl GuardianActor {
         }
         Self {
             guardian: Guardian::with_memory(storage, decisions)
-                .with_commit_history(Arc::new(GitLog::new(repo_root)))
+                // Cache della storia git invalidata su HEAD: una `report` interroga
+                // i commit molte volte, senza cache è un `git log` completo ogni volta.
+                .with_commit_history(Arc::new(CachedHistory::new(
+                    Arc::new(GitLog::new(repo_root.clone())),
+                    repo_root,
+                )))
                 .with_declared_rules(declared),
             events,
         }
