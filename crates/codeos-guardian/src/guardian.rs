@@ -82,6 +82,63 @@ fn repo_root_from(env_repo: Option<String>, cwd: &Path) -> PathBuf {
     }
 }
 
+/// Righe AGGIUNTE (lato `head`) di un file, dal diff unificato a contesto 0.
+/// `git diff -U0 base..head -- file` → parsing degli header di hunk `@@ -a,b +c,d @@`:
+/// il lato `+c,d` dà l'intervallo `[c, c+d-1]` di righe nuove a `head`. Serve a `pr_mri`
+/// per distinguere il codice che il PR ha davvero AGGIUNTO/cambiato dal resto del file.
+/// `None` se git non è eseguibile o il diff fallisce → il chiamante fa fallback onesto
+/// a tutte le entità del file (meglio sovra-riportare che dichiarare 0 a torto).
+fn added_line_ranges(
+    repo_dir: &Path,
+    base: &str,
+    head: &str,
+    rel_file: &str,
+) -> Option<Vec<(u32, u32)>> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("diff")
+        .arg("-U0")
+        .arg(format!("{base}..{head}"))
+        .arg("--")
+        .arg(rel_file)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_added_ranges(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Parsing PURO degli header di hunk di un diff unificato → intervalli `[start, end]`
+/// delle righe aggiunte sul lato `+`. Testabile senza git.
+fn parse_added_ranges(diff_text: &str) -> Vec<(u32, u32)> {
+    let mut ranges = Vec::new();
+    for line in diff_text.lines() {
+        // Header di hunk: "@@ -a,b +c,d @@ …". Estrae il lato "+c,d" (`d` assente ⇒ 1).
+        let Some(after) = line.strip_prefix("@@ ") else {
+            continue;
+        };
+        let Some(plus) = after.split('+').nth(1) else {
+            continue;
+        };
+        let spec = plus.split([' ', '@']).next().unwrap_or("");
+        let mut parts = spec.split(',');
+        let Some(start) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let count = parts
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
+        if count == 0 {
+            continue; // hunk di pura cancellazione: 0 righe aggiunte a `head`
+        }
+        ranges.push((start, start + count - 1));
+    }
+    ranges
+}
+
 use codeos_memory::{Decision, DecisionKind, DecisionStore, Evidence, Proposal};
 use codeos_paleo::{
     excavate, occasion_window, occasions, Abstention, CommitHistory, DecisionFossil, Z_95,
@@ -1257,22 +1314,60 @@ impl Guardian {
             );
         }
 
+        // Teniamo sia il path RELATIVO (per il diff riga-a-riga) sia l'ASSOLUTO (con cui
+        // il grafo indicizza i file). `files` (assoluti) resta per gli hotspot storici.
+        let mut file_pairs: Vec<(String, String)> = Vec::new();
         let mut files = Vec::new();
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
-            if !line.trim().is_empty() {
-                if let Ok(abs_path) = repo_dir.join(line).canonicalize() {
-                    files.push(abs_path.to_string_lossy().to_string());
-                } else {
-                    files.push(repo_dir.join(line).to_string_lossy().to_string());
-                }
+            let rel = line.trim();
+            if rel.is_empty() {
+                continue;
             }
+            let abs = match repo_dir.join(rel).canonicalize() {
+                Ok(p) => p.to_string_lossy().to_string(),
+                Err(_) => repo_dir.join(rel).to_string_lossy().to_string(),
+            };
+            files.push(abs.clone());
+            file_pairs.push((rel.to_string(), abs));
         }
 
+        // Entità TOCCATE dal PR: quelle il cui span di righe interseca le righe AGGIUNTE
+        // a `head` (mappa diff→nodi AST). Senza questo filtro `pr_mri` elencava OGNI
+        // dipendenza dei file toccati come "nuova" — incluse le PREESISTENTI (falso
+        // positivo segnalato dai test reali: «mri sovra-riporta il delta»). Se il diff
+        // per-file non è interpretabile (rename, git assente), fallback ONESTO: tutte le
+        // entità del file (meglio sovra-riportare che mentire dichiarando 0 a torto).
         let mut target_entities = Vec::new();
-        for file in &files {
-            if let Ok(entities) = self.storage.get_entities_by_file(file).await {
-                target_entities.extend(entities);
+        for (rel, abs) in &file_pairs {
+            let Ok(entities) = self.storage.get_entities_by_file(abs).await else {
+                continue;
+            };
+            let ranges = added_line_ranges(&repo_dir, base, head, rel);
+            for e in entities {
+                // Le entità a span d'intero-file (Module/Project) NON sono localizzabili
+                // sul diff: il loro span copre QUALSIASI riga aggiunta, e le loro
+                // "dipendenze" sono gli import di modulo in blocco — preesistenti e nuovi
+                // indistinguibili senza la riga del singolo import (che il grafo non
+                // memorizza: `Relation` non ha location). Includerle significava
+                // dichiarare "nuovi" import VECCHI: esattamente il falso positivo dei
+                // test reali. Le saltiamo e leggiamo il delta dalle UNITÀ toccate
+                // (funzioni/metodi/tipi); una dipendenza di modulo che conta davvero
+                // riemerge attraverso la funzione che la USA.
+                if matches!(e.kind, EntityKind::Module | EntityKind::Project) {
+                    continue;
+                }
+                match &ranges {
+                    Some(rs) => {
+                        let (s, t) = (e.location.start_line, e.location.end_line);
+                        if rs.iter().any(|&(a, b)| s <= b && t >= a) {
+                            target_entities.push(e);
+                        }
+                    }
+                    // Diff non interpretabile (rename, git assente): fallback onesto a
+                    // tutte le unità del file (meglio sovra-riportare che mentire con 0).
+                    None => target_entities.push(e),
+                }
             }
         }
 
@@ -1302,6 +1397,8 @@ impl Guardian {
                 ));
             }
         }
+        new_dependencies.sort();
+        new_dependencies.dedup();
 
         let mut violated_boundaries = Vec::new();
         let violations = self.check(&relations).await.unwrap_or_default();
@@ -1372,7 +1469,7 @@ impl Guardian {
         };
 
         let summary = format!(
-            "PR MRI Scansionato tra {} e {}. Rilevate {} nuove dipendenze, {} violazioni architetturali.",
+            "PR MRI scansionato tra {} e {}. {} dipendenze dal codice modificato, {} violazioni architetturali.",
             base, head, new_dependencies.len(), violated_boundaries.len()
         );
 
@@ -1827,6 +1924,30 @@ mod tests {
 
     use codeos_storage::SqliteStorage;
     use codeos_types::{Entity, EntityKind, GraphDelta, RelationKind, SourceLocation};
+
+    #[test]
+    fn parse_added_ranges_extracts_the_plus_side_of_hunks() {
+        // Diff con due hunk: una riga aggiunta a 10, e 3 righe (12..14) a fronte di una
+        // cancellazione (-5,2). `pr_mri` usa SOLO il lato `+` per sapere cosa il PR ha
+        // aggiunto a `head` — così non scambia le dipendenze preesistenti per "nuove".
+        let diff = "diff --git a/f.rs b/f.rs\n\
+                    --- a/f.rs\n\
+                    +++ b/f.rs\n\
+                    @@ -9,0 +10 @@ fn x() {\n\
+                    +    let new = dep();\n\
+                    @@ -5,2 +12,3 @@ impl T {\n\
+                    +    a();\n+    b();\n+    c();\n";
+        let ranges = parse_added_ranges(diff);
+        assert_eq!(ranges, vec![(10, 10), (12, 14)], "ranges = {ranges:?}");
+    }
+
+    #[test]
+    fn parse_added_ranges_ignores_pure_deletions() {
+        // Hunk di pura cancellazione (+N,0): 0 righe aggiunte ⇒ nessun intervallo, quindi
+        // nessuna entità "toccata" da attribuire al PR per quel punto.
+        let diff = "@@ -10,3 +9,0 @@\n-    gone_a();\n-    gone_b();\n-    gone_c();\n";
+        assert!(parse_added_ranges(diff).is_empty());
+    }
 
     #[test]
     fn repo_root_prefers_codeos_repo_then_walks_up_to_git() {

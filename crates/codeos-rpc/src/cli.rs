@@ -255,7 +255,7 @@ async fn main() -> anyhow::Result<()> {
             println!("📋 Sintesi: {}", res.summary);
             println!("📈 Variazione Blast Radius: {}", res.blast_radius_change);
             println!("⚠️  Livello di rischio: {}", res.risk_score.to_uppercase());
-            println!("\n🔍 Nuove dipendenze introdotte:");
+            println!("\n🔍 Dipendenze dal codice modificato (unità toccate dal diff):");
             for dep in &res.new_dependencies {
                 println!("  • {}", dep);
             }
