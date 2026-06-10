@@ -12,7 +12,37 @@
 //! trait di persistenza non cambia.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Risolve la root del repository git in modo INDIPENDENTE dalla working dir del
+/// client/server: prima `CODEOS_REPO` (la sorgente di verità con cui il server è
+/// configurato), poi la risalita dell'albero fino a una directory con `.git`,
+/// infine la CWD come ultima spiaggia. Risolve il limite operativo per cui `mri`
+/// falliva se il server non girava ESATTAMENTE nella root del repo (collaudo).
+fn resolve_repo_root() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    repo_root_from(std::env::var("CODEOS_REPO").ok(), &cwd)
+}
+
+/// Versione PURA (testabile senza toccare l'ambiente) di [`resolve_repo_root`].
+fn repo_root_from(env_repo: Option<String>, cwd: &Path) -> PathBuf {
+    if let Some(repo) = env_repo {
+        if !repo.trim().is_empty() {
+            return PathBuf::from(repo);
+        }
+    }
+    let mut dir = cwd;
+    loop {
+        if dir.join(".git").exists() {
+            return dir.to_path_buf();
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return cwd.to_path_buf(),
+        }
+    }
+}
 
 use codeos_memory::{Decision, DecisionKind, DecisionStore, Evidence, Proposal};
 use codeos_paleo::{excavate, occasions, Abstention, CommitHistory, DecisionFossil, Z_95};
@@ -1002,11 +1032,10 @@ impl Guardian {
         base: &str,
         head: &str,
     ) -> anyhow::Result<codeos_types::bus::PrMriResponse> {
-        let repo_dir = std::env::current_dir().map_err(|e| {
-            anyhow::anyhow!(
-                "PrMri: working dir del server illeggibile (serve come root del repo git): {e}"
-            )
-        })?;
+        // Root del repo risolta in modo indipendente dalla CWD (CODEOS_REPO →
+        // risalita a `.git` → CWD): `mri` non richiede più che il server giri
+        // esattamente nella root del repo git.
+        let repo_dir = resolve_repo_root();
         let mut cmd = std::process::Command::new("git");
         cmd.arg("-C")
             .arg(&repo_dir)
@@ -1593,6 +1622,35 @@ mod tests {
 
     use codeos_storage::SqliteStorage;
     use codeos_types::{Entity, EntityKind, GraphDelta, RelationKind, SourceLocation};
+
+    #[test]
+    fn repo_root_prefers_codeos_repo_then_walks_up_to_git() {
+        // 1. CODEOS_REPO ha priorità ed è INDIPENDENTE dalla CWD (il bug di `mri`).
+        assert_eq!(
+            repo_root_from(Some("/srv/myrepo".to_string()), Path::new("/tmp/altrove")),
+            PathBuf::from("/srv/myrepo")
+        );
+        // 2/3. Senza env (o whitespace), risale dall'albero fino alla dir con `.git`.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codeos_reporoot_{stamp}"));
+        let nested = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        assert_eq!(
+            repo_root_from(None, &nested),
+            root,
+            "senza env, risale fino al .git"
+        );
+        assert_eq!(
+            repo_root_from(Some("   ".to_string()), &nested),
+            root,
+            "CODEOS_REPO whitespace ignorato, risale al root"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn entity(qname: &str) -> Entity {
         Entity {
