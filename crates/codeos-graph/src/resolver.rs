@@ -53,6 +53,13 @@ impl GraphResolver {
         // collegare chiamate fra entità appena create, ancora assenti dal DB.
         let mut new_by_qname: HashMap<String, EntityId> = HashMap::new();
         let mut new_by_name: HashMap<String, Vec<(EntityId, String)>> = HashMap::new();
+        // Indice per FOGLIA del qualified_name (ultimo segmento `::`): serve a
+        // `unique_internal_match` per cercare i `…::Tipo::metodo` candidati in O(omonimi)
+        // invece di scandire TUTTO il batch per ogni riferimento. Senza, la risoluzione
+        // è quadratica (riferimenti × entità) e sui repo di binding generati
+        // (windows-rs: ~320k entità da liste piatte FFI) il resolve non termina in tempo
+        // pratico — misurato col profiler: 99% dei campioni nella scansione lineare.
+        let mut new_by_leaf: HashMap<String, Vec<(EntityId, String)>> = HashMap::new();
         let mut new_by_id_lang: HashMap<EntityId, String> = HashMap::new();
         // Mappa id→kind del batch: nel Passo 3 il guard anti-membro (Fix #10)
         // distingue Method da Function senza una query (vedi `resolve_target`).
@@ -140,6 +147,11 @@ impl GraphResolver {
                 new_id_to_qname.insert(id, qname.clone());
                 new_by_name
                     .entry(parsed.name.clone())
+                    .or_default()
+                    .push((id, qname.clone()));
+                let leaf = qname.rsplit("::").next().unwrap_or(&qname).to_string();
+                new_by_leaf
+                    .entry(leaf)
                     .or_default()
                     .push((id, qname.clone()));
                 new_by_id_lang.insert(id, lang);
@@ -273,6 +285,7 @@ impl GraphResolver {
                 namespace: &ctx.namespace,
                 new_by_qname: &new_by_qname,
                 new_by_name: &new_by_name,
+                new_by_leaf: &new_by_leaf,
                 new_by_id_lang: &new_by_id_lang,
                 new_by_id_kind: &new_by_id_kind,
                 storage,
@@ -809,6 +822,9 @@ struct ResolutionContext<'a> {
     namespace: &'a HashMap<String, String>,
     new_by_qname: &'a HashMap<String, EntityId>,
     new_by_name: &'a HashMap<String, Vec<(EntityId, String)>>,
+    /// Indice per foglia del qualname (ultimo segmento): la via O(omonimi) di
+    /// `unique_internal_match` (anti morte-per-volume sui binding generati).
+    new_by_leaf: &'a HashMap<String, Vec<(EntityId, String)>>,
     new_by_id_lang: &'a HashMap<EntityId, String>,
     new_by_id_kind: &'a HashMap<EntityId, codeos_types::EntityKind>,
     storage: &'a dyn GraphStorage,
@@ -1014,12 +1030,21 @@ async fn unique_internal_match(
     let suffix = format!("::{tail}");
     let mut hits: HashSet<EntityId> = HashSet::new();
 
-    // Batch corrente: entità appena create, non ancora nel DB.
-    for (qname, id) in ctx.new_by_qname.iter() {
-        if qname.starts_with(crate_prefix) && qname.ends_with(&suffix) {
-            if let Some(t_lang) = ctx.new_by_id_lang.get(id) {
-                if language_matches(ctx.language, t_lang) {
-                    hits.insert(*id);
+    // Batch corrente: entità appena create, non ancora nel DB. Lookup per FOGLIA
+    // (ultimo segmento di `tail`) invece di scandire tutto `new_by_qname`: un qname
+    // che termina con `::{tail}` ha per forza la stessa foglia di `tail`, quindi i
+    // candidati stanno tutti in QUESTO bucket — stesso insieme di match, O(omonimi)
+    // invece di O(batch). La scansione lineare era quadratica sull'intero indice
+    // (riferimenti × entità) e su windows-rs (~320k entità di binding FFI) il
+    // resolve non terminava: 99% dei campioni del profiler stavano qui.
+    let leaf = tail.rsplit("::").next().unwrap_or(tail);
+    if let Some(candidates) = ctx.new_by_leaf.get(leaf) {
+        for (id, qname) in candidates {
+            if qname.starts_with(crate_prefix) && qname.ends_with(&suffix) {
+                if let Some(t_lang) = ctx.new_by_id_lang.get(id) {
+                    if language_matches(ctx.language, t_lang) {
+                        hits.insert(*id);
+                    }
                 }
             }
         }
