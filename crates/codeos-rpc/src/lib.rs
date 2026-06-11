@@ -541,6 +541,7 @@ impl CodeOs for CodeOsService {
             suggested_tests: res.suggested_tests,
             estimated_risk: res.estimated_risk,
             formatted_markdown: res.formatted_markdown,
+            decisions: res.decisions,
         }))
     }
 

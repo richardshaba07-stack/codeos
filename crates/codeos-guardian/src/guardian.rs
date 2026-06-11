@@ -162,6 +162,10 @@ const RULE_TAG_PREFIX: &str = "layering-invariant:";
 /// abbastanza per leggere l'evoluzione, non un `git log` intero.
 const MAX_STORY_COMMITS: usize = 5;
 
+/// Quante decisioni al massimo nel context pack per l'agente: un riassunto, non il
+/// ledger (che resta consultabile per intero con `why`). Le UMANE hanno priorità.
+const MAX_PACK_DECISIONS: usize = 4;
+
 /// Una voce del "registro" degli invarianti attualmente in vigore, **derivata dal
 /// ledger** (le decisioni correnti), non da un tag di stato scritto a mano.
 struct ActiveInvariant {
@@ -1155,6 +1159,47 @@ impl Guardian {
             target_layers.insert(layer.0);
         }
 
+        // Il *perché* per l'agente: le decisioni del ledger agganciate al goal — per
+        // ID (invarianti auto-promossi) o per tag=SEGMENTO `::` esatto del qualname
+        // (le decisioni UMANE registrate con `decide`, taggate coi nomi). Stesso
+        // matching anti-flood del Query Engine; UMANE prime (il non-derivabile), cap
+        // stretto: il pack è un riassunto, il ledger completo resta su `why`. Senza
+        // questo blocco il pack non portava MAI l'intento: l'agente vedeva la
+        // struttura ma non il perché — proprio lo strato che distingue CodeOS.
+        let mut pack_decisions: Vec<String> = Vec::new();
+        if let Some(store) = &self.decisions {
+            let target_ids: HashSet<EntityId> = target_entities.iter().map(|e| e.id).collect();
+            if let Ok(mut current) = store.current_decisions().await {
+                current.retain(|d| {
+                    d.related_entity_ids
+                        .iter()
+                        .any(|id| target_ids.contains(id))
+                        || d.tags.iter().any(|t| {
+                            !t.is_empty()
+                                && target_entities
+                                    .iter()
+                                    .any(|e| e.qualified_name.split("::").any(|seg| seg == t))
+                        })
+                });
+                current.sort_by_key(|d| match d.kind {
+                    DecisionKind::Decision => 0,
+                    _ => 1,
+                });
+                current.truncate(MAX_PACK_DECISIONS);
+                pack_decisions = current
+                    .iter()
+                    .map(|d| {
+                        let rationale = d.rationale.trim();
+                        if rationale.is_empty() {
+                            format!("{} (autore: {})", d.title, d.author)
+                        } else {
+                            format!("{}: {} (autore: {})", d.title, rationale, d.author)
+                        }
+                    })
+                    .collect();
+            }
+        }
+
         let mut boundaries_to_preserve = Vec::new();
         for rule in &rules {
             if target_layers.contains(&rule.upstream.0)
@@ -1255,6 +1300,11 @@ impl Guardian {
                 );
             }
             m.push_str(&format!("GOAL_INTERP: {goal_interpretation}\n"));
+            // Il perché PRIMA della struttura (come nel contesto di `query`): è il
+            // contenuto non-derivabile, e un agente lo deve leggere per primo.
+            if !pack_decisions.is_empty() {
+                m.push_str(&format!("WHY: {}\n", pack_decisions.join(" | ")));
+            }
             m.push_str(&format!("FILES: {}\n", files_to_read.join(", ")));
             m.push_str(&format!("ENTITIES: {}\n", relevant_entities.join(", ")));
             m.push_str(&format!("DEPS: {}\n", key_dependencies.join("; ")));
@@ -1281,6 +1331,16 @@ impl Guardian {
             }
             markdown.push_str("## 1. Interpretazione del Goal\n");
             markdown.push_str(&format!("{}\n\n", goal_interpretation));
+            // Il perché in alto, come nel contesto di `query`: il non-derivabile
+            // non si seppellisce in coda. Sezione assente se il ledger non ha nulla
+            // di rilevante (niente rumore).
+            if !pack_decisions.is_empty() {
+                markdown.push_str("## Perché è fatto così (decisioni dal ledger)\n");
+                for d in &pack_decisions {
+                    markdown.push_str(&format!("- {}\n", d));
+                }
+                markdown.push('\n');
+            }
             markdown.push_str("## 2. File da Leggere / Modificare\n");
             for f in &files_to_read {
                 markdown.push_str(&format!("- {}\n", f));
@@ -1318,6 +1378,7 @@ impl Guardian {
             suggested_tests,
             estimated_risk,
             formatted_markdown: markdown,
+            decisions: pack_decisions,
         })
     }
 
@@ -2870,6 +2931,81 @@ mod tests {
         assert!(
             !ai.formatted_markdown.contains("## 1."),
             "il formato AI non ha intestazioni Markdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_pack_carries_the_human_why_from_the_ledger() {
+        use codeos_memory::{Decision, DecisionKind, DecisionStore, InMemoryDecisionStore};
+        use codeos_types::bus::NewDecision;
+
+        // Il giro del moat sull'ULTIMA superficie agent-facing: una decisione UMANA
+        // registrata con `decide --tags <modulo>` deve comparire nel context pack
+        // (riga WHY nel formato ai, sezione «Perché» nel Markdown) quando il goal
+        // tocca quel modulo — e NON comparire su un goal estraneo (niente rumore).
+        let (storage, _api, _core) = seeded_two_layer_graph().await;
+        let store = Arc::new(InMemoryDecisionStore::new());
+        store
+            .record(&Decision::from_new(
+                NewDecision {
+                    author: "human:Richard".into(),
+                    title: "api non chiama il database direttamente".into(),
+                    context: String::new(),
+                    rationale: "tutto passa dal layer core".into(),
+                    related_entity_ids: vec![],
+                    related_decision_ids: vec![],
+                    supersedes: vec![],
+                    deprecates: vec![],
+                    tags: vec!["api".into()],
+                },
+                DecisionKind::Decision,
+            ))
+            .await
+            .unwrap();
+        let guardian = Guardian::with_memory(storage, store);
+
+        // Goal che tocca il modulo taggato: il perché entra, in ENTRAMBI i formati.
+        let ai = guardian
+            .get_context_pack("handler api", true)
+            .await
+            .unwrap();
+        assert!(
+            ai.decisions
+                .iter()
+                .any(|d| d.contains("api non chiama il database")),
+            "la decisione umana deve essere nel pack: {:?}",
+            ai.decisions
+        );
+        assert!(
+            ai.formatted_markdown.contains("WHY:")
+                && ai.formatted_markdown.contains("api non chiama il database"),
+            "il formato ai porta la riga WHY:\n{}",
+            ai.formatted_markdown
+        );
+        let md = guardian
+            .get_context_pack("handler api", false)
+            .await
+            .unwrap();
+        assert!(
+            md.formatted_markdown.contains("Perché è fatto così")
+                && md.formatted_markdown.contains("api non chiama il database"),
+            "il Markdown porta la sezione del perché:\n{}",
+            md.formatted_markdown
+        );
+
+        // Goal estraneo (il tag "api" non è un segmento dei suoi qualname): niente
+        // perché — il matching per segmento non inonda.
+        let other = guardian
+            .get_context_pack("core service", true)
+            .await
+            .unwrap();
+        assert!(
+            !other
+                .decisions
+                .iter()
+                .any(|d| d.contains("api non chiama il database")),
+            "su un goal estraneo la decisione NON deve comparire: {:?}",
+            other.decisions
         );
     }
 

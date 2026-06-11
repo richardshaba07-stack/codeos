@@ -611,6 +611,10 @@ pub struct GetContextPackResponse {
     pub suggested_tests: Vec<String>,
     pub estimated_risk: String,
     pub formatted_markdown: String,
+    /// Il *perché* dal ledger di intento, agganciato al goal (umane prime, cap):
+    /// righe «titolo: razionale (autore)». Vuoto se il ledger non ha nulla di
+    /// rilevante — mai inventato.
+    pub decisions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]

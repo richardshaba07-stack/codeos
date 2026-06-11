@@ -349,6 +349,8 @@ message GetContextPackResponse {
   repeated string suggested_tests = 7;
   string estimated_risk = 8;
   string formatted_markdown = 9;
+  // Il "perche'" dal ledger di intento, agganciato al goal (umane prime, cap).
+  repeated string decisions = 10;
 }
 
 message PrMriRequest {
