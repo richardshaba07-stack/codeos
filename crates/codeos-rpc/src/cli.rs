@@ -8,6 +8,8 @@ use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::time::Duration;
 
+mod mcp;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -150,6 +152,12 @@ async fn main() -> anyhow::Result<()> {
         }
         "doctor" => {
             run_doctor().await;
+        }
+        "mcp" => {
+            // Server MCP su stdio: CodeOS come tool nativo per gli agenti
+            // (Claude Code, Cursor…). Niente stampe qui: stdout è il canale
+            // del protocollo, qualunque riga extra lo corromperebbe.
+            mcp::serve().await?;
         }
         "guard" => {
             let mut client = connect_server().await?;
@@ -756,6 +764,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "simulate \"move <src> to <dst>\"",
         "What-if di refactoring: cosa cambierebbe spostando un elemento da <src> a <dst>.",
+    ),
+    (
+        "mcp",
+        "Avvia il server MCP su stdio: CodeOS come tool nativo per gli agenti (Claude Code, Cursor…). Tool esposti: codeos_query, codeos_why, codeos_impact, codeos_context_pack, codeos_decide, codeos_report.",
     ),
     ("help", "Mostra questo aiuto."),
 ];
