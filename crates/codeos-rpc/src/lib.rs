@@ -637,6 +637,7 @@ impl CodeOs for CodeOsService {
             markdown_decisions: res.markdown_decisions,
             explanation: res.explanation,
             history_insufficient: res.history_insufficient,
+            boundary_story: res.boundary_story,
         }))
     }
 

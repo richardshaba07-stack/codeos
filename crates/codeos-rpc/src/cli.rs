@@ -384,6 +384,15 @@ async fn main() -> anyhow::Result<()> {
             for f in &res.co_changed_files {
                 println!("  • {}", f);
             }
+            // Il Crono-Semantic Mining: non solo QUANDO il confine è nato (spesso un
+            // commit iniziale poco eloquente), ma COME è stato esercitato nel tempo —
+            // ogni riga cita hash + intento verbatim dell'autore, mai sintetizzato.
+            if !res.boundary_story.is_empty() {
+                println!("\n📖 Storia del confine (i commit più recenti che l'hanno esercitato):");
+                for line in &res.boundary_story {
+                    println!("  • {}", line);
+                }
+            }
             println!("\n📜 Decisioni correlate:");
             for dec in &res.markdown_decisions {
                 println!("{}", dec);

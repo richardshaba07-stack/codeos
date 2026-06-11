@@ -634,6 +634,11 @@ pub struct WhyResponse {
     pub markdown_decisions: Vec<String>,
     pub explanation: String,
     pub history_insufficient: bool,
+    /// La STORIA del confine (Crono-Semantic Mining): i commit più recenti che hanno
+    /// co-toccato entrambi i lati, righe già formattate «hash · data · soggetto».
+    /// La nascita dice quando il confine è APPARSO; la storia come è stato ESERCITATO
+    /// nel tempo. Vuota senza storia git o senza occasioni: mai inventata.
+    pub boundary_story: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]

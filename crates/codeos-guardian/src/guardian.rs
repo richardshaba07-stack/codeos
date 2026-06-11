@@ -158,6 +158,10 @@ use crate::meta::{mine_missing_invariants, MetaConfig, MissingInvariant};
 /// regola in memoria. Forma: `layering-invariant:{upstream}|{downstream}`.
 const RULE_TAG_PREFIX: &str = "layering-invariant:";
 
+/// Quanti commit al massimo nella STORIA del confine di `why` (i più recenti):
+/// abbastanza per leggere l'evoluzione, non un `git log` intero.
+const MAX_STORY_COMMITS: usize = 5;
+
 /// Una voce del "registro" degli invarianti attualmente in vigore, **derivata dal
 /// ledger** (le decisioni correnti), non da un tag di stato scritto a mano.
 struct ActiveInvariant {
@@ -512,6 +516,45 @@ impl Guardian {
             .await?;
         let file_layers = self.build_file_layers(&relations).await?;
         Ok(excavate(upstream, downstream, &file_layers, &commits))
+    }
+
+    /// La STORIA del confine (Crono-Semantic Mining su `why`): i commit più recenti
+    /// che hanno co-toccato entrambi i lati, formattati «hash · data · soggetto».
+    /// La nascita (il fossile) dice quando il confine è APPARSO — spesso un commit
+    /// iniziale poco informativo; la storia dice come è stato ESERCITATO nel tempo,
+    /// con l'intento dichiarato (verbatim) di ciascun commit. Vuota senza storia o
+    /// senza occasioni: mai inventata (trap #1: niente razionali sintetizzati).
+    async fn boundary_story_lines(
+        &self,
+        upstream: &str,
+        downstream: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let Some(history) = self.history.clone() else {
+            return Ok(Vec::new());
+        };
+        let commits = tokio::task::spawn_blocking(move || history.commits()).await??;
+        let relations = self
+            .storage
+            .query_relations(RelationFilter::default())
+            .await?;
+        let file_layers = self.build_file_layers(&relations).await?;
+        let story = codeos_paleo::boundary_story(
+            upstream,
+            downstream,
+            &file_layers,
+            &commits,
+            MAX_STORY_COMMITS,
+        );
+        Ok(story
+            .iter()
+            .map(|o| {
+                let short: String = o.hash.chars().take(12).collect();
+                let date = chrono::DateTime::from_timestamp(o.timestamp, 0)
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                format!("[{short}] {date} «{}»", o.subject)
+            })
+            .collect())
     }
 
     /// **Spazio negativo del secondo ordine.** Punta l'algoritmo dello spazio
@@ -1586,6 +1629,17 @@ impl Guardian {
             )
         };
 
+        // La STORIA del confine: solo per espressioni ben formate (servono due
+        // estremi). Errori di mining non devono far fallire il `why` (la nascita e
+        // le decisioni restano valide): degradano a storia vuota, onestamente.
+        let boundary_story = if well_formed {
+            self.boundary_story_lines(&upstream, &downstream)
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         Ok(codeos_types::bus::WhyResponse {
             born_commit,
             born_date,
@@ -1594,6 +1648,7 @@ impl Guardian {
             markdown_decisions,
             explanation,
             history_insufficient,
+            boundary_story,
         })
     }
 
@@ -2656,6 +2711,59 @@ mod tests {
         let (storage, _api, _core) = seeded_two_layer_graph().await;
         let guardian = Guardian::new(storage);
         assert!(guardian.fossils().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn why_tells_the_boundary_story_most_recent_first_verbatim() {
+        // Crono-Semantic Mining: `why` non si ferma alla NASCITA (spesso un commit
+        // iniziale poco eloquente) — racconta la STORIA del confine: i commit che
+        // l'hanno esercitato, dal più recente, con l'intento VERBATIM dell'autore.
+        use codeos_paleo::{Commit, InMemoryHistory};
+        let (storage, api, core) = seeded_two_layer_graph().await;
+        let api_file = api[0].location.file_path.clone();
+        let core_file = core[0].location.file_path.clone();
+        let history = InMemoryHistory::new(vec![
+            Commit::with_meta(
+                "birthC0mmit",
+                100,
+                "draw the boundary",
+                [api_file.clone(), core_file.clone()],
+            ),
+            // Tocca solo un lato: NON è un'occasione, non entra nella storia.
+            Commit::with_meta("apionly", 150, "api refactor", [api_file.clone()]),
+            Commit::with_meta(
+                "reinf0rce",
+                200,
+                "reinforce the api-core contract",
+                [core_file, api_file],
+            ),
+        ]);
+        let guardian = Guardian::new(storage).with_commit_history(Arc::new(history));
+
+        let resp = guardian.why("app::api|app::core").await.unwrap();
+        assert_eq!(
+            resp.boundary_story.len(),
+            2,
+            "solo le occasioni vere (co-toccano ENTRAMBI i lati): {:?}",
+            resp.boundary_story
+        );
+        assert!(
+            resp.boundary_story[0].contains("reinf0rce")
+                && resp.boundary_story[0].contains("reinforce the api-core contract"),
+            "il più recente prima, con hash e intento verbatim: {:?}",
+            resp.boundary_story
+        );
+        assert!(
+            resp.boundary_story[1].contains("birthC0mmit"),
+            "la nascita chiude la storia: {:?}",
+            resp.boundary_story
+        );
+
+        // Senza storia git: storia vuota, mai inventata.
+        let (storage2, _a, _c) = seeded_two_layer_graph().await;
+        let bare = Guardian::new(storage2);
+        let resp2 = bare.why("app::api|app::core").await.unwrap();
+        assert!(resp2.boundary_story.is_empty());
     }
 
     #[tokio::test]

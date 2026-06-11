@@ -46,6 +46,8 @@ pub mod abstention;
 pub mod fossil;
 pub mod history;
 
-pub use abstention::{occasion_window, occasions, Abstention, OccasionWindow, Z_95};
+pub use abstention::{
+    boundary_story, occasion_window, occasions, Abstention, BoundaryOccasion, OccasionWindow, Z_95,
+};
 pub use fossil::{excavate, is_history_insufficient, DecisionFossil};
 pub use history::{head_commit, CachedHistory, Commit, CommitHistory, GitLog, InMemoryHistory};

@@ -391,6 +391,9 @@ message WhyResponse {
   repeated string markdown_decisions = 5;
   string explanation = 6;
   bool history_insufficient = 7;
+  // La STORIA del confine (Crono-Semantic Mining): i commit piu recenti che lo
+  // hanno esercitato, righe formattate "hash - data - soggetto". Mai inventata.
+  repeated string boundary_story = 8;
 }
 
 // ---------------------------------------------------------------------------

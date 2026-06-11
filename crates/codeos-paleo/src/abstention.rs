@@ -137,6 +137,54 @@ pub fn occasion_window(
     })
 }
 
+/// Un'occasione della STORIA di un confine: un commit che ha co-toccato entrambi i
+/// layer, con l'intento dichiarato dall'autore (il soggetto, verbatim). È l'unità del
+/// Crono-Semantic Mining: niente è inventato — hash, istante e messaggio sono citazioni.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundaryOccasion {
+    /// Hash del commit (citabile/verificabile con `git show`).
+    pub hash: String,
+    /// Istante del commit (secondi Unix).
+    pub timestamp: i64,
+    /// Il soggetto del messaggio: l'intento dichiarato, MAI riscritto.
+    pub subject: String,
+}
+
+/// La **storia del confine**: i commit che hanno co-toccato `layer_a` e `layer_b`
+/// (le *occasioni* del Campo di Astensione), dal più recente, al massimo `max`.
+///
+/// È il cuore del Crono-Semantic Mining applicato a `why`: la nascita (il fossile)
+/// dice quando il confine è APPARSO — spesso un commit iniziale poco informativo —
+/// mentre la storia dice come è stato ESERCITATO nel tempo, con l'intento dichiarato
+/// di ogni commit. Trap #1 rispettata: il "razionale" è il messaggio dell'autore,
+/// verbatim col suo hash — mai una spiegazione sintetizzata. Vuoto = nessuna
+/// occasione nota, mai inventato (la stessa onestà di [`occasions`] = 0).
+pub fn boundary_story(
+    layer_a: &str,
+    layer_b: &str,
+    file_layers: &HashMap<String, HashSet<String>>,
+    commits: &[Commit],
+    max: usize,
+) -> Vec<BoundaryOccasion> {
+    let mut story: Vec<BoundaryOccasion> = commits
+        .iter()
+        .filter(|c| co_touches(c, layer_a, layer_b, file_layers))
+        .map(|c| BoundaryOccasion {
+            hash: c.hash.clone(),
+            timestamp: c.timestamp,
+            subject: c.subject.clone(),
+        })
+        .collect();
+    // Dal più recente; a parità di istante, per hash (deterministico).
+    story.sort_by(|a, b| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| a.hash.cmp(&b.hash))
+    });
+    story.truncate(max);
+    story
+}
+
 /// `true` se il commit ha toccato almeno un file di `layer_a` **e** almeno uno di
 /// `layer_b`: la definizione di *occasione*. Condivisa col modulo
 /// [`crate::fossil`], che la usa per individuare la *nascita* di un confine.
@@ -196,6 +244,56 @@ mod tests {
     fn no_occasions_without_history() {
         let fl = file_layers();
         assert_eq!(occasions("app::api", "app::core", &fl, &[]), 0);
+    }
+
+    #[test]
+    fn boundary_story_returns_co_touching_commits_most_recent_first_and_capped() {
+        let fl = file_layers();
+        let commits = vec![
+            Commit::with_meta(
+                "aaa",
+                100,
+                "nasce il confine",
+                ["app/api/h.py", "app/core/s.py"],
+            ),
+            Commit::with_meta("bbb", 300, "solo api", ["app/api/h.py"]), // NON occasione
+            Commit::with_meta(
+                "ccc",
+                200,
+                "rinforza il contratto api-core",
+                ["app/core/s.py", "app/api/h.py"],
+            ),
+            Commit::with_meta(
+                "ddd",
+                400,
+                "ultima revisione del confine",
+                ["app/api/h.py", "app/core/s.py", "README.md"],
+            ),
+        ];
+
+        let story = boundary_story("app::api", "app::core", &fl, &commits, 10);
+        // Solo le occasioni vere (3 su 4), dal più recente, con l'intento VERBATIM.
+        let got: Vec<(&str, &str)> = story
+            .iter()
+            .map(|o| (o.hash.as_str(), o.subject.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("ddd", "ultima revisione del confine"),
+                ("ccc", "rinforza il contratto api-core"),
+                ("aaa", "nasce il confine"),
+            ]
+        );
+
+        // Il cap TIENE le più recenti (le più informative per "perché è così ORA").
+        let capped = boundary_story("app::api", "app::core", &fl, &commits, 2);
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].hash, "ddd");
+        assert_eq!(capped[1].hash, "ccc");
+
+        // Niente storia ⇒ vuoto, mai inventato.
+        assert!(boundary_story("app::api", "app::core", &fl, &[], 10).is_empty());
     }
 
     #[test]
