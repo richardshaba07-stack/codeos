@@ -1170,6 +1170,11 @@ impl Guardian {
         if let Some(store) = &self.decisions {
             let target_ids: HashSet<EntityId> = target_entities.iter().map(|e| e.id).collect();
             if let Ok(mut current) = store.current_decisions().await {
+                // SOLO le decisioni UMANE (kind `Decision`): gli invarianti
+                // auto-derivati sono GIÀ nelle BOUNDARIES di questo stesso pack —
+                // ripeterli nel WHY è un doppione che costa token all'agente (e il
+                // metro ha misurato il costo del doppione nel contesto di query).
+                current.retain(|d| d.kind == DecisionKind::Decision);
                 current.retain(|d| {
                     d.related_entity_ids
                         .iter()
@@ -1180,10 +1185,6 @@ impl Guardian {
                                     .iter()
                                     .any(|e| e.qualified_name.split("::").any(|seg| seg == t))
                         })
-                });
-                current.sort_by_key(|d| match d.kind {
-                    DecisionKind::Decision => 0,
-                    _ => 1,
                 });
                 current.truncate(MAX_PACK_DECISIONS);
                 pack_decisions = current

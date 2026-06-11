@@ -183,11 +183,20 @@ impl QueryEngine {
         // aggancia "codeos-core"; i tag generici degli invarianti ("layering",
         // "layering-invariant:a->b") non sono segmenti di alcun qualname ⇒ niente flood.
         // Solo le CORRENTI: una scelta rimpiazzata sarebbe un perché che mente.
+        // SOLO le decisioni UMANE (kind `Decision`) entrano nel contesto, in testa.
+        // Gli invarianti auto-derivati (`ArchitectureRule`) NE RESTANO FUORI: sono
+        // derivabili e vivono già per esteso nel `report` (e nelle BOUNDARIES del
+        // context pack) — qui sarebbero un DOPPIONE che costa budget. IL METRO l'ha
+        // misurato: col ledger default auto-popolato (22 invarianti), anche solo 2 in
+        // testa (~1.3k char di razionali) accorciavano FILE RILEVANTI su OGNI query
+        // ⇒ localization-recall 0.836 → 0.649. Il *perché* non-derivabile (umano) è
+        // piccolo e prezioso; il derivabile non deve costargli localizzazione.
         let mut decisions: Vec<Decision> = self
             .decisions
             .current_decisions()
             .await?
             .into_iter()
+            .filter(|d| d.kind == DecisionKind::Decision)
             .filter(|d| {
                 d.related_entity_ids
                     .iter()
@@ -200,31 +209,7 @@ impl QueryEngine {
                     })
             })
             .collect();
-        // PRIORITÀ al *perché* UMANO (kind `Decision`) sugli invarianti auto-derivati
-        // (`ArchitectureRule`): un sottografo multi-crate aggancia per ID molti invarianti
-        // di layering (derivabili), che — senza priorità — seppellirebbero la decisione
-        // registrata a mano (il moat) e, sforando il budget, la farebbero TAGLIARE da
-        // `compress`. Le umane prima, poi cap onesto: la sezione DECISIONI resta piccola e
-        // mostra ciò che un agente NON ricostruisce. Ordine stabile (timestamp) nei pari.
-        decisions.sort_by_key(|d| match d.kind {
-            DecisionKind::Decision => 0,
-            _ => 1,
-        });
         decisions.truncate(MAX_CONTEXT_DECISIONS);
-        // Gli invarianti AUTO-derivati (`ArchitectureRule`) sono un di-più qui: vivono
-        // già per esteso nel `report`, e un sottografo multi-crate ne aggancia tanti
-        // (misurato: 6 × ~750 char ≈ 4.5k ⇒ FILE RILEVANTI espulso dal budget). Nel
-        // contesto di `query` ne restano al più MAX_AUTO_DECISIONS come segnale; le
-        // decisioni UMANE (il moat, già prime) non vengono MAI sacrificate.
-        let mut auto_seen = 0usize;
-        decisions.retain(|d| {
-            if d.kind == DecisionKind::Decision {
-                true
-            } else {
-                auto_seen += 1;
-                auto_seen <= MAX_AUTO_DECISIONS
-            }
-        });
 
         // Tieni solo le relazioni i cui due estremi sono nel set selezionato.
         let mut relations: Vec<Relation> = expansion
@@ -1421,11 +1406,6 @@ const MAX_CONTEXT_DECISIONS: usize = 6;
 /// contesto bastano le prime citazioni verificabili + il conteggio del resto.
 const MAX_PROOFS_PER_DECISION: usize = 3;
 
-/// Quanti invarianti AUTO-derivati (`ArchitectureRule`) al massimo nel contesto di
-/// `query`: sono derivabili e già per esteso nel `report`; qui sono un segnale, non
-/// la sostanza. Le decisioni UMANE non sono soggette a questo cap.
-const MAX_AUTO_DECISIONS: usize = 2;
-
 const SEED_BONUS: u32 = 1_000_000;
 
 /// Scala della SPECIFICITÀ di un seme (vedi `find_seeds`): aggiunta SOPRA `SEED_BONUS`
@@ -2490,13 +2470,19 @@ mod tests {
             !ctx.contains("decisione di un altro modulo"),
             "un tag-sottostringa non deve agganciare (anti-flood):\n{ctx}"
         );
-        let pos_human = ctx.find("il billing non chiama").unwrap();
-        let pos_auto = ctx
-            .find("Invariante: payment_service")
-            .expect("l'invariante auto (entro il cap) dev'essere presente");
+        // Gli invarianti AUTO-derivati restano FUORI dal contesto di query: sono
+        // derivabili, vivono già nel report, e IL METRO ha misurato che metterli in
+        // testa costava localizzazione (0.836 → 0.649 col ledger auto-popolato).
         assert!(
-            pos_human < pos_auto,
-            "l'umana (il moat) deve precedere l'invariante auto-derivato:\n{ctx}"
+            !ctx.contains("Invariante: payment_service"),
+            "un invariante auto-derivato NON deve entrare nel contesto di query:\n{ctx}"
+        );
+        // E il perché umano sta IN TESTA: prima di FILE RILEVANTI.
+        let pos_human = ctx.find("il billing non chiama").unwrap();
+        let pos_files = ctx.find("FILE RILEVANTI").unwrap();
+        assert!(
+            pos_human < pos_files,
+            "l'umana (il moat) sta in testa, prima di FILE RILEVANTI:\n{ctx}"
         );
     }
 
@@ -2532,7 +2518,7 @@ mod tests {
                     deprecates: Vec::new(),
                     tags: vec!["sicurezza".to_string()],
                 },
-                DecisionKind::ArchitectureRule,
+                DecisionKind::Decision,
             ))
             .await
             .unwrap();
@@ -2594,7 +2580,7 @@ mod tests {
         let decisions = Arc::new(InMemoryDecisionStore::new());
         let old = Decision::from_new(
             new("Sessioni lato client", "Token JWT nel localStorage."),
-            DecisionKind::ArchitectureRule,
+            DecisionKind::Decision,
         );
         // La nuova scelta rimpiazza la vecchia, agganciata alla STESSA entità.
         let mut newer = Decision::from_new(
@@ -2602,7 +2588,7 @@ mod tests {
                 "Sessioni lato server",
                 "Cookie httpOnly, niente token nel client.",
             ),
-            DecisionKind::ArchitectureRule,
+            DecisionKind::Decision,
         );
         newer.supersedes = vec![old.id];
         decisions.record(&old).await.unwrap();
@@ -2658,7 +2644,7 @@ mod tests {
                 deprecates: Vec::new(),
                 tags: Vec::new(),
             },
-            DecisionKind::ArchitectureRule,
+            DecisionKind::Decision,
         );
         decision.evidence = vec![Evidence::Commit("birth01".to_string())];
         decisions.record(&decision).await.unwrap();
