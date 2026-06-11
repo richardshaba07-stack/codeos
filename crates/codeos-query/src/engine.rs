@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use codeos_memory::{Decision, DecisionStore, InMemoryDecisionStore};
+use codeos_memory::{Decision, DecisionKind, DecisionStore, InMemoryDecisionStore};
 use codeos_storage::{GraphStorage, RelationFilter};
 use codeos_types::bus::{
     CallPathReply, CallPathStatus, ImpactReply, ImpactStatus, ImpactTransitiveReply,
@@ -173,8 +173,58 @@ impl QueryEngine {
         // chiedere allo store solo le entità che entreranno davvero nel contesto.
         // Solo le decisioni CORRENTI: una scelta già rimpiazzata o ritirata non è
         // il perché di oggi e portarla nel contesto sarebbe un arco che mente.
-        let selected_id_list: Vec<EntityId> = selected.iter().map(|e| e.id).collect();
-        let decisions = self.decisions.current_related_to(&selected_id_list).await?;
+        // Una decisione è il *perché* di questo sottografo se è agganciata per ID a
+        // un'entità selezionata (come gli invarianti auto-promossi, che portano
+        // `related_entity_ids`) OPPURE se un suo tag nomina un SEGMENTO `::` del
+        // qualified_name di un'entità selezionata (un modulo o un nome). Quest'ultimo
+        // aggancia le decisioni UMANE registrate con `decide` (taggate coi nomi via
+        // `--boundary`/`--tags`) al contesto di `query`, non solo a `why` — completa la
+        // porta del moat. Match per SEGMENTO, non sottostringa: il tag "core" non
+        // aggancia "codeos-core"; i tag generici degli invarianti ("layering",
+        // "layering-invariant:a->b") non sono segmenti di alcun qualname ⇒ niente flood.
+        // Solo le CORRENTI: una scelta rimpiazzata sarebbe un perché che mente.
+        let mut decisions: Vec<Decision> = self
+            .decisions
+            .current_decisions()
+            .await?
+            .into_iter()
+            .filter(|d| {
+                d.related_entity_ids
+                    .iter()
+                    .any(|id| selected_ids.contains(id))
+                    || d.tags.iter().any(|t| {
+                        !t.is_empty()
+                            && selected
+                                .iter()
+                                .any(|e| e.qualified_name.split("::").any(|seg| seg == t))
+                    })
+            })
+            .collect();
+        // PRIORITÀ al *perché* UMANO (kind `Decision`) sugli invarianti auto-derivati
+        // (`ArchitectureRule`): un sottografo multi-crate aggancia per ID molti invarianti
+        // di layering (derivabili), che — senza priorità — seppellirebbero la decisione
+        // registrata a mano (il moat) e, sforando il budget, la farebbero TAGLIARE da
+        // `compress`. Le umane prima, poi cap onesto: la sezione DECISIONI resta piccola e
+        // mostra ciò che un agente NON ricostruisce. Ordine stabile (timestamp) nei pari.
+        decisions.sort_by_key(|d| match d.kind {
+            DecisionKind::Decision => 0,
+            _ => 1,
+        });
+        decisions.truncate(MAX_CONTEXT_DECISIONS);
+        // Gli invarianti AUTO-derivati (`ArchitectureRule`) sono un di-più qui: vivono
+        // già per esteso nel `report`, e un sottografo multi-crate ne aggancia tanti
+        // (misurato: 6 × ~750 char ≈ 4.5k ⇒ FILE RILEVANTI espulso dal budget). Nel
+        // contesto di `query` ne restano al più MAX_AUTO_DECISIONS come segnale; le
+        // decisioni UMANE (il moat, già prime) non vengono MAI sacrificate.
+        let mut auto_seen = 0usize;
+        decisions.retain(|d| {
+            if d.kind == DecisionKind::Decision {
+                true
+            } else {
+                auto_seen += 1;
+                auto_seen <= MAX_AUTO_DECISIONS
+            }
+        });
 
         // Tieni solo le relazioni i cui due estremi sono nel set selezionato.
         let mut relations: Vec<Relation> = expansion
@@ -1361,6 +1411,21 @@ fn last_segment(name: &str) -> &str {
 /// Bonus additivo dato a ogni SEME (match esatto del nome sulla query). Deve essere
 /// più grande di qualunque punteggio di espansione plausibile (≈ numero di semi), così
 /// l'entità cercata è SEMPRE in cima a FILE RILEVANTI, mai tagliata dal limite.
+/// Quante decisioni al massimo iniettare nel contesto di `query` (sezione DECISIONI).
+/// Le UMANE hanno priorità (vedi `query`): il cap tiene la sezione piccola — il *perché*
+/// non-derivabile — invece di una pila di invarianti auto-derivati che il budget taglierebbe.
+const MAX_CONTEXT_DECISIONS: usize = 6;
+
+/// Quante PROVE mostrare al massimo per decisione nel contesto: un invariante
+/// auto-promosso può portarne decine (un arco per dipendenza osservata), e nel
+/// contesto bastano le prime citazioni verificabili + il conteggio del resto.
+const MAX_PROOFS_PER_DECISION: usize = 3;
+
+/// Quanti invarianti AUTO-derivati (`ArchitectureRule`) al massimo nel contesto di
+/// `query`: sono derivabili e già per esteso nel `report`; qui sono un segnale, non
+/// la sostanza. Le decisioni UMANE non sono soggette a questo cap.
+const MAX_AUTO_DECISIONS: usize = 2;
+
 const SEED_BONUS: u32 = 1_000_000;
 
 /// Scala della SPECIFICITÀ di un seme (vedi `find_seeds`): aggiunta SOPRA `SEED_BONUS`
@@ -1561,6 +1626,51 @@ fn format_context(
 
     let mut out = String::new();
     out.push_str(&format!("Contesto per: \"{text}\"\n\n"));
+
+    // Passo 3 — Il *perché*: IN TESTA al contesto, mai in coda. È il contenuto a più
+    // alto valore (l'intento registrato — ciò che un agente NON deriva dal codice; le
+    // decisioni UMANE sono già ordinate prime, con cap) ed è PICCOLO. In coda veniva
+    // TAGLIATO dal passo Compress appena il contesto sforava il budget; e persino dopo
+    // FILE RILEVANTI non bastava (misurato: ~50 entità × path assoluti ≈ 7.5k char ⇒ il
+    // budget si esauriva DENTRO quella sezione). Il moat non si tronca: poche righe in
+    // testa, le sezioni derivabili (entità, dipendenze, impatto) cedono il posto loro.
+    // Mostrato solo se c'è davvero una decisione rilevante, per non aggiungere rumore.
+    if !decisions.is_empty() {
+        out.push_str("DECISIONI ARCHITETTURALI (il perché):\n");
+        for decision in decisions {
+            out.push_str(&format!("- {}", decision.title));
+            let rationale = decision.rationale.trim();
+            if !rationale.is_empty() {
+                out.push_str(&format!(": {}", one_line(rationale)));
+            }
+            out.push_str(&format!(" (autore: {})\n", decision.author));
+            // Le prove a sostegno del perché: l'LLM vede la citazione verificabile
+            // (commit, arco, test), non solo l'affermazione. Mostrate solo quando ci
+            // sono — una decisione scritta a mano può legittimamente non averne. CAP
+            // onesto: un invariante auto-promosso può portare DECINE di archi-prova
+            // (misurato: 57 archi ≈ 4k char per UNA decisione ⇒ il budget evaporava e
+            // FILE RILEVANTI veniva espulso). Poche citazioni + il conteggio del resto:
+            // la prova completa vive nel file del ledger, non nel contesto.
+            if !decision.evidence.is_empty() {
+                let shown: Vec<String> = decision
+                    .evidence
+                    .iter()
+                    .take(MAX_PROOFS_PER_DECISION)
+                    .map(|e| e.to_string())
+                    .collect();
+                let rest = decision.evidence.len().saturating_sub(shown.len());
+                if rest > 0 {
+                    out.push_str(&format!(
+                        "  prove: {} (+{rest} altre nel ledger)\n",
+                        shown.join("; ")
+                    ));
+                } else {
+                    out.push_str(&format!("  prove: {}\n", shown.join("; ")));
+                }
+            }
+        }
+        out.push('\n');
+    }
 
     // Livello L1 — VISTA SOTTOSISTEMI: il raggruppamento dei moduli per CARTELLA, un
     // gradino più in alto di PANORAMICA (che è per file). Compare solo quando AGGREGA
@@ -1856,27 +1966,6 @@ fn format_context(
                 out.push_str(
                     "  («nascita» = quando l'entità è APPARSA nel grafo temporale, non l'ultima\n   modifica; le entità senza dato di nascita — indicizzate senza contesto git — non\n   compaiono.)\n",
                 );
-            }
-        }
-    }
-
-    // Passo 3 — Il *perché*. Mostrato solo se c'è davvero una memoria agganciata,
-    // per non aggiungere rumore quando non ci sono decisioni rilevanti.
-    if !decisions.is_empty() {
-        out.push_str("\nDECISIONI ARCHITETTURALI (il perché):\n");
-        for decision in decisions {
-            out.push_str(&format!("- {}", decision.title));
-            let rationale = decision.rationale.trim();
-            if !rationale.is_empty() {
-                out.push_str(&format!(": {}", one_line(rationale)));
-            }
-            out.push_str(&format!(" (autore: {})\n", decision.author));
-            // Le prove a sostegno del perché: l'LLM vede la citazione verificabile
-            // (commit, arco, test), non solo l'affermazione. Mostrate solo quando
-            // ci sono — una decisione scritta a mano può legittimamente non averne.
-            if !decision.evidence.is_empty() {
-                let proofs: Vec<String> = decision.evidence.iter().map(|e| e.to_string()).collect();
-                out.push_str(&format!("  prove: {}\n", proofs.join("; ")));
             }
         }
     }
@@ -2319,6 +2408,95 @@ mod tests {
                 .iter()
                 .map(|e| &e.qualified_name)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn human_decision_tagged_by_module_reaches_query_context_and_leads() {
+        use codeos_memory::DecisionKind;
+        use codeos_types::bus::NewDecision;
+
+        // Il moat completo: una decisione UMANA registrata con `decide --tags <modulo>`
+        // (nessun related_entity_id: la CLI non risolve i nomi) deve raggiungere il
+        // contesto di `query` via TAG=segmento del qualname, stare IN TESTA (prima
+        // degli invarianti auto-derivati) e sopravvivere — mentre il tag che è solo
+        // SOTTOSTRINGA di un segmento non deve agganciare nulla (anti-flood).
+        let storage = graph_from(
+            "billing/payment_service.py",
+            "class PaymentService:\n    def charge(self):\n        pass\n",
+        )
+        .await;
+        let store = Arc::new(InMemoryDecisionStore::new());
+
+        // Decisione umana taggata col MODULO (come fa `decide --boundary/--tags`).
+        let human = Decision::from_new(
+            NewDecision {
+                author: "human:Richard".into(),
+                title: "il billing non chiama gateway esterni in-process".into(),
+                context: String::new(),
+                rationale: "i pagamenti passano dalla coda, mai chiamate sincrone".into(),
+                related_entity_ids: vec![],
+                related_decision_ids: vec![],
+                supersedes: vec![],
+                deprecates: vec![],
+                tags: vec!["payment_service".into()],
+            },
+            DecisionKind::Decision,
+        );
+        store.record(&human).await.unwrap();
+        // Invariante auto-derivato che aggancia lo stesso modulo: NON deve precedere
+        // l'umana nel contesto.
+        let auto = Decision::from_new(
+            NewDecision {
+                author: "ai:ArchitectureGuardian".into(),
+                title: "Invariante: payment_service non dipende da ui".into(),
+                context: String::new(),
+                rationale: "asimmetria osservata".into(),
+                related_entity_ids: vec![],
+                related_decision_ids: vec![],
+                supersedes: vec![],
+                deprecates: vec![],
+                tags: vec!["payment_service".into()],
+            },
+            DecisionKind::ArchitectureRule,
+        );
+        store.record(&auto).await.unwrap();
+        // Decisione con tag che è solo SOTTOSTRINGA di un segmento ("payment" ⊂
+        // "payment_service"): non è un nome del sottografo ⇒ NON deve entrare.
+        let substring = Decision::from_new(
+            NewDecision {
+                author: "human:Altro".into(),
+                title: "decisione di un altro modulo".into(),
+                context: String::new(),
+                rationale: "non c'entra".into(),
+                related_entity_ids: vec![],
+                related_decision_ids: vec![],
+                supersedes: vec![],
+                deprecates: vec![],
+                tags: vec!["payment".into()],
+            },
+            DecisionKind::Decision,
+        );
+        store.record(&substring).await.unwrap();
+
+        let engine = QueryEngine::with_decisions(storage, store);
+        let ctx = engine.query(&nl("charge")).await.unwrap().formatted_context;
+
+        assert!(
+            ctx.contains("il billing non chiama gateway esterni"),
+            "la decisione umana taggata col modulo deve entrare nel contesto:\n{ctx}"
+        );
+        assert!(
+            !ctx.contains("decisione di un altro modulo"),
+            "un tag-sottostringa non deve agganciare (anti-flood):\n{ctx}"
+        );
+        let pos_human = ctx.find("il billing non chiama").unwrap();
+        let pos_auto = ctx
+            .find("Invariante: payment_service")
+            .expect("l'invariante auto (entro il cap) dev'essere presente");
+        assert!(
+            pos_human < pos_auto,
+            "l'umana (il moat) deve precedere l'invariante auto-derivato:\n{ctx}"
         );
     }
 
