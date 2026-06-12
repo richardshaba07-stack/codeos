@@ -302,6 +302,7 @@ dependencies = [
  "codeos-paleo",
  "codeos-storage",
  "codeos-types",
+ "tempfile",
  "tokio",
  "tracing",
 ]

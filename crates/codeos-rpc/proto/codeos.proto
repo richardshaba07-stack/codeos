@@ -398,10 +398,22 @@ message LicenseViolation {
   string decision_title = 4;
 }
 
+// Avviso trovato NEI SORGENTI (v2): tag SPDX, intestazione di copyright,
+// o file LICENSE/COPYING. text vuota su license-file = non classificata
+// (astensione, mai indovinata).
+message SourceNotice {
+  string path = 1;
+  uint32 line = 2;  // 1-based; 0 = avviso a livello di file
+  string kind = 3;  // "spdx" | "copyright" | "license-file"
+  string text = 4;
+}
+
 message LicensesResponse {
   repeated DependencyLicense dependencies = 1;
   repeated LicenseViolation violations = 2;
   uint32 denied_count = 3;
+  repeated SourceNotice source_notices = 4;
+  uint32 notices_truncated = 5;  // avvisi tagliati dal tetto server-side
 }
 
 message WhyRequest {

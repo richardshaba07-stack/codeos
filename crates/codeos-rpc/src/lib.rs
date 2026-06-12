@@ -664,6 +664,17 @@ impl CodeOs for CodeOsService {
                 })
                 .collect(),
             denied_count: res.denied_count,
+            source_notices: res
+                .source_notices
+                .into_iter()
+                .map(|n| proto::SourceNotice {
+                    path: n.path,
+                    line: n.line,
+                    kind: n.kind,
+                    text: n.text,
+                })
+                .collect(),
+            notices_truncated: res.notices_truncated,
         }))
     }
 

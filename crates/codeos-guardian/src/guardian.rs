@@ -1651,10 +1651,14 @@ impl Guardian {
     /// Le licenze vengono dai metadati LOCALI (registry cache cargo, node_modules);
     /// assente = «sconosciuta», mai indovinata. La policy sono le decisioni correnti
     /// con tag `license-deny:<ID>`: il razionale del divieto vive nel ledger, il
-    /// report lo CITA (fatti, mai conclusioni legali).
+    /// report lo CITA (fatti, mai conclusioni legali). La v2 scansiona anche i
+    /// SORGENTI (SPDX, copyright, file LICENSE vendored): gli avvisi che dichiarano
+    /// una licenza passano per la STESSA policy (un copyright nudo mai — non è
+    /// una licenza).
     pub async fn license_report(&self) -> anyhow::Result<codeos_types::bus::LicenseReportResponse> {
         let repo = resolve_repo_root();
         let scanned = crate::license::scan_licenses(&repo);
+        let source_scan = crate::license::scan_source_notices(&repo);
 
         let mut denied: Vec<(String, String)> = Vec::new();
         if let Some(store) = &self.decisions {
@@ -1666,7 +1670,11 @@ impl Guardian {
                 }
             }
         }
-        let violations = crate::license::check_policy(&scanned, &denied);
+        let mut violations = crate::license::check_policy(&scanned, &denied);
+        violations.extend(crate::license::check_source_policy(
+            &source_scan.notices,
+            &denied,
+        ));
 
         Ok(codeos_types::bus::LicenseReportResponse {
             dependencies: scanned
@@ -1688,6 +1696,17 @@ impl Guardian {
                 })
                 .collect(),
             denied_count: denied.len() as u32,
+            source_notices: source_scan
+                .notices
+                .into_iter()
+                .map(|n| codeos_types::bus::SourceNoticeInfo {
+                    path: n.path,
+                    line: n.line,
+                    kind: n.kind,
+                    text: n.text,
+                })
+                .collect(),
+            notices_truncated: source_scan.truncated,
         })
     }
 

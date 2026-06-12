@@ -317,6 +317,47 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             println!();
+            println!("🔎 AVVISI NEI SORGENTI (SPDX · copyright · file LICENSE)");
+            println!("------------------------------------------------------------");
+            if res.source_notices.is_empty() {
+                println!("  nessun avviso trovato nei sorgenti.\n");
+            } else {
+                let count_kind =
+                    |k: &str| res.source_notices.iter().filter(|n| n.kind == k).count();
+                println!(
+                    "  {} avvisi · {} SPDX · {} copyright · {} file di licenza\n",
+                    res.source_notices.len(),
+                    count_kind("spdx"),
+                    count_kind("copyright"),
+                    count_kind("license-file")
+                );
+                // Tetto di stampa onesto: il conteggio sopra resta completo.
+                const MAX_SHOWN_NOTICES: usize = 40;
+                for n in res.source_notices.iter().take(MAX_SHOWN_NOTICES) {
+                    let place = if n.line > 0 {
+                        format!("{}:{}", n.path, n.line)
+                    } else {
+                        n.path.clone()
+                    };
+                    let text = if n.text.is_empty() {
+                        "licenza NON CLASSIFICATA (astensione: testo non riconosciuto)".to_string()
+                    } else {
+                        n.text.clone()
+                    };
+                    println!("  • {:<44} [{}]  {}", place, n.kind, text);
+                }
+                let hidden = res.source_notices.len().saturating_sub(MAX_SHOWN_NOTICES);
+                if hidden > 0 {
+                    println!("  … e altri {hidden} avvisi non mostrati (conteggio sopra).");
+                }
+                if res.notices_truncated > 0 {
+                    println!(
+                        "  ⚠️  il server ha TAGLIATO {} avvisi oltre il tetto (lista parziale, dichiarato).",
+                        res.notices_truncated
+                    );
+                }
+                println!();
+            }
             if res.denied_count == 0 {
                 println!("⚖️  POLICY: nessun divieto nel ledger. Per impostarne uno:");
                 println!("    codeos decide --title \"niente GPL nel prodotto\" --why \"…\" --tags \"license-deny:GPL-3.0\"");
@@ -811,7 +852,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "licenses",
-        "Scansiona le licenze delle dipendenze (metadati locali; sconosciuta = astensione) e le confronta con la policy del ledger (decisioni con tag license-deny:<ID>). Exit 1 su violazioni.",
+        "Scansiona le licenze delle dipendenze (metadati locali; sconosciuta = astensione) E i sorgenti (tag SPDX, intestazioni di copyright, file LICENSE vendored), confrontando con la policy del ledger (decisioni con tag license-deny:<ID>). Exit 1 su violazioni.",
     ),
     (
         "decide --title \"…\" --why \"…\" [--boundary \"a|b\"] [--tags …]",

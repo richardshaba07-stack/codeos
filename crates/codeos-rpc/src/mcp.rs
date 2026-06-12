@@ -180,7 +180,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "codeos_licenses",
-            "description": "Licenze delle dipendenze (dai metadati locali; vuota = sconosciuta, mai indovinata) + violazioni della policy del ledger (decisioni con tag license-deny:<ID>). Da chiamare PRIMA di aggiungere una dipendenza.",
+            "description": "Licenze delle dipendenze (dai metadati locali; vuota = sconosciuta, mai indovinata) + avvisi nei SORGENTI (tag SPDX, intestazioni di copyright, file LICENSE vendored) + violazioni della policy del ledger (decisioni con tag license-deny:<ID>). Da chiamare PRIMA di aggiungere una dipendenza o incollare codice di terzi.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
@@ -342,6 +342,38 @@ async fn dispatch_tool(name: &str, args: &Value) -> anyhow::Result<String> {
                 };
                 out.push_str(&format!("{} [{}]: {}\n", d.name, d.ecosystem, lic));
             }
+            if res.source_notices.is_empty() {
+                out.push_str("\nSORGENTI: nessun avviso (SPDX/copyright/LICENSE) trovato.\n");
+            } else {
+                out.push_str(&format!(
+                    "\nSORGENTI: {} avvisi:\n",
+                    res.source_notices.len()
+                ));
+                const MAX_SHOWN: usize = 40;
+                for n in res.source_notices.iter().take(MAX_SHOWN) {
+                    let place = if n.line > 0 {
+                        format!("{}:{}", n.path, n.line)
+                    } else {
+                        n.path.clone()
+                    };
+                    let text = if n.text.is_empty() {
+                        "NON CLASSIFICATA (astensione)"
+                    } else {
+                        n.text.as_str()
+                    };
+                    out.push_str(&format!("- {place} [{}]: {text}\n", n.kind));
+                }
+                let hidden = res.source_notices.len().saturating_sub(MAX_SHOWN);
+                if hidden > 0 {
+                    out.push_str(&format!("… e altri {hidden} avvisi non mostrati.\n"));
+                }
+                if res.notices_truncated > 0 {
+                    out.push_str(&format!(
+                        "ATTENZIONE: {} avvisi tagliati dal tetto server-side (lista parziale).\n",
+                        res.notices_truncated
+                    ));
+                }
+            }
             if res.denied_count == 0 {
                 out.push_str("\nPOLICY: nessun divieto nel ledger (registrane con codeos_decide, tag license-deny:<ID>).");
             } else if res.violations.is_empty() {
@@ -370,7 +402,8 @@ async fn dispatch_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         }
         other => anyhow::bail!(
             "tool sconosciuto: '{other}' (disponibili: codeos_query, codeos_why, \
-             codeos_impact, codeos_context_pack, codeos_decide, codeos_report)"
+             codeos_impact, codeos_context_pack, codeos_decide, codeos_report, \
+             codeos_licenses)"
         ),
     }
 }

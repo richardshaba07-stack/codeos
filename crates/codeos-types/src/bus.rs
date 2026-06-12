@@ -653,6 +653,22 @@ pub struct LicenseViolationInfo {
     pub decision_title: String,
 }
 
+/// Un avviso di licenza/copyright trovato NEI SORGENTI (scanner licenze v2):
+/// tag SPDX, intestazione di copyright, o file LICENSE/COPYING vendored.
+#[derive(Debug, Clone)]
+pub struct SourceNoticeInfo {
+    /// Path relativo alla root del repo.
+    pub path: String,
+    /// Riga 1-based; 0 = avviso a livello di file (es. LICENSE).
+    pub line: u32,
+    /// "spdx" | "copyright" | "license-file".
+    pub kind: String,
+    /// L'espressione SPDX verbatim, la riga di copyright, o la famiglia di
+    /// licenza classificata. VUOTA per un license-file = non classificata
+    /// (astensione, mai indovinata).
+    pub text: String,
+}
+
 /// Risposta della scansione licenze.
 #[derive(Debug, Clone)]
 pub struct LicenseReportResponse {
@@ -661,6 +677,12 @@ pub struct LicenseReportResponse {
     /// Quanti id vietati la policy del ledger dichiara (0 = nessuna policy:
     /// le violazioni non possono esistere e il report lo dice).
     pub denied_count: u32,
+    /// Gli avvisi trovati NEI SORGENTI (v2). Le violazioni che ne derivano
+    /// (SPDX/license-file vs policy) sono già dentro `violations`.
+    pub source_notices: Vec<SourceNoticeInfo>,
+    /// Quanti avvisi il tetto server-side ha TAGLIATO (0 = lista completa) —
+    /// troncamento dichiarato, mai muto.
+    pub notices_truncated: u32,
 }
 
 #[derive(Debug, Clone, Default)]
