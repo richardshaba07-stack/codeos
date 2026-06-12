@@ -827,7 +827,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "mcp",
-        "Avvia il server MCP su stdio: CodeOS come tool nativo per gli agenti (Claude Code, Cursor…). Tool esposti: codeos_query, codeos_why, codeos_impact, codeos_context_pack, codeos_decide, codeos_report.",
+        "Avvia il server MCP su stdio: CodeOS come tool nativo per gli agenti (Claude Code, Cursor…). Tool esposti: codeos_query, codeos_why, codeos_impact, codeos_context_pack, codeos_decide, codeos_report, codeos_licenses.",
     ),
     ("help", "Mostra questo aiuto."),
 ];
@@ -1385,7 +1385,7 @@ mod tests {
         let usage = usage_text();
         for cmd in [
             "index", "report", "query", "path", "impact", "doctor", "guard", "context", "mri",
-            "why", "simulate", "help",
+            "why", "simulate", "help", "decide", "mcp", "licenses",
         ] {
             assert!(
                 usage.contains(cmd),
