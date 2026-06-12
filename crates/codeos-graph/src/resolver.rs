@@ -184,11 +184,7 @@ impl GraphResolver {
                 entity_aux.push(EntityAux {
                     id,
                     name: parsed.name.clone(),
-                    rust_kind: parsed
-                        .metadata
-                        .get("rust_kind")
-                        .cloned()
-                        .unwrap_or_default(),
+                    role: type_role(&parsed.metadata),
                     file_idx,
                 });
 
@@ -597,12 +593,30 @@ struct FileContext {
 }
 
 /// Info ausiliarie per la canonicalizzazione dei tipi (Passo 1.5), raccolte nel
-/// Passo 1 quando ancora conosciamo `name`, `rust_kind` e il file di origine.
+/// Passo 1 quando ancora conosciamo `name`, il ruolo di tipo e il file di origine.
 struct EntityAux {
     id: EntityId,
     name: String,
-    rust_kind: String,
+    /// Ruolo nella canonicalizzazione: `"decl"` = definizione nominale reale
+    /// (Rust `struct`/`enum`/`trait`, Go `type_decl`), `"placeholder"` = frammento
+    /// sintetico da fondere (Rust `impl_target`, Go `receiver_target`), `""` = non
+    /// partecipa. Normalizzato da [`type_role`] così il pass è language-neutral.
+    role: &'static str,
     file_idx: usize,
+}
+
+/// Normalizza i marcatori per-linguaggio nel ruolo di canonicalizzazione.
+fn type_role(metadata: &HashMap<String, String>) -> &'static str {
+    match metadata.get("rust_kind").map(String::as_str) {
+        Some("struct" | "enum" | "trait") => return "decl",
+        Some("impl_target") => return "placeholder",
+        _ => {}
+    }
+    match metadata.get("go_kind").map(String::as_str) {
+        Some("type_decl") => "decl",
+        Some("receiver_target") => "placeholder",
+        _ => "",
+    }
 }
 
 /// Passo 1.5 — Canonicalizzazione dell'identità di tipo (anti-frammentazione).
@@ -640,14 +654,14 @@ async fn canonicalize_type_fragments(
     //    placeholder (`impl_target`) né gli alias/associati (`type`).
     let mut canon_by_name: HashMap<&str, Vec<EntityId>> = HashMap::new();
     for a in aux {
-        if matches!(a.rust_kind.as_str(), "struct" | "enum" | "trait") {
+        if a.role == "decl" {
             canon_by_name.entry(a.name.as_str()).or_default().push(a.id);
         }
     }
     // 2. Decidi i merge: placeholder → canonico (unico e non importato da esterno).
     let mut merge: HashMap<EntityId, EntityId> = HashMap::new();
     for a in aux {
-        if a.rust_kind != "impl_target" {
+        if a.role != "placeholder" {
             continue;
         }
         let ctx = &file_ctxs[a.file_idx];
@@ -745,11 +759,9 @@ async fn db_canonical_for(
         if e.qualified_name != name && !e.qualified_name.ends_with(&suffix) {
             continue;
         }
-        // Solo definizioni reali: esclude i placeholder `impl_target` e gli alias.
-        if !matches!(
-            e.metadata.get("rust_kind").map(String::as_str),
-            Some("struct" | "enum" | "trait")
-        ) {
+        // Solo definizioni reali: esclude i placeholder (`impl_target` Rust,
+        // `receiver_target` Go) e gli alias — stesso discrimine del batch.
+        if type_role(&e.metadata) != "decl" {
             continue;
         }
         // Stesso crate del chiamante: niente sconfinamento cross-crate.
@@ -1596,6 +1608,102 @@ mod tests {
     /// `UNIQUE(qualified_name)` e l'INTERA transazione fa rollback (misurato sul
     /// crate reale: serde_json → 0 entità salvate). Il resolver tiene UNA sola
     /// identità: «un'identità in meno è meglio di un indice che muore».
+    /// Regressione (campagna 50 progetti): in Go un tipo con metodi sparsi su più
+    /// file dello stesso package si frammentava in N entità omonime (gin.Context ×2,
+    /// uuid.UUID ×2) — il parser sintetizza il tipo del ricevente per-file, e senza
+    /// marcatore il Passo 1.5 non poteva fonderlo. Ora `receiver_target` → fuso
+    /// nell'unica `type_decl` del batch, come l'`impl_target` Rust.
+    #[tokio::test]
+    async fn go_receiver_fragments_merge_into_the_declared_type() {
+        let decl = parse_go(
+            "gin/context.go",
+            "package gin\n\ntype Context struct {}\n\nfunc (c *Context) JSON() {}\n",
+        )
+        .await;
+        let frag = parse_go(
+            "gin/helpers.go",
+            "package gin\n\nfunc (c *Context) Query() {}\n\nfunc (c *Context) Param() {}\n",
+        )
+        .await;
+        // Non-vacuità: il file di soli metodi sintetizza DAVVERO un placeholder.
+        assert!(
+            frag.entities.iter().any(|e| e.name == "Context"
+                && e.metadata.get("go_kind").map(String::as_str) == Some("receiver_target")),
+            "helpers.go deve produrre il placeholder receiver_target"
+        );
+
+        let storage = SqliteStorage::in_memory().unwrap();
+        let delta = GraphResolver::new(None)
+            .resolve(&[decl, frag], &storage)
+            .await
+            .unwrap();
+
+        // UN tipo = UNA entità: il frammento di helpers.go è fuso nella decl.
+        let contexts: Vec<&Entity> = delta
+            .added_entities
+            .iter()
+            .filter(|e| e.qualified_name.ends_with("::Context"))
+            .collect();
+        assert_eq!(
+            contexts.len(),
+            1,
+            "gin.Context dev'essere UNA entità, non frammenti per-file: {:?}",
+            contexts
+                .iter()
+                .map(|e| &e.qualified_name)
+                .collect::<Vec<_>>()
+        );
+        // E i metodi di ENTRAMBI i file appartengono al canonico.
+        let canon = contexts[0].id;
+        let members = delta
+            .added_relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::BelongsTo && r.target_id == canon)
+            .count();
+        assert_eq!(
+            members, 3,
+            "JSON, Query e Param devono appartenere tutti al Context canonico"
+        );
+    }
+
+    /// Anti-falso-positivo: con DUE dichiarazioni omonime nel batch (package
+    /// diversi) il frammento NON si fonde — 0 o ≥2 candidati = non si indovina,
+    /// il duplicato onesto resta (mai un merge bugiardo cross-package).
+    #[tokio::test]
+    async fn go_receiver_fragment_stays_apart_when_decl_is_ambiguous() {
+        let decl_a = parse_go(
+            "alfa/context.go",
+            "package alfa\n\ntype Context struct {}\n",
+        )
+        .await;
+        let decl_b = parse_go(
+            "beta/context.go",
+            "package beta\n\ntype Context struct {}\n",
+        )
+        .await;
+        let frag = parse_go(
+            "beta/helpers.go",
+            "package beta\n\nfunc (c *Context) Query() {}\n",
+        )
+        .await;
+
+        let storage = SqliteStorage::in_memory().unwrap();
+        let delta = GraphResolver::new(None)
+            .resolve(&[decl_a, decl_b, frag], &storage)
+            .await
+            .unwrap();
+
+        let contexts = delta
+            .added_entities
+            .iter()
+            .filter(|e| e.qualified_name.ends_with("::Context"))
+            .count();
+        assert_eq!(
+            contexts, 3,
+            "con 2 decl omonime il placeholder resta separato: niente merge indovinato"
+        );
+    }
+
     #[tokio::test]
     async fn cfg_variant_duplicate_methods_collapse_to_one_identity() {
         let src = r#"

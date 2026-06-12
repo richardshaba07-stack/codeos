@@ -206,7 +206,7 @@ impl<'src> FileWalk<'src> {
             Some("interface_type") => EntityKind::Interface,
             _ => EntityKind::Struct,
         };
-        let id = self.ensure_type_entity(&name, node, scope, kind);
+        let id = self.ensure_type_entity(&name, node, scope, kind, true);
         let child_scope = Scope { local_id: id };
         self.walk_children(node, &child_scope);
     }
@@ -239,7 +239,7 @@ impl<'src> FileWalk<'src> {
         let receiver = self.receiver_type_name(node);
         let (parent_id, mut metadata) = match &receiver {
             Some(type_name) => (
-                self.ensure_type_entity(type_name, node, scope, EntityKind::Struct),
+                self.ensure_type_entity(type_name, node, scope, EntityKind::Struct, false),
                 go_metadata(),
             ),
             None => (scope.local_id.clone(), go_metadata()),
@@ -280,25 +280,60 @@ impl<'src> FileWalk<'src> {
         None
     }
 
+    /// Crea (o ritrova) l'entità del tipo `name`. `declared=true` quando viene dalla
+    /// DICHIARAZIONE reale (`type Foo struct/interface`), `false` quando è sintetizzata
+    /// dal ricevente di un metodo (`func (f *Foo) …`) in un file che non dichiara Foo.
+    ///
+    /// Il marcatore `go_kind` distingue i due casi (`type_decl` vs `receiver_target`):
+    /// è il gemello Go dell'`impl_target` Rust, e permette al Passo 1.5 del resolver
+    /// di FONDERE i frammenti sintetici nell'unica dichiarazione reale del batch —
+    /// senza, un tipo con metodi sparsi su più file (gin.Context, uuid.UUID — misurato
+    /// dalla campagna 50 progetti) resta spezzato in N entità omonime.
+    ///
+    /// Se il tipo era già stato sintetizzato dal ricevente e POI arriva la
+    /// dichiarazione nello stesso file (in Go i metodi possono precederla), l'entità
+    /// esistente viene PROMOSSA: kind reale, posizione della dichiarazione, marcatore
+    /// `type_decl` — una sola identità per file, mai due.
     fn ensure_type_entity(
         &mut self,
         name: &str,
         node: Node,
         scope: &Scope,
         kind: EntityKind,
+        declared: bool,
     ) -> String {
+        let go_kind = if declared {
+            "type_decl"
+        } else {
+            "receiver_target"
+        };
         if let Some(existing) = self.type_entities.get(name) {
-            return existing.clone();
+            let existing = existing.clone();
+            if declared {
+                // Promozione: la dichiarazione reale vince sul placeholder.
+                let loc = self.loc(node);
+                if let Some(e) = self.entities.iter_mut().find(|e| e.local_id == existing) {
+                    if e.metadata.get("go_kind").map(String::as_str) != Some("type_decl") {
+                        e.kind = kind;
+                        e.location = loc;
+                        e.metadata
+                            .insert("go_kind".to_string(), "type_decl".to_string());
+                    }
+                }
+            }
+            return existing;
         }
         let id = self.fresh_id();
         self.type_entities.insert(name.to_string(), id.clone());
+        let mut metadata = go_metadata();
+        metadata.insert("go_kind".to_string(), go_kind.to_string());
         self.entities.push(ParsedEntity {
             local_id: id.clone(),
             kind,
             name: name.to_string(),
             parent_local_id: Some(scope.local_id.clone()),
             location: self.loc(node),
-            metadata: go_metadata(),
+            metadata,
         });
         id
     }
