@@ -9,9 +9,12 @@
 //! *chi* usa X. E la POLICY di licenza è intento architetturale: una decisione
 //! del ledger (`codeos decide --tags "license-deny:GPL-3.0"`) diventa il gate.
 //!
-//! Onestà di scope (v1, dipendenze):
+//! Onestà di scope (v1+v3, dipendenze):
 //! - la licenza viene SOLO da metadati locali del pacchetto (Cargo.toml del
-//!   registry cache per Rust; package.json dentro node_modules per JS/TS);
+//!   registry cache per Rust; package.json dentro node_modules per JS/TS;
+//!   METADATA dei dist-info nel venv del repo per pip — v3);
+//! - go.mod (v3): solo i NOMI delle require dirette, licenza sconosciuta
+//!   (niente module-cache affidabile senza toolchain);
 //! - licenza non trovata ⇒ `None` («sconosciuta»), mai indovinata.
 //!
 //! Onestà di scope (v2, sorgenti — [`scan_source_notices`]):
@@ -122,17 +125,43 @@ pub fn scan_licenses(repo_root: &Path) -> Vec<DependencyLicense> {
         }
     }
 
-    // --- Python: requirements.txt — solo i NOMI; la licenza resta sconosciuta
-    //     in v1 (i pacchetti potrebbero non essere installati). Astensione. ---
+    // --- Python: requirements.txt per i NOMI; la licenza (v3) si legge dal
+    //     METADATA dei pacchetti INSTALLATI nel venv del repo (dist-info).
+    //     Pacchetto non installato ⇒ sconosciuta. Astensione, mai PyPI. ---
     let req = repo_root.join("requirements.txt");
     if let Ok(text) = std::fs::read_to_string(&req) {
+        let site_packages = find_site_packages(repo_root);
         for dep in pip_dependency_names(&text) {
+            let found = site_packages
+                .iter()
+                .find_map(|sp| pip_dist_info_license(sp, &dep));
+            let (license, source) = match found {
+                Some((l, s)) => (Some(l), s),
+                None => (None, req.to_string_lossy().to_string()),
+            };
             out.entry(("pip".to_string(), dep.clone()))
                 .or_insert(DependencyLicense {
                     name: dep,
                     ecosystem: "pip".to_string(),
+                    license,
+                    source,
+                });
+        }
+    }
+
+    // --- Go: go.mod — solo le require DIRETTE (le `// indirect` sono
+    //     transitive, fuori dal censimento come per gli altri ecosistemi).
+    //     Licenza sconosciuta in v3: senza toolchain/module-cache locale
+    //     affidabile non si indovina. Astensione. ---
+    let gomod = repo_root.join("go.mod");
+    if let Ok(text) = std::fs::read_to_string(&gomod) {
+        for dep in go_dependency_names(&text) {
+            out.entry(("go".to_string(), dep.clone()))
+                .or_insert(DependencyLicense {
+                    name: dep,
+                    ecosystem: "go".to_string(),
                     license: None,
-                    source: req.to_string_lossy().to_string(),
+                    source: gomod.to_string_lossy().to_string(),
                 });
         }
     }
@@ -621,6 +650,113 @@ fn json_string_field(json: &str, field: &str) -> Option<String> {
     }
 }
 
+/// Nomi dei moduli richiesti DIRETTAMENTE da un go.mod: blocchi `require ( … )`
+/// e require a riga singola. Le righe marcate `// indirect` (transitive) sono
+/// escluse — il censimento è delle dipendenze dirette, come per gli altri
+/// ecosistemi. Una forma esotica non riconosciuta produce MENO voci, mai voci
+/// inventate.
+fn go_dependency_names(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_require = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("require (") {
+            in_require = true;
+            continue;
+        }
+        if in_require && line == ")" {
+            in_require = false;
+            continue;
+        }
+        let dep_line = if in_require {
+            Some(line)
+        } else {
+            line.strip_prefix("require ").map(str::trim)
+        };
+        let Some(dep_line) = dep_line else { continue };
+        if dep_line.is_empty() || dep_line.starts_with("//") || dep_line.contains("// indirect") {
+            continue;
+        }
+        if let Some(name) = dep_line.split_whitespace().next() {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// Le directory site-packages dei venv DENTRO il repo (`venv`, `.venv`, `env`):
+/// è lì che i pacchetti pip del progetto sono davvero installati. Niente
+/// site-packages di sistema: la licenza deve venire dall'ambiente del repo.
+fn find_site_packages(repo_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for venv in ["venv", ".venv", "env"] {
+        let lib = repo_root.join(venv).join("lib");
+        let Ok(entries) = std::fs::read_dir(&lib) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let sp = e.path().join("site-packages");
+            if sp.is_dir() {
+                out.push(sp);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// La licenza di un pacchetto pip INSTALLATO, dal `METADATA` della sua
+/// directory `<nome>-<ver>.dist-info`. Il nome si confronta normalizzato
+/// PEP-503 (case-insensitive, `-`≡`_`). Ritorna (licenza, path del METADATA).
+/// Ordine dei campi: `License-Expression:` (PEP 639, espressione SPDX esatta)
+/// poi `License:` se non vuoto/UNKNOWN. I classifier Trove NON si interpretano
+/// (mapparli a un id è un indovinello) — astensione.
+fn pip_dist_info_license(site_packages: &Path, name: &str) -> Option<(String, String)> {
+    let normalized = |s: &str| s.to_lowercase().replace('-', "_");
+    let wanted = normalized(name);
+    let entries = std::fs::read_dir(site_packages).ok()?;
+    for e in entries.flatten() {
+        let fname = e.file_name().to_string_lossy().to_string();
+        let Some(stem) = fname.strip_suffix(".dist-info") else {
+            continue;
+        };
+        // `<nome>-<versione>` → il nome è tutto fino all'ULTIMO '-' (la
+        // versione inizia con una cifra).
+        let Some((pkg, ver)) = stem.rsplit_once('-') else {
+            continue;
+        };
+        if !ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if normalized(pkg) != wanted {
+            continue;
+        }
+        let meta_path = e.path().join("METADATA");
+        let text = std::fs::read_to_string(&meta_path).ok()?;
+        let meta_str = meta_path.to_string_lossy().to_string();
+        // Gli header finiscono alla prima riga vuota (poi è il README).
+        let headers = text.split("\n\n").next().unwrap_or(&text);
+        for line in headers.lines() {
+            if let Some(v) = line.strip_prefix("License-Expression:") {
+                let v = v.trim();
+                if !v.is_empty() {
+                    return Some((v.to_string(), meta_str));
+                }
+            }
+        }
+        for line in headers.lines() {
+            if let Some(v) = line.strip_prefix("License:") {
+                let v = v.trim();
+                if !v.is_empty() && !v.eq_ignore_ascii_case("unknown") {
+                    return Some((v.to_string(), meta_str));
+                }
+            }
+        }
+        return None; // installato ma senza licenza dichiarata: astensione.
+    }
+    None
+}
+
 /// Nomi dei pacchetti da un requirements.txt (righe `nome==ver`, `nome>=…`,
 /// `nome`). Commenti, opzioni (`-r`, `--hash`) e URL sono saltati.
 fn pip_dependency_names(text: &str) -> Vec<String> {
@@ -689,6 +825,82 @@ tempfile = "3"
             json_string_field(r#"{"license":{"type":"ISC"}}"#, "license"),
             None
         );
+    }
+
+    #[test]
+    fn go_names_cover_block_and_single_require_excluding_indirect() {
+        let gomod = "module example.com/app\n\ngo 1.21\n\n\
+                     require (\n\
+                     \tgithub.com/gin-gonic/gin v1.9.1\n\
+                     \tgolang.org/x/sync v0.5.0 // indirect\n\
+                     )\n\n\
+                     require github.com/single v1.0.0\n";
+        assert_eq!(
+            go_dependency_names(gomod),
+            vec!["github.com/gin-gonic/gin", "github.com/single"]
+        );
+    }
+
+    #[test]
+    fn pip_dist_info_reads_installed_license_with_pep503_normalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let sp = dir
+            .path()
+            .join(".venv")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages");
+        // typing_extensions installato (dist-info con underscore), licenza
+        // via PEP 639; flask con il vecchio header License:; old-pkg UNKNOWN.
+        let te = sp.join("typing_extensions-4.8.0.dist-info");
+        std::fs::create_dir_all(&te).unwrap();
+        std::fs::write(
+            te.join("METADATA"),
+            "Metadata-Version: 2.1\nName: typing_extensions\n\
+             License-Expression: PSF-2.0\n\nREADME License: finto\n",
+        )
+        .unwrap();
+        let fl = sp.join("flask-3.0.0.dist-info");
+        std::fs::create_dir_all(&fl).unwrap();
+        std::fs::write(
+            fl.join("METADATA"),
+            "Metadata-Version: 2.1\nName: flask\nLicense: BSD-3-Clause\n\n…",
+        )
+        .unwrap();
+        let old = sp.join("old_pkg-1.0.dist-info");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(
+            old.join("METADATA"),
+            "Metadata-Version: 2.1\nName: old-pkg\nLicense: UNKNOWN\n\n…",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("requirements.txt"),
+            // Il requirements usa il TRATTINO: deve matchare l'underscore.
+            "typing-extensions==4.8.0\nflask\nold-pkg\nnot-installed\n",
+        )
+        .unwrap();
+
+        let scanned = scan_licenses(dir.path());
+        let by_name = |n: &str| {
+            scanned
+                .iter()
+                .find(|d| d.name == n)
+                .unwrap_or_else(|| panic!("manca {n}"))
+        };
+        assert_eq!(
+            by_name("typing-extensions").license.as_deref(),
+            Some("PSF-2.0")
+        );
+        assert!(by_name("typing-extensions").source.ends_with("METADATA"));
+        assert_eq!(by_name("flask").license.as_deref(), Some("BSD-3-Clause"));
+        // UNKNOWN dichiarato dal pacchetto = astensione, non una "licenza".
+        assert_eq!(by_name("old-pkg").license, None);
+        // Non installato: astensione, source = il requirements.
+        assert_eq!(by_name("not-installed").license, None);
+        assert!(by_name("not-installed")
+            .source
+            .ends_with("requirements.txt"));
     }
 
     #[test]
