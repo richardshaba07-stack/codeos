@@ -1128,12 +1128,34 @@ impl QueryEngine {
         let from_q = ef.qualified_name.clone();
         let to_q = et.qualified_name.clone();
         match self.call_path(ef.id, et.id).await? {
-            Some(path) => Ok(CallPathReply {
-                formatted: format_call_path_found(&from_q, &to_q, &path.steps),
-                status: CallPathStatus::Found,
-                steps: path.steps,
-                candidates: Vec::new(),
-            }),
+            Some(path) => {
+                // Le VIE ALTERNATIVE (capability `call_paths`, integrata in
+                // `query()` dal 19bfa68 ma finora invisibile al comando `path`):
+                // più vie indipendenti rivelano un coupling che il solo
+                // più-corto nasconde. Il singolare resta la fonte di verità per
+                // l'ESISTENZA (non ha tetto di lunghezza; il plurale si ferma a
+                // MAX_PATH_LEN nodi) — mai una regressione Found→NoPath: se il
+                // plurale non trova nulla, si mostra il cammino singolo.
+                let routes = self.call_paths(ef.id, et.id).await?;
+                let primary_ids: Vec<EntityId> = path.steps.iter().map(|e| e.id).collect();
+                let alternatives: Vec<&CallPath> = routes
+                    .iter()
+                    .filter(|r| r.steps.iter().map(|e| e.id).collect::<Vec<_>>() != primary_ids)
+                    .collect();
+                let capped = routes.len() >= MAX_ALT_PATHS;
+                Ok(CallPathReply {
+                    formatted: format_call_path_found_with_routes(
+                        &from_q,
+                        &to_q,
+                        &path.steps,
+                        &alternatives,
+                        capped,
+                    ),
+                    status: CallPathStatus::Found,
+                    steps: path.steps,
+                    candidates: Vec::new(),
+                })
+            }
             None => Ok(CallPathReply {
                 formatted: format_no_path(&from_q, &to_q),
                 status: CallPathStatus::NoPath,
@@ -2126,6 +2148,38 @@ fn format_call_path_found(from_q: &str, to_q: &str, steps: &[Entity]) -> String 
         "\n({} passi, ogni freccia è un arco `Calls` risolto del grafo.)\n",
         steps.len()
     ));
+    out
+}
+
+/// Come [`format_call_path_found`], ma con le VIE ALTERNATIVE quando esistono:
+/// due vie indipendenti verso la stessa destinazione rivelano un coupling che il
+/// solo cammino più corto nasconde. `capped` dichiara che la ricerca multi-via
+/// ha raggiunto il suo tetto ([`MAX_ALT_PATHS`]) — potrebbero esisterne altre.
+fn format_call_path_found_with_routes(
+    from_q: &str,
+    to_q: &str,
+    steps: &[Entity],
+    alternatives: &[&CallPath],
+    capped: bool,
+) -> String {
+    let mut out = format_call_path_found(from_q, to_q, steps);
+    if alternatives.is_empty() {
+        return out;
+    }
+    out.push_str(&format!("\nVie alternative ({}):\n", alternatives.len()));
+    for alt in alternatives {
+        let chain: Vec<&str> = alt
+            .steps
+            .iter()
+            .map(|e| e.qualified_name.as_str())
+            .collect();
+        out.push_str(&format!("  • {}\n", chain.join(" → ")));
+    }
+    if capped {
+        out.push_str(&format!(
+            "  (tetto di ricerca raggiunto: al più {MAX_ALT_PATHS} vie cercate — potrebbero esisterne altre.)\n"
+        ));
+    }
     out
 }
 
@@ -3528,6 +3582,49 @@ mod tests {
             path.is_none(),
             "l'unica chiamata di handler è Unresolved: nessun cammino verso target, \
              non un collegamento inventato"
+        );
+    }
+
+    #[tokio::test]
+    async fn path_command_surfaces_alternative_routes() {
+        // Il wire CLI delle vie multiple (chiude il deferral di 19bfa68): il
+        // comando `codeos path a b` passa per `call_path_by_name`, che finora
+        // mostrava SOLO il più corto. Con due vie indipendenti a→via_x→b e
+        // a→via_y→b, il formatted deve portarle ENTRAMBE; con una via sola,
+        // niente sezione «Vie alternative» (anti-rumore).
+        let storage = graph_from(
+            "app.py",
+            "def b():\n    pass\n\n\
+             def via_x():\n    b()\n\n\
+             def via_y():\n    b()\n\n\
+             def a():\n    via_x()\n    via_y()\n\n\
+             def solo():\n    a()\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let reply = engine.call_path_by_name("a", "b").await.unwrap();
+        assert_eq!(reply.status, CallPathStatus::Found);
+        assert!(
+            reply.formatted.contains("Vie alternative (1)"),
+            "la seconda via deve comparire:\n{}",
+            reply.formatted
+        );
+        assert!(
+            reply.formatted.contains("via_x") && reply.formatted.contains("via_y"),
+            "entrambe le vie nel testo:\n{}",
+            reply.formatted
+        );
+        // `steps` resta il cammino primario (3 nodi), non si gonfia con le vie.
+        assert_eq!(reply.steps.len(), 3);
+
+        // Via unica (solo → a): nessuna sezione alternativa.
+        let reply = engine.call_path_by_name("solo", "a").await.unwrap();
+        assert_eq!(reply.status, CallPathStatus::Found);
+        assert!(
+            !reply.formatted.contains("Vie alternative"),
+            "una via sola non genera la sezione:\n{}",
+            reply.formatted
         );
     }
 
