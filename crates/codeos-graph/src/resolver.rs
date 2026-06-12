@@ -307,7 +307,26 @@ impl GraphResolver {
                     continue;
                 };
 
-                let resolved = resolve_target(&rctx, &target).await?;
+                let mut resolved = resolve_target(&rctx, &target).await?;
+
+                // Una chiamata con receiver PUNTATO (`x.foo()`) non può mai essere la
+                // ricorsione dell'entità chiamante: la ricorsione vera si scrive
+                // `foo()` nudo, o `self.foo()`/`this.foo()` (2 segmenti, receiver di
+                // tipo certo). Se lo stadio per nome semplice ha legato un `x.foo()`
+                // all'entità SORGENTE stessa, è la firma della menzogna type-blind —
+                // misurata: 1.065 self-archi su DeepSpeed (es. `parser.parse_args()`
+                // dentro `parse_args`, legato a sé stesso). Meglio il buco onesto,
+                // che riemerge nei POSSIBILI di `impact`.
+                if let Some((target_id, ResolutionStrategy::SameModule)) = &resolved {
+                    if target_id == source_id && target.contains('.') {
+                        let segs = target.split('.').filter(|s| !s.is_empty()).count();
+                        let direct_self =
+                            segs == 2 && first_segment(&target).is_some_and(is_self_receiver);
+                        if !direct_self {
+                            resolved = None;
+                        }
+                    }
+                }
 
                 let mut relation = match resolved {
                     Some((target_id, strategy)) => {
@@ -974,7 +993,7 @@ async fn resolve_target(
     // si legava all'unico omonimo del modulo — il metodo CHIAMANTE stesso: un
     // self-arco bugiardo, e il vero riferimento mai tra i POSSIBILI. Astensione:
     // il buco onesto riemerge nei POSSIBILI di `impact`, l'arco falso sparisce.
-    if (ctx.language == "typescript" || ctx.language == "javascript") && target.contains('.') {
+    if matches!(ctx.language, "typescript" | "javascript" | "python") && target.contains('.') {
         let segs: Vec<&str> = target.split('.').filter(|s| !s.is_empty()).collect();
         if segs.len() >= 3 && is_self_receiver(segs[0]) {
             return Ok(None);
@@ -1622,6 +1641,83 @@ mod tests {
     /// `UNIQUE(qualified_name)` e l'INTERA transazione fa rollback (misurato sul
     /// crate reale: serde_json → 0 entità salvate). Il resolver tiene UNA sola
     /// identità: «un'identità in meno è meglio di un indice che muore».
+    /// Regressione (misurata su DeepSpeed: 1.065 self-archi bugiardi): in Python il
+    /// gate web del Fix #10 era OFF, quindi `parser.parse_args()` DENTRO la funzione
+    /// `parse_args` si legava per nome nudo a SÉ STESSA (ricorsione mai scritta), e
+    /// `self.engine.run()` (catena ≥3) indovinava per nome. Due regole oneste: un
+    /// receiver puntato non è MAI la ricorsione del chiamante; le catene
+    /// `self.attr.metodo` si astengono. `self.helper()` (2 segmenti) resta risolto.
+    #[tokio::test]
+    async fn python_dotted_receiver_never_binds_to_the_enclosing_entity() {
+        let parsed = parse(
+            "app/cli.py",
+            r#"
+class Tool:
+    def helper(self):
+        pass
+
+    def parse_args(self):
+        self.helper()
+        return parser.parse_args()
+
+    def run(self):
+        return self.engine.run()
+"#,
+        )
+        .await;
+        let storage = SqliteStorage::in_memory().unwrap();
+        let delta = GraphResolver::new(None)
+            .resolve(&[parsed], &storage)
+            .await
+            .unwrap();
+        let id_of = |suffix: &str| {
+            delta
+                .added_entities
+                .iter()
+                .find(|e| e.qualified_name.ends_with(suffix))
+                .unwrap_or_else(|| panic!("manca {suffix}"))
+                .id
+        };
+        let parse_args = id_of("Tool::parse_args");
+        let run = id_of("Tool::run");
+        let helper = id_of("Tool::helper");
+
+        // NIENTE self-archi: né `parser.parse_args()` né `self.engine.run()` sono
+        // ricorsioni del chiamante.
+        for (name, id) in [("parse_args", parse_args), ("run", run)] {
+            assert!(
+                !delta
+                    .added_relations
+                    .iter()
+                    .any(|r| r.kind == RelationKind::Calls
+                        && r.source_id == id
+                        && r.target_id == id),
+                "{name}: un receiver puntato non deve produrre un self-arco"
+            );
+        }
+        // La catena self.attr.metodo resta un buco ONESTO col raw target.
+        assert!(
+            delta
+                .added_relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Unresolved
+                    && r.source_id == run
+                    && r.metadata.get("unresolved_target").map(String::as_str)
+                        == Some("self.engine.run")),
+            "self.engine.run deve restare Unresolved (astensione onesta)"
+        );
+        // E il self-receiver DIRETTO continua a risolvere.
+        assert!(
+            delta
+                .added_relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Calls
+                    && r.source_id == parse_args
+                    && r.target_id == helper),
+            "self.helper() (due segmenti) deve continuare a risolvere"
+        );
+    }
+
     /// Regressione del CASE 4 (A/B playwright, perso per 4 misure): in
     /// `FrameDispatcher.title()` la chiamata `this._frame.title(progress)` veniva
     /// "risolta" come SELF-CALL — il primo segmento `this` esonerava la catena dal
