@@ -966,6 +966,20 @@ async fn resolve_target(
     // dirottati dallo Stadio 2; ciò che resta qui è un valore a runtime. Se un
     // namespace sfuggito cadesse fin qui, astenersi è coerente con la tesi: un arco
     // mancante batte uno indovinato.
+    // Catena su PROPRIETÀ di this/self (`this._frame.title()`, ≥3 segmenti): il
+    // receiver REALE è la proprietà, di tipo IGNOTO — qui anche il guard Method-only
+    // del Fix #10 non basta, perché un METODO omonimo nello stesso modulo resta un
+    // indovinello type-blind. Misurato su playwright (la radice del CASE 4 perso in
+    // 4 collaudi): dentro `FrameDispatcher.title()`, `this._frame.title(progress)`
+    // si legava all'unico omonimo del modulo — il metodo CHIAMANTE stesso: un
+    // self-arco bugiardo, e il vero riferimento mai tra i POSSIBILI. Astensione:
+    // il buco onesto riemerge nei POSSIBILI di `impact`, l'arco falso sparisce.
+    if (ctx.language == "typescript" || ctx.language == "javascript") && target.contains('.') {
+        let segs: Vec<&str> = target.split('.').filter(|s| !s.is_empty()).collect();
+        if segs.len() >= 3 && is_self_receiver(segs[0]) {
+            return Ok(None);
+        }
+    }
     let foreign_member = (ctx.language == "typescript" || ctx.language == "javascript")
         && target.contains('.')
         && first_segment(target).is_some_and(|s| !is_self_receiver(s));
@@ -1608,6 +1622,80 @@ mod tests {
     /// `UNIQUE(qualified_name)` e l'INTERA transazione fa rollback (misurato sul
     /// crate reale: serde_json → 0 entità salvate). Il resolver tiene UNA sola
     /// identità: «un'identità in meno è meglio di un indice che muore».
+    /// Regressione del CASE 4 (A/B playwright, perso per 4 misure): in
+    /// `FrameDispatcher.title()` la chiamata `this._frame.title(progress)` veniva
+    /// "risolta" come SELF-CALL — il primo segmento `this` esonerava la catena dal
+    /// guard foreign (Fix #10) e il nome nudo `title` si legava all'unico omonimo
+    /// del modulo: il metodo chiamante stesso. Un arco bugiardo, e il vero
+    /// riferimento mai tra i POSSIBILI. `this.PROP.metodo` (≥3 segmenti) deve
+    /// restare Unresolved; `this.metodo()` (2 segmenti) deve continuare a risolvere.
+    #[tokio::test]
+    async fn this_property_member_call_stays_unresolved_not_a_self_arc() {
+        let parsed = parse_ts(
+            "src/dispatcher.ts",
+            r#"
+class FrameDispatcher {
+  private _frame: any;
+  helper(): void {}
+  title(progress: number): number {
+    this.helper();
+    return this._frame.title(progress);
+  }
+}
+"#,
+        )
+        .await;
+        let storage = SqliteStorage::in_memory().unwrap();
+        let delta = GraphResolver::new(None)
+            .resolve(&[parsed], &storage)
+            .await
+            .unwrap();
+
+        let title_id = delta
+            .added_entities
+            .iter()
+            .find(|e| e.qualified_name.ends_with("FrameDispatcher::title"))
+            .expect("il metodo title esiste")
+            .id;
+        // NESSUN self-arco: title NON chiama sé stesso (la chiamata è su _frame).
+        assert!(
+            !delta
+                .added_relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Calls
+                    && r.source_id == title_id
+                    && r.target_id == title_id),
+            "this._frame.title NON deve diventare un self-arco bugiardo"
+        );
+        // Il riferimento resta un buco ONESTO, ritrovabile tra i POSSIBILI.
+        assert!(
+            delta
+                .added_relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Unresolved
+                    && r.source_id == title_id
+                    && r.metadata.get("unresolved_target").map(String::as_str)
+                        == Some("this._frame.title")),
+            "this._frame.title deve restare Unresolved (astensione onesta)"
+        );
+        // E il self-receiver DIRETTO continua a risolvere: this.helper() → helper.
+        let helper_id = delta
+            .added_entities
+            .iter()
+            .find(|e| e.qualified_name.ends_with("FrameDispatcher::helper"))
+            .unwrap()
+            .id;
+        assert!(
+            delta
+                .added_relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Calls
+                    && r.source_id == title_id
+                    && r.target_id == helper_id),
+            "this.helper() (due segmenti) deve continuare a risolvere same-module"
+        );
+    }
+
     /// Regressione (campagna 50 progetti): in Go un tipo con metodi sparsi su più
     /// file dello stesso package si frammentava in N entità omonime (gin.Context ×2,
     /// uuid.UUID ×2) — il parser sintetizza il tipo del ricevente per-file, e senza
