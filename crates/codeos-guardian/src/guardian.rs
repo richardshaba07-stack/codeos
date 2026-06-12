@@ -82,6 +82,45 @@ fn repo_root_from(env_repo: Option<String>, cwd: &Path) -> PathBuf {
     }
 }
 
+/// `true` se `ref_name` esiste nel repo (branch/tag/commit). Sonda economica via
+/// `git rev-parse --verify --quiet`.
+fn git_ref_exists(repo_dir: &Path, ref_name: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{ref_name}^{{commit}}"))
+        .output()
+        .map(|o| o.status.success())
+        .is_ok_and(|ok| ok)
+}
+
+/// Il branch di DEFAULT del repo, rilevato (mai indovinato): prima il default
+/// dichiarato dal remote (`origin/HEAD`), poi i nomi convenzionali che ESISTONO
+/// (`main`, `master`). `None` se nessuno esiste — il chiamante decide come
+/// fallire, onestamente.
+fn default_base_ref(repo_dir: &Path) -> Option<String> {
+    if let Ok(out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
+        .output()
+    {
+        if out.status.success() {
+            let full = String::from_utf8_lossy(&out.stdout);
+            if let Some(name) = full.trim().rsplit('/').next() {
+                if !name.is_empty() && git_ref_exists(repo_dir, name) {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    ["main", "master"]
+        .into_iter()
+        .find(|c| git_ref_exists(repo_dir, c))
+        .map(str::to_string)
+}
+
 /// Righe AGGIUNTE (lato `head`) di un file, dal diff unificato a contesto 0.
 /// `git diff -U0 base..head -- file` → parsing degli header di hunk `@@ -a,b +c,d @@`:
 /// il lato `+c,d` dà l'intervallo `[c, c+d-1]` di righe nuove a `head`. Serve a `pr_mri`
@@ -1392,6 +1431,24 @@ impl Guardian {
         // risalita a `.git` → CWD): `mri` non richiede più che il server giri
         // esattamente nella root del repo git.
         let repo_dir = resolve_repo_root();
+        // Base VUOTA = «usa il default del repo». "main" è solo una convenzione: i
+        // repo storici usano `master` (l'unico vero bug della campagna dei 50
+        // progetti: `mri` senza --base falliva exit-128 su anyhow, branch master).
+        // Il rilevamento avviene SOLO senza base esplicita: un --base sbagliato
+        // scritto dall'utente deve fallire onestamente, mai essere "corretto" di
+        // nascosto (maschererebbe i typo).
+        let base = if base.trim().is_empty() {
+            default_base_ref(&repo_dir).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "PrMri: nessuna base indicata e nessun branch di default \
+                     rilevabile (origin/HEAD, main, master assenti). Indica \
+                     --base <ref> esplicitamente."
+                )
+            })?
+        } else {
+            base.to_string()
+        };
+        let base = base.as_str();
         let mut cmd = std::process::Command::new("git");
         cmd.arg("-C")
             .arg(&repo_dir)
@@ -3482,6 +3539,54 @@ mod tests {
             "uno spostamento reale con un chiamante deve elencare dipendenze: {:?}",
             sim.dependencies_to_rewrite
         );
+    }
+
+    #[test]
+    fn default_base_ref_detects_master_only_repos() {
+        // L'unico vero bug della campagna dei 50 progetti: `mri` senza --base
+        // assumeva `main` e falliva exit-128 sui repo storici con `master`
+        // (anyhow). Il rilevamento deve trovare `master` quando `main` non c'è —
+        // e None su una dir non-git (il chiamante fallisce onestamente).
+        let tmp = std::env::temp_dir().join(format!("codeos-mri-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&tmp)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q", "--initial-branch=master"]);
+        std::fs::write(tmp.join("a.txt"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "primo"]);
+
+        assert_eq!(
+            default_base_ref(&tmp).as_deref(),
+            Some("master"),
+            "su un repo solo-master il default rilevato è master"
+        );
+
+        let non_git = tmp.join("sotto-non-git");
+        std::fs::create_dir_all(&non_git).unwrap();
+        // (una sottodir di un repo git è ancora nel repo: usa una dir davvero fuori)
+        let outside = std::env::temp_dir().join(format!("codeos-nongit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        assert_eq!(
+            default_base_ref(&outside),
+            None,
+            "fuori da un repo git non c'è un default da rilevare"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[tokio::test]

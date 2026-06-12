@@ -241,7 +241,10 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", res.formatted_markdown);
         }
         "mri" => {
-            let mut base = "main".to_string();
+            // Base vuota = «branch di default del repo», rilevato dal SERVER
+            // (origin/HEAD → main → master). "main" fisso era l'unico vero bug
+            // della campagna dei 50 progetti: exit-128 sui repo con `master`.
+            let mut base = String::new();
             let mut head = "HEAD".to_string();
             let mut i = 2;
             while i < args.len() {
@@ -751,7 +754,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "mri [--base <ref>] [--head <ref>]",
-        "\"MRI\" architetturale di un PR: confronta due ref git (default: main..HEAD) e misura il rischio.",
+        "\"MRI\" architetturale di un PR: confronta due ref git e misura il rischio. Senza --base usa il branch di default del repo (origin/HEAD → main → master), rilevato non indovinato.",
     ),
     (
         "decide --title \"…\" --why \"…\" [--boundary \"a|b\"] [--tags …]",
