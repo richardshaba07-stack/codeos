@@ -103,6 +103,10 @@ pub enum Command {
         head: String,
         reply_to: mpsc::Sender<anyhow::Result<PrMriResponse>>,
     },
+    /// Scansione licenze delle dipendenze + policy dal ledger di intento.
+    LicenseReport {
+        reply_to: mpsc::Sender<anyhow::Result<LicenseReportResponse>>,
+    },
     /// Time machine architetturale: perché esiste un confine o regola
     Why {
         expr: String,
@@ -627,6 +631,36 @@ pub struct PrMriResponse {
     pub impacted_tests: Vec<String>,
     pub risk_score: String, // "low", "medium", "high"
     pub summary: String,
+}
+
+/// La licenza dichiarata di una dipendenza diretta (scanner licenze v1).
+#[derive(Debug, Clone)]
+pub struct DependencyLicenseInfo {
+    pub name: String,
+    pub ecosystem: String,
+    /// Vuota = SCONOSCIUTA (astensione: il metadato locale non c'è).
+    pub license: String,
+    pub source: String,
+}
+
+/// Violazione di policy: licenza che contiene un identificatore vietato da
+/// una decisione del ledger.
+#[derive(Debug, Clone)]
+pub struct LicenseViolationInfo {
+    pub dependency: String,
+    pub license: String,
+    pub denied: String,
+    pub decision_title: String,
+}
+
+/// Risposta della scansione licenze.
+#[derive(Debug, Clone)]
+pub struct LicenseReportResponse {
+    pub dependencies: Vec<DependencyLicenseInfo>,
+    pub violations: Vec<LicenseViolationInfo>,
+    /// Quanti id vietati la policy del ledger dichiara (0 = nessuna policy:
+    /// le violazioni non possono esistere e il report lo dice).
+    pub denied_count: u32,
 }
 
 #[derive(Debug, Clone, Default)]

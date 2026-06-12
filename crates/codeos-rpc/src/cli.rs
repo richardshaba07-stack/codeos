@@ -288,6 +288,58 @@ async fn main() -> anyhow::Result<()> {
                 println!("  • {}", t);
             }
         }
+        "licenses" => {
+            let mut client = connect_server().await?;
+            let res = client
+                .licenses(proto::LicensesRequest {})
+                .await?
+                .into_inner();
+            println!("📜 LICENZE DELLE DIPENDENZE (dichiarate nei metadati locali)");
+            println!("------------------------------------------------------------");
+            let known = res
+                .dependencies
+                .iter()
+                .filter(|d| !d.license.is_empty())
+                .count();
+            let unknown = res.dependencies.len() - known;
+            println!(
+                "  {} dipendenze · {} con licenza dichiarata · {} sconosciute (astensione, mai indovinate)\n",
+                res.dependencies.len(), known, unknown
+            );
+            for d in &res.dependencies {
+                if d.license.is_empty() {
+                    println!(
+                        "  ? {:<28} [{}]  licenza SCONOSCIUTA — metadato locale assente",
+                        d.name, d.ecosystem
+                    );
+                } else {
+                    println!("  • {:<28} [{}]  {}", d.name, d.ecosystem, d.license);
+                }
+            }
+            println!();
+            if res.denied_count == 0 {
+                println!("⚖️  POLICY: nessun divieto nel ledger. Per impostarne uno:");
+                println!("    codeos decide --title \"niente GPL nel prodotto\" --why \"…\" --tags \"license-deny:GPL-3.0\"");
+            } else if res.violations.is_empty() {
+                println!(
+                    "✅ POLICY: nessuna violazione ({} divieti attivi dal ledger).",
+                    res.denied_count
+                );
+            } else {
+                println!(
+                    "🔴 POLICY: {} violazioni ({} divieti attivi):",
+                    res.violations.len(),
+                    res.denied_count
+                );
+                for v in &res.violations {
+                    println!(
+                        "  • {} — licenza «{}» contiene «{}» — vietato da: «{}»",
+                        v.dependency, v.license, v.denied, v.decision_title
+                    );
+                }
+                std::process::exit(1);
+            }
+        }
         "decide" => {
             // La PORTA di scrittura del ledger di intento — lo strato non-derivabile
             // del moat: un umano (o un agente) registra il PERCHÉ che git non dice.
@@ -756,6 +808,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "mri [--base <ref>] [--head <ref>]",
         "\"MRI\" architetturale di un PR: confronta due ref git e misura il rischio. Senza --base usa il branch di default del repo (origin/HEAD → main → master), rilevato non indovinato.",
+    ),
+    (
+        "licenses",
+        "Scansiona le licenze delle dipendenze (metadati locali; sconosciuta = astensione) e le confronta con la policy del ledger (decisioni con tag license-deny:<ID>). Exit 1 su violazioni.",
     ),
     (
         "decide --title \"…\" --why \"…\" [--boundary \"a|b\"] [--tags …]",

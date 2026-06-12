@@ -1647,6 +1647,50 @@ impl Guardian {
         })
     }
 
+    /// Scansione LICENZE delle dipendenze + policy dal ledger di intento.
+    /// Le licenze vengono dai metadati LOCALI (registry cache cargo, node_modules);
+    /// assente = «sconosciuta», mai indovinata. La policy sono le decisioni correnti
+    /// con tag `license-deny:<ID>`: il razionale del divieto vive nel ledger, il
+    /// report lo CITA (fatti, mai conclusioni legali).
+    pub async fn license_report(&self) -> anyhow::Result<codeos_types::bus::LicenseReportResponse> {
+        let repo = resolve_repo_root();
+        let scanned = crate::license::scan_licenses(&repo);
+
+        let mut denied: Vec<(String, String)> = Vec::new();
+        if let Some(store) = &self.decisions {
+            if let Ok(current) = store.current_decisions().await {
+                for d in &current {
+                    for id in crate::license::denied_ids_from_tags(&d.tags) {
+                        denied.push((id, d.title.clone()));
+                    }
+                }
+            }
+        }
+        let violations = crate::license::check_policy(&scanned, &denied);
+
+        Ok(codeos_types::bus::LicenseReportResponse {
+            dependencies: scanned
+                .into_iter()
+                .map(|d| codeos_types::bus::DependencyLicenseInfo {
+                    name: d.name,
+                    ecosystem: d.ecosystem,
+                    license: d.license.unwrap_or_default(),
+                    source: d.source,
+                })
+                .collect(),
+            violations: violations
+                .into_iter()
+                .map(|v| codeos_types::bus::LicenseViolationInfo {
+                    dependency: v.dependency,
+                    license: v.license,
+                    denied: v.denied,
+                    decision_title: v.decision_title,
+                })
+                .collect(),
+            denied_count: denied.len() as u32,
+        })
+    }
+
     pub async fn why(&self, expr: &str) -> anyhow::Result<codeos_types::bus::WhyResponse> {
         let parts: Vec<&str> = if expr.contains('|') {
             expr.split('|').collect()

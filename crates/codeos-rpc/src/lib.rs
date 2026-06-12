@@ -627,6 +627,46 @@ impl CodeOs for CodeOsService {
         }))
     }
 
+    async fn licenses(
+        &self,
+        _request: Request<proto::LicensesRequest>,
+    ) -> Result<Response<proto::LicensesResponse>, Status> {
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::LicenseReport { reply_to })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+        let res = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian actor"))?
+            .map_err(|e| Status::internal(format!("license_report fallita: {e}")))?;
+        Ok(Response::new(proto::LicensesResponse {
+            dependencies: res
+                .dependencies
+                .into_iter()
+                .map(|d| proto::DependencyLicense {
+                    name: d.name,
+                    ecosystem: d.ecosystem,
+                    license: d.license,
+                    source: d.source,
+                })
+                .collect(),
+            violations: res
+                .violations
+                .into_iter()
+                .map(|v| proto::LicenseViolation {
+                    dependency: v.dependency,
+                    license: v.license,
+                    denied: v.denied,
+                    decision_title: v.decision_title,
+                })
+                .collect(),
+            denied_count: res.denied_count,
+        }))
+    }
+
     async fn why(
         &self,
         request: Request<proto::WhyRequest>,

@@ -19,6 +19,7 @@ mod actor;
 mod declared;
 mod guardian;
 mod invariant;
+pub mod license;
 mod meta;
 
 pub use actor::GuardianActor;

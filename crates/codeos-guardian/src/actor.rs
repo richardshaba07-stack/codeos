@@ -179,6 +179,13 @@ impl GuardianActor {
                 let res = self.guardian.pr_mri(&base, &head).await;
                 let _ = reply_to.send(res).await;
             }
+            Command::LicenseReport { reply_to } => {
+                let result = self.guardian.license_report().await;
+                if let Err(err) = &result {
+                    tracing::warn!(error = %err, "GuardianActor: license_report fallita");
+                }
+                let _ = reply_to.send(result).await;
+            }
             Command::Why { expr, reply_to } => {
                 let res = self.guardian.why(&expr).await;
                 let _ = reply_to.send(res).await;

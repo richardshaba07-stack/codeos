@@ -250,6 +250,7 @@ async fn dispatch_loop(mut commands: mpsc::Receiver<Command>, routes: Routes) {
             | Command::GuardAfter { .. }
             | Command::GetContextPack { .. }
             | Command::PrMri { .. }
+            | Command::LicenseReport { .. }
             | Command::Why { .. }
             | Command::Simulate { .. } => (&routes.guardian, "guardian"),
         };

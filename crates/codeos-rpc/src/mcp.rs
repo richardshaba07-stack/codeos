@@ -179,6 +179,11 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "codeos_licenses",
+            "description": "Licenze delle dipendenze (dai metadati locali; vuota = sconosciuta, mai indovinata) + violazioni della policy del ledger (decisioni con tag license-deny:<ID>). Da chiamare PRIMA di aggiungere una dipendenza.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
             "name": "codeos_report",
             "description": "Referto architetturale in JSON: invarianti di layering (confidenza Wilson calibrata su git), candidati in formazione, fossili di decisione, lacune, qualità del grafo. Per orientarsi prima di toccare l'architettura.",
             "inputSchema": {"type": "object", "properties": {}}
@@ -321,6 +326,39 @@ async fn dispatch_tool(name: &str, args: &Value) -> anyhow::Result<String> {
                  Riemerge in codeos_why, codeos_query e codeos_context_pack.",
                 res.decision_id
             ))
+        }
+        "codeos_licenses" => {
+            let mut client = connect_server().await?;
+            let res = client
+                .licenses(proto::LicensesRequest {})
+                .await?
+                .into_inner();
+            let mut out = String::new();
+            for d in &res.dependencies {
+                let lic = if d.license.is_empty() {
+                    "SCONOSCIUTA"
+                } else {
+                    d.license.as_str()
+                };
+                out.push_str(&format!("{} [{}]: {}\n", d.name, d.ecosystem, lic));
+            }
+            if res.denied_count == 0 {
+                out.push_str("\nPOLICY: nessun divieto nel ledger (registrane con codeos_decide, tag license-deny:<ID>).");
+            } else if res.violations.is_empty() {
+                out.push_str(&format!(
+                    "\nPOLICY: nessuna violazione ({} divieti attivi).",
+                    res.denied_count
+                ));
+            } else {
+                out.push_str(&format!("\nPOLICY: {} VIOLAZIONI:\n", res.violations.len()));
+                for v in &res.violations {
+                    out.push_str(&format!(
+                        "- {} — «{}» contiene «{}» — vietato da: «{}»\n",
+                        v.dependency, v.license, v.denied, v.decision_title
+                    ));
+                }
+            }
+            Ok(out)
         }
         "codeos_report" => {
             let mut client = connect_server().await?;

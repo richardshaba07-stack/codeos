@@ -381,6 +381,29 @@ message SimulateResponse {
   repeated string recommendation_plan = 5;
 }
 
+// Licenses — scansione licenze delle dipendenze + policy dal ledger.
+message LicensesRequest {}
+
+message DependencyLicense {
+  string name = 1;
+  string ecosystem = 2;
+  string license = 3;  // vuota = sconosciuta (astensione)
+  string source = 4;
+}
+
+message LicenseViolation {
+  string dependency = 1;
+  string license = 2;
+  string denied = 3;
+  string decision_title = 4;
+}
+
+message LicensesResponse {
+  repeated DependencyLicense dependencies = 1;
+  repeated LicenseViolation violations = 2;
+  uint32 denied_count = 3;
+}
+
 message WhyRequest {
   string expr = 1;
 }
@@ -419,5 +442,6 @@ service CodeOs {
   rpc GetContextPack(GetContextPackRequest) returns (GetContextPackResponse);
   rpc PrMri(PrMriRequest) returns (PrMriResponse);
   rpc Simulate(SimulateRequest) returns (SimulateResponse);
+  rpc Licenses(LicensesRequest) returns (LicensesResponse);
   rpc Why(WhyRequest) returns (WhyResponse);
 }
