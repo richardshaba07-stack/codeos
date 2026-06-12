@@ -137,7 +137,7 @@ impl QueryEngine {
         // porta un peso di SPECIFICITÀ: una keyword rara (matcha poche entità, es.
         // `compress`) è un segnale forte; una comune (matcha tante entità, tipica della
         // prosa) è rumore. Serve a NON far diluire il seme giusto tra molti semi-rumore.
-        let (seeds, seed_specificity) = self.find_seeds(&keywords).await?;
+        let (seeds, seed_specificity, literal_seeds) = self.find_seeds(&keywords).await?;
         if seeds.is_empty() {
             return Ok(QueryResponse {
                 formatted_context: format!(
@@ -155,7 +155,9 @@ impl QueryEngine {
         }
 
         // Passi 4-5 — Espansione BFS con punteggio di rilevanza.
-        let expansion = self.expand(&seeds, &seed_specificity).await?;
+        let expansion = self
+            .expand(&seeds, &seed_specificity, &literal_seeds)
+            .await?;
 
         // Seleziona le entità più rilevanti (punteggio decrescente, cap a max).
         let mut selected = select_top(
@@ -275,40 +277,100 @@ impl QueryEngine {
     /// di prosa). Peso ∝ 1/match_count, sommato sui keyword: un'entità che combacia con
     /// PIÙ parole della query, o con parole più rare, ha specificità maggiore — così in
     /// `select_top` il seme GIUSTO non viene diluito tra molti semi-rumore equi-boostati.
+    ///
+    /// FALLBACK CROSS-LINGUA (la frontiera misurata dal metro: query in italiano,
+    /// entità in inglese — «Scansione LICENZE» non trovava mai `scan_licenses`).
+    /// SOLO quando il letterale matcha ZERO entità si tentano, nell'ordine:
+    /// (1) le traduzioni del glossario IT→EN dichiarato (radici diverse:
+    /// confine→boundary); (2) la RADICE per prefisso più lungo (radici latine
+    /// comuni: licenze→licen→license). Onestà: mai attivo se il letterale
+    /// funziona (zero rumore aggiunto alle query che già localizzano) e peso
+    /// DIMEZZATO (un'ipotesi morfologica vale meno di un match letterale).
     async fn find_seeds(
         &self,
         keywords: &[String],
-    ) -> anyhow::Result<(Vec<Entity>, HashMap<EntityId, u32>)> {
+    ) -> anyhow::Result<(Vec<Entity>, HashMap<EntityId, u32>, HashSet<EntityId>)> {
         let mut by_id: HashMap<EntityId, Entity> = HashMap::new();
         let mut specificity: HashMap<EntityId, u32> = HashMap::new();
+        let mut literal: HashSet<EntityId> = HashSet::new();
         for keyword in keywords {
-            // Le dipendenze esterne (std, tokio, react…) non sono dove si fa una modifica:
-            // non vanno mai come seme né nel contesto. `is_external` per qualname non le
-            // cattura (il loro nome è il pacchetto, non `std::`), quindi escludiamo per
-            // KIND — stesso discrimine di L0/L1.
-            let matches: Vec<Entity> = self
-                .storage
-                .find_entities_by_name_pattern(keyword)
-                .await?
-                .into_iter()
-                .filter(|e| e.kind != EntityKind::ExternalDependency)
-                .collect();
+            let mut matches = self.seed_matches(keyword).await?;
+            // Peso pieno per il match letterale; dimezzato per i fallback.
+            let mut discount: u32 = 1;
+            if matches.is_empty() {
+                discount = 2;
+                for translation in glossary_translations(keyword) {
+                    matches.extend(self.seed_matches(translation).await?);
+                }
+                if matches.is_empty() {
+                    matches = self.stem_matches(keyword).await?;
+                }
+                // Le vie di fallback possono sovrapporsi: dedup per id.
+                let mut seen = HashSet::new();
+                matches.retain(|e| seen.insert(e.id));
+            }
             if matches.is_empty() {
                 continue;
             }
-            let weight = (SPEC_SCALE / matches.len() as u32).max(1);
+            let weight = (SPEC_SCALE / (discount * matches.len() as u32)).max(1);
             for entity in matches {
                 *specificity.entry(entity.id).or_insert(0) += weight;
+                if discount == 1 {
+                    literal.insert(entity.id);
+                }
                 by_id.entry(entity.id).or_insert(entity);
             }
         }
-        Ok((by_id.into_values().collect(), specificity))
+        // Ordine DETERMINISTICO dei semi: l'iterazione della HashMap cambia a ogni
+        // processo e l'ordine dei semi influenza l'espansione ⇒ due query identiche
+        // davano contesti diversi (flip 0→1 osservato dal metro a parità di binario).
+        // Una misura che balla non è una misura.
+        let mut seeds: Vec<Entity> = by_id.into_values().collect();
+        seeds.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+        Ok((seeds, specificity, literal))
+    }
+
+    /// Le entità il cui qualified_name contiene `pattern`, senza le dipendenze
+    /// esterne: std/tokio/react… non sono dove si fa una modifica — non vanno
+    /// mai come seme né nel contesto (`is_external` per qualname non le cattura,
+    /// il loro nome è il pacchetto; si esclude per KIND, stesso discrimine di
+    /// L0/L1).
+    async fn seed_matches(&self, pattern: &str) -> anyhow::Result<Vec<Entity>> {
+        Ok(self
+            .storage
+            .find_entities_by_name_pattern(pattern)
+            .await?
+            .into_iter()
+            .filter(|e| e.kind != EntityKind::ExternalDependency)
+            .collect())
+    }
+
+    /// Fallback per RADICE: il prefisso PIÙ LUNGO della keyword (≥ MIN_STEM_LEN)
+    /// che matcha almeno un'entità. Le radici latine comuni a italiano e inglese
+    /// si incontrano lì: «licenze»→«licen»(license), «scansione»→«scan»,
+    /// «quadratica»→«quadrat»(quadratic). Deterministico; il rumore di una
+    /// radice corta è già smorzato dal peso ∝ 1/match_count (IDF) e dal
+    /// dimezzamento da fallback.
+    async fn stem_matches(&self, keyword: &str) -> anyhow::Result<Vec<Entity>> {
+        let chars: Vec<char> = keyword.chars().collect();
+        if chars.len() <= MIN_STEM_LEN {
+            return Ok(Vec::new());
+        }
+        for len in (MIN_STEM_LEN..chars.len()).rev() {
+            let stem: String = chars[..len].iter().collect();
+            let matches = self.seed_matches(&stem).await?;
+            if !matches.is_empty() {
+                return Ok(matches);
+            }
+        }
+        Ok(Vec::new())
     }
 
     async fn expand(
         &self,
         seeds: &[Entity],
         seed_specificity: &HashMap<EntityId, u32>,
+        literal_seeds: &HashSet<EntityId>,
     ) -> anyhow::Result<Expansion> {
         let mut entities: HashMap<EntityId, Entity> = HashMap::new();
         let mut scores: HashMap<EntityId, u32> = HashMap::new();
@@ -376,9 +438,20 @@ impl QueryEngine {
         // zoccolo comune) garantisce che ogni seme superi qualunque nodo di pura
         // espansione; la SPECIFICITÀ (sopra lo zoccolo) ordina i semi TRA loro, così un
         // match raro/preciso batte i semi-rumore di una keyword comune di prosa.
+        //
+        // I semi di FALLBACK (cross-lingua: glossario/radice) NON ricevono lo zoccolo:
+        // vivono di sola specificità. Misurato dal metro: col bonus pieno, una keyword
+        // di prosa caduta in fallback inondava il top-k di semi-ipotesi sfrattando i
+        // nodi di espansione veri (fix #1: 5/6 → 2/6). Così la gerarchia è
+        // architetturale: letterale > fallback-specifico > espansione ≈ fallback-vago.
         for seed in seeds {
             let spec = seed_specificity.get(&seed.id).copied().unwrap_or(0);
-            *scores.entry(seed.id).or_insert(0) += SEED_BONUS + spec;
+            let bonus = if literal_seeds.contains(&seed.id) {
+                SEED_BONUS
+            } else {
+                0
+            };
+            *scores.entry(seed.id).or_insert(0) += bonus + spec;
         }
 
         Ok(Expansion {
@@ -1451,6 +1524,51 @@ fn extract_keywords(text: &str) -> Vec<String> {
     keywords
 }
 
+/// Lunghezza minima della RADICE nel fallback per prefisso (`stem_matches`):
+/// sotto i 4 caratteri un prefisso matcha mezzo dizionario — rumore, non radice.
+const MIN_STEM_LEN: usize = 4;
+
+/// GLOSSARIO IT→EN del vocabolario strutturale di sviluppo — il fallback per le
+/// coppie a RADICE DIVERSA che il prefisso non può unire (confine/boundary,
+/// foglia/leaf). Curato e dichiarato, non un dizionario: ogni voce è un termine
+/// che ricorre nelle query reali su codebase con nomi inglesi. Deterministico
+/// e tracciabile (la traduzione è un fatto del glossario, non un'inferenza);
+/// usato SOLO quando il letterale matcha zero (vedi `find_seeds`).
+fn glossary_translations(keyword: &str) -> &'static [&'static str] {
+    match keyword {
+        "confine" | "confini" => &["boundary", "boundaries"],
+        "foglia" | "foglie" => &["leaf"],
+        "seme" | "semi" => &["seed"],
+        "storia" | "storie" => &["history", "story"],
+        "misura" | "misure" => &["measure", "metric"],
+        "cammino" | "cammini" => &["path"],
+        "percorso" | "percorsi" => &["path"],
+        "arco" | "archi" => &["edge"],
+        "nodo" | "nodi" => &["node"],
+        "grafo" | "grafi" => &["graph"],
+        "chiamata" | "chiamate" => &["call"],
+        "chiamante" | "chiamanti" => &["caller"],
+        "dipendenza" | "dipendenze" => &["dependency", "dependencies"],
+        "ricerca" | "ricerche" => &["search", "find"],
+        "attesa" | "attese" => &["wait"],
+        "soglia" | "soglie" => &["threshold"],
+        "riga" | "righe" => &["line"],
+        "buco" | "buchi" => &["gap", "hole"],
+        "prova" | "prove" => &["evidence", "proof"],
+        "sicurezza" => &["security"],
+        "velocita" | "velocità" => &["speed"],
+        "pulizia" => &["cleanup"],
+        "rumore" => &["noise"],
+        "tetto" => &["cap", "limit"],
+        "vincolo" | "vincoli" => &["constraint", "invariant"],
+        "regola" | "regole" => &["rule"],
+        "fossile" | "fossili" => &["fossil"],
+        "nascita" | "nascite" => &["birth", "born"],
+        "lacuna" | "lacune" => &["gap"],
+        _ => &[],
+    }
+}
+
 /// Stopword minime (italiano + inglese). Non esaustivo: per la v1 basta togliere
 /// le parole-funzione più comuni che inquinerebbero i semi.
 fn is_stopword(token: &str) -> bool {
@@ -2307,6 +2425,87 @@ mod tests {
         assert!(!response
             .formatted_context
             .contains("DECISIONI ARCHITETTURALI"));
+    }
+
+    #[tokio::test]
+    async fn cross_lingua_fallback_finds_seeds_only_when_literal_fails() {
+        // La frontiera misurata dal metro (test_findings §O): «Scansione LICENZE»
+        // in italiano non trovava MAI `scan_licenses` in inglese (0/9). Il
+        // fallback deve unirle: «licenze» per RADICE (licen→license), «confine»
+        // per GLOSSARIO (boundary, radice diversa).
+        let storage = graph_from(
+            "app.py",
+            "def scan_licenses():\n    pass\n\n\
+             def check_boundary():\n    pass\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        // Radice per prefisso: «licenze» → stem «licen» → scan_licenses.
+        let response = engine.query(&nl("scansione licenze")).await.unwrap();
+        assert!(
+            response
+                .entities
+                .iter()
+                .any(|e| e.qualified_name.contains("scan_licenses")),
+            "il fallback per radice deve trovare scan_licenses: {:?}",
+            response
+                .entities
+                .iter()
+                .map(|e| &e.qualified_name)
+                .collect::<Vec<_>>()
+        );
+
+        // Glossario: «confine» → boundary (nessuna radice comune).
+        let response = engine.query(&nl("ripara il confine")).await.unwrap();
+        assert!(
+            response
+                .entities
+                .iter()
+                .any(|e| e.qualified_name.contains("check_boundary")),
+            "il glossario deve tradurre confine→boundary: {:?}",
+            response
+                .entities
+                .iter()
+                .map(|e| &e.qualified_name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn literal_match_disables_fallback_no_noise_added() {
+        // Onestà del fallback: se il LETTERALE matcha, niente vie morfologiche —
+        // una query che già funziona non deve ricevere semi-rumore. «confine»
+        // qui matcha letteralmente `confine_zone`: la traduzione di glossario
+        // (boundary) NON deve aggiungere `boundary_helper` ai semi.
+        let storage = graph_from(
+            "app.py",
+            "def confine_zone():\n    pass\n\n\
+             def boundary_helper():\n    pass\n",
+        )
+        .await;
+        let engine = QueryEngine::new(storage);
+
+        let response = engine.query(&nl("confine")).await.unwrap();
+        assert!(
+            response
+                .entities
+                .iter()
+                .any(|e| e.qualified_name.contains("confine_zone")),
+            "il letterale resta il match primario"
+        );
+        assert!(
+            !response
+                .entities
+                .iter()
+                .any(|e| e.qualified_name.contains("boundary_helper")),
+            "col letterale vivo il glossario NON deve aggiungere semi: {:?}",
+            response
+                .entities
+                .iter()
+                .map(|e| &e.qualified_name)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
