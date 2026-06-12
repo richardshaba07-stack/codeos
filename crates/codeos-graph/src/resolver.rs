@@ -307,7 +307,7 @@ impl GraphResolver {
                     continue;
                 };
 
-                let mut resolved = resolve_target(&rctx, &target).await?;
+                let mut resolved = resolve_target(&rctx, &target, parsed.kind).await?;
 
                 // Una chiamata con receiver PUNTATO (`x.foo()`) non può mai essere la
                 // ricorsione dell'entità chiamante: la ricorsione vera si scrive
@@ -323,6 +323,32 @@ impl GraphResolver {
                         let direct_self =
                             segs == 2 && first_segment(&target).is_some_and(is_self_receiver);
                         if !direct_self {
+                            resolved = None;
+                        }
+                    }
+                }
+
+                // Una CHIAMATA non può avere come bersaglio un MODULO/PROGETTO: un
+                // file non si invoca, in nessuno dei linguaggi supportati. Il bind
+                // accade da DUE porte (lookup_exact quando il qname del modulo
+                // coincide col target; lo stadio per nome nudo altrimenti — 13 archi
+                // misurati su DeepSpeed, tutti falsi, es. `setup()` di setup.py
+                // legato al Module omonimo). Il guard sta QUI, al call-site, così
+                // copre ogni strategia; il fall-through onesto è il Passo 3.4
+                // (esternalizzazione via import: `external::setuptools`) o Unresolved.
+                if parsed.kind == RelationKind::Calls {
+                    if let Some((target_id, _)) = &resolved {
+                        let tkind = match new_by_id_kind.get(target_id) {
+                            Some(k) => Some(*k),
+                            None => storage.get_entity_by_id(target_id).await?.map(|e| e.kind),
+                        };
+                        if matches!(
+                            tkind,
+                            Some(
+                                codeos_types::EntityKind::Module
+                                    | codeos_types::EntityKind::Project
+                            )
+                        ) {
                             resolved = None;
                         }
                     }
@@ -867,6 +893,7 @@ struct ResolutionContext<'a> {
 async fn resolve_target(
     ctx: &ResolutionContext<'_>,
     target: &str,
+    kind: RelationKind,
 ) -> anyhow::Result<Option<(EntityId, ResolutionStrategy)>> {
     // 0 — Import path normalisation. I parser mantengono i target come li scrive
     // il linguaggio (`crate::x`, `codeos_types::x`, `./client`); qui li traduciamo
@@ -1010,6 +1037,19 @@ async fn resolve_target(
                     .get(id)
                     .is_some_and(|t_lang| language_matches(ctx.language, t_lang))
             })
+            // Una CHIAMATA non può avere come bersaglio un MODULO (un file non si
+            // invoca, in nessuno dei linguaggi supportati): il match per nome nudo
+            // che legava `setup()` di setup.py al Module omonimo era un arco
+            // bugiardo (13 misurati su DeepSpeed, tutti falsi). Il fall-through
+            // onesto è l'esternalizzazione (Passo 3.4: l'import dice la verità,
+            // `external::setuptools`) o l'Unresolved.
+            .filter(|(id, _)| {
+                kind != RelationKind::Calls
+                    || !matches!(
+                        ctx.new_by_id_kind.get(id),
+                        Some(codeos_types::EntityKind::Module | codeos_types::EntityKind::Project)
+                    )
+            })
             .filter(|(_, qname)| qname.starts_with(ctx.module_prefix))
             // Fix #10: receiver-membro foreign ⇒ solo Method (mai una Function libera).
             .filter(|(id, _)| {
@@ -1042,6 +1082,14 @@ async fn resolve_target(
             language_matches(ctx.language, &t_lang)
         })
         .filter(|e| e.qualified_name.starts_with(ctx.module_prefix))
+        // Stessa regola del batch: mai una Call legata a un Module/Project.
+        .filter(|e| {
+            kind != RelationKind::Calls
+                || !matches!(
+                    e.kind,
+                    codeos_types::EntityKind::Module | codeos_types::EntityKind::Project
+                )
+        })
         // Fix #10: stesso guard del batch, applicato anche al fallback su DB.
         .filter(|e| !foreign_member || e.kind == codeos_types::EntityKind::Method)
         .collect();
@@ -1641,6 +1689,48 @@ mod tests {
     /// `UNIQUE(qualified_name)` e l'INTERA transazione fa rollback (misurato sul
     /// crate reale: serde_json → 0 entità salvate). Il resolver tiene UNA sola
     /// identità: «un'identità in meno è meglio di un indice che muore».
+    /// Regressione (misurata su DeepSpeed: 13 archi Calls→Module, tutti falsi): in
+    /// `setup.py`, `from setuptools import setup` + la chiamata `setup(...)` veniva
+    /// legata per nome nudo all'entità MODULE omonima (il file stesso) — ma un modulo
+    /// non si invoca. Il fall-through onesto è l'esternalizzazione via import
+    /// (`external::setuptools`), mai il Module locale.
+    #[tokio::test]
+    async fn bare_call_never_binds_to_a_module_entity() {
+        let parsed = parse(
+            "setup.py",
+            "from setuptools import setup\n\nsetup(name='pkg')\n",
+        )
+        .await;
+        let storage = SqliteStorage::in_memory().unwrap();
+        let delta = GraphResolver::new(None)
+            .resolve(&[parsed], &storage)
+            .await
+            .unwrap();
+
+        let module_id = delta
+            .added_entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Module)
+            .expect("il modulo setup esiste")
+            .id;
+        assert!(
+            !delta
+                .added_relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Calls && r.target_id == module_id),
+            "una Call non deve mai avere come bersaglio un Module"
+        );
+        // La verità è l'import: la chiamata aggancia la dipendenza esterna.
+        assert!(
+            delta
+                .added_entities
+                .iter()
+                .any(|e| e.kind == EntityKind::ExternalDependency
+                    && e.qualified_name.contains("setuptools")),
+            "setup() deve esternalizzare verso setuptools (l'import dice la verità)"
+        );
+    }
+
     /// Regressione (misurata su DeepSpeed: 1.065 self-archi bugiardi): in Python il
     /// gate web del Fix #10 era OFF, quindi `parser.parse_args()` DENTRO la funzione
     /// `parse_args` si legava per nome nudo a SÉ STESSA (ricorsione mai scritta), e
