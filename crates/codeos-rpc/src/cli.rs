@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
 
             let mut client = connect_server().await?;
             println!("⚡ Invio richiesta di indicizzazione per: {}", project_root);
+            println!("   (attendo il completamento: la risposta arriva quando il grafo è scritto — sui repo grandi possono volerci minuti)");
 
             let req = proto::IndexProjectRequest { project_root };
             client.index_project(req).await?;

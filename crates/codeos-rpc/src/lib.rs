@@ -45,7 +45,22 @@ pub mod proto {
 
 use proto::code_os_server::{CodeOs, CodeOsServer};
 
-const GRAPH_UPDATE_WAIT: Duration = Duration::from_secs(5);
+/// Attesa di DEFAULT della conferma `GraphUpdated` (l'attesa è EVENT-DRIVEN: la
+/// risposta arriva nell'istante esatto del commit del grafo, mai un polling — quindi
+/// un tetto generoso non costa nulla nei casi rapidi). I 5s storici producevano un
+/// FALSO NEGATIVO di conferma sui repo grandi (campagna 50 progetti: sqlalchemy
+/// completava a ~15s, guava a ~26s, la CLI usciva exit-1 mentre il server finiva
+/// il lavoro). 10 minuti coprono i repo monster misurati (windows-rs 58s,
+/// TypeScript 82s) con margine; `CODEOS_INDEX_WAIT_SECS` lo regola senza ricompilare.
+const GRAPH_UPDATE_WAIT_DEFAULT: Duration = Duration::from_secs(600);
+
+fn graph_update_wait() -> Duration {
+    std::env::var("CODEOS_INDEX_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(GRAPH_UPDATE_WAIT_DEFAULT)
+}
 
 /// L'implementazione del servizio gRPC. Tiene una [`DispatcherHandle`] clonabile
 /// (un `Sender` verso la front door + il bus eventi): è tutto ciò che serve per
@@ -99,7 +114,8 @@ async fn wait_for_graph_update(
     mut graph_rx: broadcast::Receiver<CodeOsEvent>,
     operation: &str,
 ) -> GraphWaitOutcome {
-    let observed = timeout(GRAPH_UPDATE_WAIT, async {
+    let wait = graph_update_wait();
+    let observed = timeout(wait, async {
         loop {
             match graph_rx.recv().await {
                 Ok(CodeOsEvent::GraphUpdated { .. }) => return GraphWaitOutcome::Updated,
@@ -125,7 +141,7 @@ async fn wait_for_graph_update(
         Err(_) => {
             tracing::warn!(
                 operation,
-                timeout_ms = GRAPH_UPDATE_WAIT.as_millis(),
+                timeout_ms = wait.as_millis(),
                 "attesa GraphUpdated scaduta: esito dell'indicizzazione non confermato"
             );
             GraphWaitOutcome::Unconfirmed
@@ -144,8 +160,10 @@ fn ensure_graph_updated(outcome: GraphWaitOutcome, operation: &str) -> Result<()
             "{operation}: aggiornamento del grafo fallito: {reason}"
         ))),
         GraphWaitOutcome::Unconfirmed => Err(Status::deadline_exceeded(format!(
-            "{operation}: esito dell'indicizzazione non confermato entro {} ms",
-            GRAPH_UPDATE_WAIT.as_millis()
+            "{operation}: esito non confermato entro {} s. Il server può star ancora \
+             lavorando in background: verifica con `codeos report`, o alza \
+             CODEOS_INDEX_WAIT_SECS (lato server) per attese più lunghe.",
+            graph_update_wait().as_secs()
         ))),
     }
 }
