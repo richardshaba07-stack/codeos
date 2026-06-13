@@ -314,6 +314,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "codeos-storage",
  "codeos-types",
  "tokio",
  "tracing",
