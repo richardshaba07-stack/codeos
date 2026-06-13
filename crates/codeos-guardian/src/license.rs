@@ -254,9 +254,11 @@ const MAX_NOTICE_TEXT_CHARS: usize = 160;
 /// - file LICENSE/LICENCE/COPYING/NOTICE (vendored o di progetto), con la
 ///   famiglia di licenza riconosciuta SOLO per frase distintiva esatta.
 ///
-/// Salta `.git`, `target`, `node_modules` (terze parti già censite dai
-/// metadati), `.codeos`, i file binari (NUL nei primi 8 KiB) e quelli oltre
-/// i 3 MiB. Solo filesystem locale, niente rete. Ordine deterministico.
+/// Salta le directory di TERZE PARTI e di ambiente (le loro licenze NON sono
+/// del progetto: un GPL dentro una dipendenza non è una violazione del TUO
+/// codice — misurato su un venv reale, dove pip vendora distlib GPL-2.0), i
+/// file binari (NUL nei primi 8 KiB) e quelli oltre i 3 MiB. Solo filesystem
+/// locale, niente rete. Ordine deterministico.
 pub fn scan_source_notices(repo_root: &Path) -> SourceScan {
     let mut notices: Vec<SourceNotice> = Vec::new();
     let mut stack = vec![repo_root.to_path_buf()];
@@ -272,10 +274,7 @@ pub fn scan_source_notices(repo_root: &Path) -> SourceScan {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             if child.is_dir() {
-                if matches!(
-                    name.as_str(),
-                    ".git" | "target" | "node_modules" | ".codeos"
-                ) {
+                if is_skipped_scan_dir(&name) {
                     continue;
                 }
                 stack.push(child);
@@ -351,6 +350,31 @@ pub fn check_source_policy(
         }
     }
     out
+}
+
+/// Le directory che lo scan dei sorgenti SALTA: VCS/build, e soprattutto le
+/// directory di DIPENDENZE e AMBIENTI (le loro licenze sono di terzi, già
+/// censite — o da censire — come dipendenze, mai violazioni del progetto).
+/// `site-packages` è la chiave del fix dal test su venv reale: senza, il pip
+/// vendored (incl. un distlib GPL-2.0) inonderebbe il report del progetto.
+fn is_skipped_scan_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "target"           // Rust build
+            | "node_modules"     // JS/TS deps
+            | ".codeos"          // il ledger
+            | "venv"
+            | ".venv"
+            | "env"              // venv Python comuni
+            | "site-packages"    // deps pip installate (qualunque python*/)
+            | ".tox"
+            | ".nox"             // ambienti di test Python
+            | "vendor"           // deps Go/PHP vendored
+            | "dist"
+            | "build"            // artefatti di pacchettizzazione
+            | "__pycache__"
+    )
 }
 
 /// Un nome file che DICHIARA di essere una licenza: LICENSE, LICENCE,
@@ -1037,6 +1061,18 @@ tempfile = "3"
         std::fs::write(
             dir.path().join("doc.md"),
             "Il copyright è un istituto giuridico.\n",
+        )
+        .unwrap();
+        // Le DIPENDENZE in un venv NON sono sorgenti del progetto: un LICENSE
+        // dentro site-packages (qui un GPL, come il distlib vendored da pip
+        // trovato nel test su venv reale) non deve entrare nel report.
+        let sp = dir
+            .path()
+            .join(".venv/lib/python3.11/site-packages/distlib");
+        std::fs::create_dir_all(&sp).unwrap();
+        std::fs::write(
+            sp.join("LICENSE.txt"),
+            "GNU GENERAL PUBLIC LICENSE\nVersion 2, June 1991\n",
         )
         .unwrap();
         let scan = scan_source_notices(dir.path());
