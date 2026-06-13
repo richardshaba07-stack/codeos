@@ -8,6 +8,7 @@ use codeos_types::ParsedFileResult;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::cpp::CppParser;
+use crate::csharp_lang::CSharpParser;
 use crate::go::GoParser;
 use crate::java_lang::JavaParser;
 use crate::python::PythonParser;
@@ -53,6 +54,7 @@ impl ParserActor {
                 Box::new(CppParser::new()),
                 Box::new(RubyParser::new()),
                 Box::new(SwiftParser::new()),
+                Box::new(CSharpParser::new()),
             ],
             events,
         }

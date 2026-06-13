@@ -26,6 +26,7 @@ pub(crate) const STACK_GROW_BY: usize = 2 * 1024 * 1024;
 
 mod actor;
 mod cpp;
+mod csharp_lang;
 mod go;
 mod java_lang;
 mod python;
