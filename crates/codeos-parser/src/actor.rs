@@ -149,10 +149,17 @@ impl ParserActor {
     }
 
     fn publish(&self, results: Vec<ParsedFileResult>) {
-        if results.is_empty() {
-            return;
-        }
-        // L'assenza di sottoscrittori non è un errore.
+        // Emette SEMPRE `FilesIndexed`, anche con `results` VUOTO: un progetto
+        // senza file sorgente (es. un repo-stub con un solo `.gemspec`, o una
+        // cartella di soli generati saltati) è un esito legittimo "0 entità",
+        // non un non-evento. Senza questo, il GraphActor non riceverebbe mai
+        // `FilesIndexed`, non emetterebbe `GraphUpdated`, e la CLI che attende
+        // la conferma resterebbe bloccata fino al timeout — scambiando "niente
+        // da fare" per uno stallo. (Bug trovato dalla batteria di scala su 80
+        // repo: `arel`, branch-stub con 0 sorgenti, andava in time-box a 420s.)
+        // È lo stesso principio già applicato in GraphActor::handle_files_indexed
+        // per il delta vuoto: un esito vuoto va comunque ANNUNCIATO.
+        // L'assenza di sottoscrittori, invece, non è un errore (`let _`).
         let _ = self.events.send(CodeOsEvent::FilesIndexed { results });
     }
 
@@ -365,6 +372,56 @@ mod tests {
         drop(cmd_tx); // chiude il loop dell'attore
         let _ = handle.await;
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn empty_project_still_publishes_files_indexed() {
+        // Regressione della batteria di SCALA (80 repo): `arel` è un branch-stub
+        // con ZERO file sorgente (solo un .gemspec). `IndexProject` deve comunque
+        // EMETTERE `FilesIndexed` (results vuoto), altrimenti il GraphActor non
+        // emette `GraphUpdated` e la CLI resta bloccata fino al timeout (420s nel
+        // test reale). Un esito "0 entità" è legittimo, non un non-evento.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codeos_empty_proj_{nanos}"));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        // Un file NON sorgente: nessun parser lo gestisce ⇒ results vuoto.
+        tokio::fs::write(dir.join("arel.gemspec"), "Gem::Specification.new\n")
+            .await
+            .unwrap();
+
+        let (events_tx, mut events_rx) = broadcast::channel(16);
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let actor = ParserActor::new(events_tx);
+        let handle = tokio::spawn(actor.run(cmd_rx));
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(1);
+        cmd_tx
+            .send(Command::IndexProject {
+                project_root: dir.to_string_lossy().to_string(),
+                reply_to: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(reply_rx.recv().await.expect("nessuna risposta").is_ok());
+
+        let event = events_rx
+            .recv()
+            .await
+            .expect("FilesIndexed deve essere emesso anche a 0 file");
+        let CodeOsEvent::FilesIndexed { results } = event else {
+            panic!("evento inatteso");
+        };
+        assert!(
+            results.is_empty(),
+            "0 file sorgente ⇒ 0 risultati, ma l'evento DEVE esserci"
+        );
+
+        drop(cmd_tx);
+        let _ = handle.await;
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
@@ -604,7 +661,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_extension_yields_no_event() {
+    async fn unknown_extension_yields_empty_files_indexed() {
+        // Un file con estensione non gestita (.txt) non produce risultati, MA
+        // l'indicizzazione DEVE comunque emettere `FilesIndexed` (results vuoto)
+        // così la pipeline arriva a `GraphUpdated` e la CLL non resta in attesa.
+        // (Prima emetteva "nessun evento" — il bug arel della batteria su 80 repo.)
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -626,8 +687,16 @@ mod tests {
             .unwrap();
         reply_rx.recv().await.expect("nessuna risposta").unwrap();
 
-        // Nessun parser per .txt => nessun evento. Usiamo try_recv per non bloccare.
-        assert!(events_rx.try_recv().is_err());
+        // Nessun parser per .txt ⇒ FilesIndexed con results VUOTO (non l'assenza
+        // di evento): l'esito "0 entità" va comunque annunciato.
+        let event = events_rx
+            .recv()
+            .await
+            .expect("FilesIndexed deve essere emesso anche senza risultati");
+        let CodeOsEvent::FilesIndexed { results } = event else {
+            panic!("evento inatteso");
+        };
+        assert!(results.is_empty());
 
         drop(cmd_tx);
         let _ = handle.await;
