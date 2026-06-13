@@ -371,7 +371,7 @@ fn last_dot_segment(qualified: &str) -> String {
         .next()
         .unwrap_or(qualified)
         .trim()
-        .trim_end_matches(|c: char| c == '<' || c == '(')
+        .trim_end_matches(['<', '('])
         .to_string()
 }
 
