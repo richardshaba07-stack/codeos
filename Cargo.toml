@@ -38,6 +38,7 @@ tree-sitter-typescript = "0.21"
 tree-sitter-go = "0.21"
 tree-sitter-java = "0.21"
 tree-sitter-cpp = "0.22"
+tree-sitter-ruby = "0.21"
 
 # Storage
 rusqlite = { version = "0.31", features = ["bundled"] }

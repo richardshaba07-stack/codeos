@@ -11,6 +11,7 @@ use crate::cpp::CppParser;
 use crate::go::GoParser;
 use crate::java_lang::JavaParser;
 use crate::python::PythonParser;
+use crate::ruby_lang::RubyParser;
 use crate::rust_lang::RustParser;
 use crate::traits::LanguageParser;
 use crate::typescript::TypeScriptParser;
@@ -49,6 +50,7 @@ impl ParserActor {
                 Box::new(GoParser::new()),
                 Box::new(JavaParser::new()),
                 Box::new(CppParser::new()),
+                Box::new(RubyParser::new()),
             ],
             events,
         }
