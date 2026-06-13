@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use async_trait::async_trait;
 use codeos_types::{
     EntityKind, ParseError, ParsedEntity, ParsedFileResult, ParsedRelation, RelationKind,
     SourceLocation,
@@ -27,7 +26,6 @@ impl Default for TypeScriptParser {
     }
 }
 
-#[async_trait]
 impl LanguageParser for TypeScriptParser {
     fn can_parse(&self, file_extension: &str) -> bool {
         matches!(
@@ -36,7 +34,7 @@ impl LanguageParser for TypeScriptParser {
         )
     }
 
-    async fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
+    fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
         let path_str = file_path.to_string_lossy().to_string();
         let extension = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let is_js = matches!(
@@ -464,9 +462,7 @@ export function connectClient() {
 "#;
 
     async fn parse(src: &str) -> ParsedFileResult {
-        TypeScriptParser::new()
-            .parse_file(Path::new("vscode-extension/src/extension.ts"), src)
-            .await
+        TypeScriptParser::new().parse_file(Path::new("vscode-extension/src/extension.ts"), src)
     }
 
     fn find<'a>(result: &'a ParsedFileResult, name: &str) -> &'a ParsedEntity {
@@ -530,9 +526,7 @@ function lookup(key) {
   return key;
 }
 "#;
-        let result = TypeScriptParser::new()
-            .parse_file(Path::new("app/cache.js"), src)
-            .await;
+        let result = TypeScriptParser::new().parse_file(Path::new("app/cache.js"), src);
 
         // Tutte le entità sono marcate come JavaScript, non TypeScript.
         assert!(
@@ -583,9 +577,7 @@ export function Badge(props) {
 "#;
         // Nome file diverso dal componente, per non confondere il modulo
         // (derivato dallo stem) con la funzione `Badge`.
-        let result = TypeScriptParser::new()
-            .parse_file(Path::new("ui/badge_view.jsx"), src)
-            .await;
+        let result = TypeScriptParser::new().parse_file(Path::new("ui/badge_view.jsx"), src);
 
         assert!(
             result

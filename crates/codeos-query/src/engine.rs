@@ -2338,7 +2338,7 @@ mod tests {
 
     /// Costruisce uno storage con il grafo di un piccolo sorgente Python.
     async fn graph_from(path: &str, src: &str) -> Arc<SqliteStorage> {
-        let parsed = PythonParser::new().parse_file(Path::new(path), src).await;
+        let parsed = PythonParser::new().parse_file(Path::new(path), src);
         let storage = SqliteStorage::in_memory().unwrap();
         let delta = GraphResolver::new(None)
             .resolve(&[parsed], &storage)
@@ -2353,7 +2353,7 @@ mod tests {
     async fn graph_from_files(files: &[(&str, &str)]) -> Arc<SqliteStorage> {
         let mut parsed = Vec::new();
         for (path, src) in files {
-            parsed.push(PythonParser::new().parse_file(Path::new(path), src).await);
+            parsed.push(PythonParser::new().parse_file(Path::new(path), src));
         }
         let storage = SqliteStorage::in_memory().unwrap();
         let delta = GraphResolver::new(None)
@@ -2385,9 +2385,7 @@ mod tests {
                 ts: ts1,
             }))
             .resolve(
-                &[PythonParser::new()
-                    .parse_file(Path::new(path), src_v1)
-                    .await],
+                &[PythonParser::new().parse_file(Path::new(path), src_v1)],
                 &storage,
             )
             .await
@@ -2399,9 +2397,7 @@ mod tests {
                 ts: ts2,
             }))
             .resolve(
-                &[PythonParser::new()
-                    .parse_file(Path::new(path), src_v2)
-                    .await],
+                &[PythonParser::new().parse_file(Path::new(path), src_v2)],
                 &storage,
             )
             .await
@@ -2414,9 +2410,7 @@ mod tests {
     /// receiver foreign deve restare `Unresolved`, non legarsi a una funzione libera
     /// omonima). Passa una project-root così i nomi qualificati sono `src::…::…`.
     async fn graph_from_ts(path: &str, src: &str) -> Arc<SqliteStorage> {
-        let parsed = TypeScriptParser::new()
-            .parse_file(Path::new(path), src)
-            .await;
+        let parsed = TypeScriptParser::new().parse_file(Path::new(path), src);
         let storage = SqliteStorage::in_memory().unwrap();
         let delta = GraphResolver::new(Some("/repo".to_string()))
             .resolve(&[parsed], &storage)

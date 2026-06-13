@@ -1619,25 +1619,23 @@ mod tests {
     use std::path::Path;
 
     async fn parse(path: &str, src: &str) -> ParsedFileResult {
-        PythonParser::new().parse_file(Path::new(path), src).await
+        PythonParser::new().parse_file(Path::new(path), src)
     }
 
     async fn parse_rust(path: &str, src: &str) -> ParsedFileResult {
-        RustParser::new().parse_file(Path::new(path), src).await
+        RustParser::new().parse_file(Path::new(path), src)
     }
 
     async fn parse_go(path: &str, src: &str) -> ParsedFileResult {
-        GoParser::new().parse_file(Path::new(path), src).await
+        GoParser::new().parse_file(Path::new(path), src)
     }
 
     async fn parse_java(path: &str, src: &str) -> ParsedFileResult {
-        JavaParser::new().parse_file(Path::new(path), src).await
+        JavaParser::new().parse_file(Path::new(path), src)
     }
 
     async fn parse_ts(path: &str, src: &str) -> ParsedFileResult {
-        TypeScriptParser::new()
-            .parse_file(Path::new(path), src)
-            .await
+        TypeScriptParser::new().parse_file(Path::new(path), src)
     }
 
     fn find<'a>(delta: &'a GraphDelta, qname: &str) -> &'a Entity {

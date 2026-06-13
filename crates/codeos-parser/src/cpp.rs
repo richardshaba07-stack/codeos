@@ -23,7 +23,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use async_trait::async_trait;
 use codeos_types::{
     EntityKind, ParseError, ParsedEntity, ParsedFileResult, ParsedRelation, RelationKind,
     SourceLocation,
@@ -46,7 +45,6 @@ impl Default for CppParser {
     }
 }
 
-#[async_trait]
 impl LanguageParser for CppParser {
     fn can_parse(&self, file_extension: &str) -> bool {
         // C e C++: header e source di tutte le convenzioni comuni.
@@ -56,7 +54,7 @@ impl LanguageParser for CppParser {
         )
     }
 
-    async fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
+    fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
         let path_str = file_path.to_string_lossy().to_string();
         let mut parser = Parser::new();
         if let Err(err) = parser.set_language(&tree_sitter_cpp::language()) {
@@ -556,7 +554,7 @@ mod tests {
     use super::*;
 
     async fn parse(src: &str, file: &str) -> ParsedFileResult {
-        CppParser::new().parse_file(Path::new(file), src).await
+        CppParser::new().parse_file(Path::new(file), src)
     }
 
     fn find<'a>(result: &'a ParsedFileResult, name: &str) -> &'a ParsedEntity {

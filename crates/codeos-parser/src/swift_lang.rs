@@ -20,7 +20,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use async_trait::async_trait;
 use codeos_types::{
     EntityKind, ParseError, ParsedEntity, ParsedFileResult, ParsedRelation, RelationKind,
     SourceLocation,
@@ -43,13 +42,12 @@ impl Default for SwiftParser {
     }
 }
 
-#[async_trait]
 impl LanguageParser for SwiftParser {
     fn can_parse(&self, file_extension: &str) -> bool {
         file_extension.eq_ignore_ascii_case("swift")
     }
 
-    async fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
+    fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
         let path_str = file_path.to_string_lossy().to_string();
         let mut parser = Parser::new();
         if let Err(err) = parser.set_language(&tree_sitter_swift::language()) {
@@ -479,9 +477,7 @@ mod tests {
         // Nome file NEUTRO (non un nome di tipo) così il Module-file sintetico non
         // collide con una classe omonima — in Swift Animal.swift+class Animal è
         // comune; il grafo tiene entrambe le entità, ma il test cerca per nome.
-        SwiftParser::new()
-            .parse_file(Path::new("Sources/App/Zoo.swift"), src)
-            .await
+        SwiftParser::new().parse_file(Path::new("Sources/App/Zoo.swift"), src)
     }
 
     fn find<'a>(result: &'a ParsedFileResult, name: &str) -> &'a ParsedEntity {

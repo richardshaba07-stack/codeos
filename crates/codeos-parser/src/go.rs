@@ -10,7 +10,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use async_trait::async_trait;
 use codeos_types::{
     EntityKind, ParseError, ParsedEntity, ParsedFileResult, ParsedRelation, RelationKind,
     SourceLocation,
@@ -33,13 +32,12 @@ impl Default for GoParser {
     }
 }
 
-#[async_trait]
 impl LanguageParser for GoParser {
     fn can_parse(&self, file_extension: &str) -> bool {
         file_extension.eq_ignore_ascii_case("go")
     }
 
-    async fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
+    fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
         let path_str = file_path.to_string_lossy().to_string();
         let mut parser = Parser::new();
         if let Err(err) = parser.set_language(&tree_sitter_go::language()) {
@@ -442,9 +440,7 @@ func New() *Cache {
 "#;
 
     async fn parse(src: &str) -> ParsedFileResult {
-        GoParser::new()
-            .parse_file(Path::new("internal/store/cache.go"), src)
-            .await
+        GoParser::new().parse_file(Path::new("internal/store/cache.go"), src)
     }
 
     fn find<'a>(result: &'a ParsedFileResult, name: &str) -> &'a ParsedEntity {
@@ -531,9 +527,7 @@ func (s *Server) Start() {}
 
 type Server struct{}
 "#;
-        let result = GoParser::new()
-            .parse_file(Path::new("p/server.go"), src)
-            .await;
+        let result = GoParser::new().parse_file(Path::new("p/server.go"), src);
         let server = find(&result, "Server");
         assert_eq!(server.kind, EntityKind::Struct);
         let start = find(&result, "Start");

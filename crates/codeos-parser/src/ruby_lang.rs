@@ -20,7 +20,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use async_trait::async_trait;
 use codeos_types::{
     EntityKind, ParseError, ParsedEntity, ParsedFileResult, ParsedRelation, RelationKind,
     SourceLocation,
@@ -43,13 +42,12 @@ impl Default for RubyParser {
     }
 }
 
-#[async_trait]
 impl LanguageParser for RubyParser {
     fn can_parse(&self, file_extension: &str) -> bool {
         file_extension.eq_ignore_ascii_case("rb")
     }
 
-    async fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
+    fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
         let path_str = file_path.to_string_lossy().to_string();
         let mut parser = Parser::new();
         if let Err(err) = parser.set_language(&tree_sitter_ruby::language()) {
@@ -370,9 +368,7 @@ mod tests {
     use super::*;
 
     async fn parse(src: &str) -> ParsedFileResult {
-        RubyParser::new()
-            .parse_file(Path::new("app/models/user.rb"), src)
-            .await
+        RubyParser::new().parse_file(Path::new("app/models/user.rb"), src)
     }
 
     fn find<'a>(result: &'a ParsedFileResult, name: &str) -> &'a ParsedEntity {

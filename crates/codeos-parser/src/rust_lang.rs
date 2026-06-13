@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use async_trait::async_trait;
 use codeos_types::{
     EntityKind, ParseError, ParsedEntity, ParsedFileResult, ParsedRelation, RelationKind,
     SourceLocation,
@@ -30,13 +29,12 @@ impl Default for RustParser {
     }
 }
 
-#[async_trait]
 impl LanguageParser for RustParser {
     fn can_parse(&self, file_extension: &str) -> bool {
         file_extension.eq_ignore_ascii_case("rs")
     }
 
-    async fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
+    fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
         let path_str = file_path.to_string_lossy().to_string();
         let mut parser = Parser::new();
         if let Err(err) = parser.set_language(&tree_sitter_rust::language()) {
@@ -631,9 +629,7 @@ fn helper() {}
 "#;
 
     async fn parse(src: &str) -> ParsedFileResult {
-        RustParser::new()
-            .parse_file(Path::new("crates/codeos-parser/src/actor.rs"), src)
-            .await
+        RustParser::new().parse_file(Path::new("crates/codeos-parser/src/actor.rs"), src)
     }
 
     fn find<'a>(result: &'a ParsedFileResult, name: &str) -> &'a ParsedEntity {

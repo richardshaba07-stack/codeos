@@ -1,6 +1,5 @@
 //! Il trait universale che ogni parser di linguaggio deve implementare.
 
-use async_trait::async_trait;
 use codeos_types::ParsedFileResult;
 use std::path::Path;
 
@@ -10,7 +9,11 @@ use std::path::Path;
 /// file e `target_qualified_name` come scritti nel sorgente. Non assegna
 /// `EntityId` e non tocca il grafo (invariante 1.4) — quello è compito del
 /// `GraphResolver` (Blocco 3).
-#[async_trait]
+///
+/// `parse_file` è **sincrono**: il parsing tree-sitter è CPU puro (nessun I/O,
+/// nessun await), così l'indicizzazione può parallelizzarlo con `rayon` su
+/// tutti i core. La lettura del file dal disco è responsabilità del chiamante
+/// (`ParserActor`), separata dal parsing.
 pub trait LanguageParser: Send + Sync {
     /// `true` se questo parser gestisce l'estensione data (senza punto, es. `"py"`).
     fn can_parse(&self, file_extension: &str) -> bool;
@@ -18,5 +21,5 @@ pub trait LanguageParser: Send + Sync {
     /// Analizza il sorgente già letto dal disco. Non deve mai fare panic: gli
     /// errori di sintassi vanno riportati in [`ParsedFileResult::errors`], non
     /// propagati.
-    async fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult;
+    fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult;
 }

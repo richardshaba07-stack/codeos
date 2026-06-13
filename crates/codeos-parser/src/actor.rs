@@ -1,8 +1,8 @@
 //! `ParserActor`: legge i file dal disco, li analizza e pubblica i risultati.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::Context;
 use codeos_types::bus::{CodeOsEvent, Command};
 use codeos_types::ParsedFileResult;
 use tokio::sync::{broadcast, mpsc};
@@ -37,7 +37,9 @@ const MAX_FILE_BYTES: u64 = 3 * 1024 * 1024;
 /// né gli altri attori (invariante 1.3): riceve comandi su un `mpsc` e pubblica
 /// eventi su un `broadcast`.
 pub struct ParserActor {
-    parsers: Vec<Box<dyn LanguageParser>>,
+    /// I parser dietro `Arc`: condivisi (immutabili) coi worker `rayon` che
+    /// parsano in parallelo dentro `spawn_blocking` (richiede `'static + Send`).
+    parsers: Arc<Vec<Box<dyn LanguageParser>>>,
     events: broadcast::Sender<CodeOsEvent>,
 }
 
@@ -45,7 +47,7 @@ impl ParserActor {
     /// Crea l'attore col set di parser predefinito.
     pub fn new(events: broadcast::Sender<CodeOsEvent>) -> Self {
         Self {
-            parsers: vec![
+            parsers: Arc::new(vec![
                 Box::new(PythonParser::new()),
                 Box::new(RustParser::new()),
                 Box::new(TypeScriptParser::new()),
@@ -55,7 +57,7 @@ impl ParserActor {
                 Box::new(RubyParser::new()),
                 Box::new(SwiftParser::new()),
                 Box::new(CSharpParser::new()),
-            ],
+            ]),
             events,
         }
     }
@@ -106,46 +108,42 @@ impl ParserActor {
     }
 
     async fn index_files(&self, files: &[String]) -> Vec<ParsedFileResult> {
-        let mut results = Vec::with_capacity(files.len());
-        // Un solo modello di workspace per batch: la cache evita di rileggere lo
-        // stesso manifest una volta per file (P1-c).
+        let files: Vec<String> = files.to_vec();
+        let parsers = Arc::clone(&self.parsers);
+
+        // FASE 1+2 — lettura + PARSING in PARALLELO su `rayon` (CPU-bound: il
+        // profilo `sample` lo dà ~85% dei CAMPIONI CPU). Dentro `spawn_blocking`
+        // per non bloccare il runtime tokio. `par_iter().collect()` PRESERVA
+        // l'ordine dei file ⇒ il resolver vede sempre lo stesso ordine ⇒
+        // risultato DETERMINISTICO (la dedup "primo vince" del Fix #8 regge).
+        // NB: dopo questo, il collo del WALL-CLOCK si sposta sul GraphResolver
+        // sequenziale (I/O su storage, che i campioni CPU sottostimano) — la
+        // prossima leva è lì, non più nel parsing.
+        let mut results: Vec<ParsedFileResult> = tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            files
+                .par_iter()
+                .filter_map(|file| parse_one_sync(&parsers, file))
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+
+        // FASE 3 — `stamp_package` SEQUENZIALE: usa la cache `WorkspaceModel`
+        // (mutabile, un manifest letto una volta sola per batch). È cheap
+        // rispetto al parsing, non vale la pena parallelizzarla.
         let mut workspace = WorkspaceModel::new();
-        for file in files {
-            match self.index_one(file).await {
-                Ok(Some(mut result)) => {
-                    stamp_package(&mut result, &mut workspace);
-                    results.push(result);
-                }
-                Ok(None) => tracing::debug!(%file, "nessun parser per l'estensione, salto"),
-                Err(err) => tracing::warn!(%file, error = %err, "indicizzazione fallita"),
-            }
+        for result in &mut results {
+            stamp_package(result, &mut workspace);
         }
         results
     }
 
-    async fn index_one(&self, file: &str) -> anyhow::Result<Option<ParsedFileResult>> {
-        let path = Path::new(file);
-        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let Some(parser) = self.parsers.iter().find(|p| p.can_parse(extension)) else {
-            return Ok(None);
-        };
-        // Guardia anti-stallo: salta i file enormi (generati/vendored/minificati)
-        // prima di leggerli e parsarli. `Ok(None)` = saltato pulito, non un errore.
-        if let Ok(meta) = tokio::fs::metadata(path).await {
-            if meta.len() > MAX_FILE_BYTES {
-                tracing::warn!(
-                    %file,
-                    bytes = meta.len(),
-                    limit = MAX_FILE_BYTES,
-                    "file oltre il limite di dimensione: saltato (probabile generato/vendored)"
-                );
-                return Ok(None);
-            }
-        }
-        let source = tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| format!("lettura di {file} fallita"))?;
-        Ok(Some(parser.parse_file(path, &source).await))
+    /// Per i test: parsa un singolo file (sincrono). In produzione il parsing
+    /// passa per `parse_one_sync` dentro il pool `rayon` di `index_files`.
+    #[cfg(test)]
+    fn index_one(&self, file: &str) -> Option<ParsedFileResult> {
+        parse_one_sync(&self.parsers, file)
     }
 
     fn publish(&self, results: Vec<ParsedFileResult>) {
@@ -186,6 +184,37 @@ impl ParserActor {
             }
         }
         filter_generated(found, Path::new(root))
+    }
+}
+
+/// Legge e parsa UN file, sincrono — il corpo eseguito in parallelo dai worker
+/// `rayon`. `None` se: nessun parser per l'estensione, file oltre il tetto di
+/// dimensione (saltato pulito), o lettura fallita (loggata). Funzione libera
+/// (non un metodo) così `&[Box<dyn LanguageParser>]` attraversa il confine
+/// `spawn_blocking` senza catturare `&self`.
+fn parse_one_sync(parsers: &[Box<dyn LanguageParser>], file: &str) -> Option<ParsedFileResult> {
+    let path = Path::new(file);
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let parser = parsers.iter().find(|p| p.can_parse(extension))?;
+    // Guardia anti-stallo: salta i file enormi (generati/vendored/minificati)
+    // prima di leggerli e parsarli.
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_FILE_BYTES {
+            tracing::warn!(
+                %file,
+                bytes = meta.len(),
+                limit = MAX_FILE_BYTES,
+                "file oltre il limite di dimensione: saltato (probabile generato/vendored)"
+            );
+            return None;
+        }
+    }
+    match std::fs::read_to_string(path) {
+        Ok(source) => Some(parser.parse_file(path, &source)),
+        Err(err) => {
+            tracing::warn!(%file, error = %err, "lettura del file fallita, saltato");
+            None
+        }
     }
 }
 
@@ -439,7 +468,7 @@ mod tests {
 
         let huge = format!("# {}\nx = 1\n", "a".repeat(MAX_FILE_BYTES as usize + 16));
         tokio::fs::write(&big, &huge).await.unwrap();
-        let skipped = actor.index_one(&big.to_string_lossy()).await.unwrap();
+        let skipped = actor.index_one(&big.to_string_lossy());
         assert!(
             skipped.is_none(),
             "un file oltre {MAX_FILE_BYTES} byte va saltato, non parsato"
@@ -448,7 +477,7 @@ mod tests {
         tokio::fs::write(&small, "def f():\n    pass\n")
             .await
             .unwrap();
-        let parsed = actor.index_one(&small.to_string_lossy()).await.unwrap();
+        let parsed = actor.index_one(&small.to_string_lossy());
         assert!(parsed.is_some(), "un file piccolo dev'essere parsato");
 
         let _ = tokio::fs::remove_file(&big).await;

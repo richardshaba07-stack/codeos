@@ -10,7 +10,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use async_trait::async_trait;
 use codeos_types::{
     EntityKind, ParseError, ParsedEntity, ParsedFileResult, ParsedRelation, RelationKind,
     SourceLocation,
@@ -33,13 +32,12 @@ impl Default for JavaParser {
     }
 }
 
-#[async_trait]
 impl LanguageParser for JavaParser {
     fn can_parse(&self, file_extension: &str) -> bool {
         file_extension.eq_ignore_ascii_case("java")
     }
 
-    async fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
+    fn parse_file(&self, file_path: &Path, source_code: &str) -> ParsedFileResult {
         let path_str = file_path.to_string_lossy().to_string();
         let mut parser = Parser::new();
         if let Err(err) = parser.set_language(&tree_sitter_java::language()) {
@@ -386,9 +384,7 @@ public class Cache extends BaseCache implements Repository {
 
     async fn parse(src: &str) -> ParsedFileResult {
         // Nome file diverso dai tipi, per non confondere il modulo (dallo stem).
-        JavaParser::new()
-            .parse_file(Path::new("com/example/store/app.java"), src)
-            .await
+        JavaParser::new().parse_file(Path::new("com/example/store/app.java"), src)
     }
 
     fn find<'a>(result: &'a ParsedFileResult, name: &str) -> &'a ParsedEntity {
@@ -481,9 +477,7 @@ public class Service {
     }
 }
 "#;
-        let result = JavaParser::new()
-            .parse_file(Path::new("p/svc.java"), src)
-            .await;
+        let result = JavaParser::new().parse_file(Path::new("p/svc.java"), src);
         let calls: Vec<&str> = result
             .relations
             .iter()

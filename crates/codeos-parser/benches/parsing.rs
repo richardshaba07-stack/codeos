@@ -5,8 +5,8 @@
 //! pipeline di indicizzazione, quello CPU-bound; isolarlo qui ci dà un numero
 //! di riferimento per inseguire le regressioni linguaggio per linguaggio.
 //!
-//! `parse_file` è `async` solo per firma (il lavoro è sincrono): un runtime
-//! tokio minimo con `block_on` ha overhead trascurabile rispetto al parsing.
+//! `parse_file` è sincrono (il parsing è CPU puro): in produzione l'attore lo
+//! esegue in parallelo su `rayon`, qui lo misuriamo isolato per linguaggio.
 //!
 //! Esegui con: `cargo bench -p codeos-parser`.
 
@@ -16,7 +16,6 @@ use codeos_parser::{
     GoParser, JavaParser, LanguageParser, PythonParser, RustParser, TypeScriptParser,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use tokio::runtime::Runtime;
 
 const PYTHON_SRC: &str = r#"
 import os
@@ -134,40 +133,39 @@ public class Cache extends BaseCache implements Repository {
 }
 "#;
 
-/// Esegue una singola `parse_file` e consuma il risultato con `black_box` perché
-/// l'ottimizzatore non possa eliminare il lavoro.
-fn parse_once(rt: &Runtime, parser: &dyn LanguageParser, path: &str, src: &str) {
-    let result = rt.block_on(parser.parse_file(Path::new(path), src));
+/// Esegue una singola `parse_file` (sincrona) e consuma il risultato con
+/// `black_box` perché l'ottimizzatore non possa eliminare il lavoro.
+fn parse_once(parser: &dyn LanguageParser, path: &str, src: &str) {
+    let result = parser.parse_file(Path::new(path), src);
     black_box(result);
 }
 
 fn bench_parsing(c: &mut Criterion) {
-    let rt = Runtime::new().expect("runtime tokio per il benchmark");
     let mut group = c.benchmark_group("parse_file");
 
     let python = PythonParser::new();
     group.bench_function("python", |b| {
-        b.iter(|| parse_once(&rt, &python, "bench/sample.py", PYTHON_SRC))
+        b.iter(|| parse_once(&python, "bench/sample.py", PYTHON_SRC))
     });
 
     let rust = RustParser::new();
     group.bench_function("rust", |b| {
-        b.iter(|| parse_once(&rt, &rust, "bench/sample.rs", RUST_SRC))
+        b.iter(|| parse_once(&rust, "bench/sample.rs", RUST_SRC))
     });
 
     let typescript = TypeScriptParser::new();
     group.bench_function("typescript", |b| {
-        b.iter(|| parse_once(&rt, &typescript, "bench/sample.ts", TYPESCRIPT_SRC))
+        b.iter(|| parse_once(&typescript, "bench/sample.ts", TYPESCRIPT_SRC))
     });
 
     let go = GoParser::new();
     group.bench_function("go", |b| {
-        b.iter(|| parse_once(&rt, &go, "bench/sample.go", GO_SRC))
+        b.iter(|| parse_once(&go, "bench/sample.go", GO_SRC))
     });
 
     let java = JavaParser::new();
     group.bench_function("java", |b| {
-        b.iter(|| parse_once(&rt, &java, "bench/sample.java", JAVA_SRC))
+        b.iter(|| parse_once(&java, "bench/sample.java", JAVA_SRC))
     });
 
     group.finish();

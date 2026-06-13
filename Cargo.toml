@@ -41,6 +41,7 @@ tree-sitter-cpp = "0.22"
 tree-sitter-ruby = "0.21"
 tree-sitter-swift = "=0.5.0"
 tree-sitter-c-sharp = "0.21"
+rayon = "1.10"
 
 # Storage
 rusqlite = { version = "0.31", features = ["bundled"] }

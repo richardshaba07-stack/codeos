@@ -209,9 +209,7 @@ mod tests {
 
         // Un file con entità reali → delta NON vuoto → si arriva ad apply_delta,
         // che il mock fa fallire.
-        let parsed = RustParser::new()
-            .parse_file(Path::new("src/lib.rs"), "pub fn alpha() {}\n")
-            .await;
+        let parsed = RustParser::new().parse_file(Path::new("src/lib.rs"), "pub fn alpha() {}\n");
         tx.send(CodeOsEvent::FilesIndexed {
             results: vec![parsed],
         })
@@ -269,9 +267,7 @@ mod tests {
         });
         let actor = GraphActor::new(storage, tx.clone(), None).with_commit_provider(provider);
 
-        let parsed = RustParser::new()
-            .parse_file(Path::new("src/lib.rs"), "pub fn alpha() {}\n")
-            .await;
+        let parsed = RustParser::new().parse_file(Path::new("src/lib.rs"), "pub fn alpha() {}\n");
         actor.handle_files_indexed(vec![parsed]).await.unwrap();
 
         let delta = recv_graph_updated(&mut rx).await;
@@ -294,9 +290,7 @@ mod tests {
         let mut rx = tx.subscribe();
         let actor = GraphActor::new(storage, tx.clone(), None); // nessun provider
 
-        let parsed = RustParser::new()
-            .parse_file(Path::new("src/lib.rs"), "pub fn alpha() {}\n")
-            .await;
+        let parsed = RustParser::new().parse_file(Path::new("src/lib.rs"), "pub fn alpha() {}\n");
         actor.handle_files_indexed(vec![parsed]).await.unwrap();
 
         let delta = recv_graph_updated(&mut rx).await;

@@ -52,7 +52,7 @@ fn bench_resolve(c: &mut Criterion) {
         .map(|i| {
             let src = module_source(i);
             let path = format!("pkg/mod{i}.py");
-            rt.block_on(parser.parse_file(Path::new(&path), &src))
+            parser.parse_file(Path::new(&path), &src)
         })
         .collect();
 
