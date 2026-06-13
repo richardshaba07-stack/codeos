@@ -94,11 +94,44 @@ impl SqliteStorage {
     }
 
     fn from_connection(mut conn: Connection) -> anyhow::Result<Self> {
+        apply_performance_pragmas(&conn).context("PRAGMA di performance falliti")?;
         run_migrations(&mut conn).context("migrazione dello schema del grafo fallita")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
+}
+
+/// PRAGMA di performance per la scrittura intensiva durante l'indicizzazione.
+/// Applicati all'apertura, prima delle migrazioni.
+///
+/// - `journal_mode=WAL`: il Write-Ahead Logging permette letture concorrenti
+///   mentre si scrive ed è molto più veloce del rollback-journal su tante
+///   transazioni (su `:memory:` SQLite lo ignora — è già in RAM).
+/// - `synchronous=NORMAL`: niente `fsync` a ogni commit (sicuro CON il WAL: si
+///   può perdere l'ultima transazione su crash del SO, mai corrompere il DB).
+/// - `temp_store=MEMORY`: gli indici/sort temporanei restano in RAM, non su disco.
+/// - `cache_size`: pagine in cache, in KiB se negativo. Default PRUDENTE (64 MiB):
+///   su una macchina da poca RAM una cache enorme ruberebbe memoria al parsing
+///   (che durante l'index è il vero divoratore — misurato: ~85% del tempo). Chi
+///   ha RAM da vendere alza `CODEOS_SQLITE_CACHE_MB`. NON un 2 GB hardcoded che
+///   manderebbe in swap una macchina da 8 GB sotto indicizzazione parallela.
+fn apply_performance_pragmas(conn: &Connection) -> anyhow::Result<()> {
+    let cache_mb: i64 = std::env::var("CODEOS_SQLITE_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&mb: &i64| mb > 0)
+        .unwrap_or(64);
+    let pragmas = format!(
+        "PRAGMA journal_mode=WAL;\
+         PRAGMA synchronous=NORMAL;\
+         PRAGMA temp_store=MEMORY;\
+         PRAGMA cache_size=-{};",
+        cache_mb * 1024
+    );
+    conn.execute_batch(&pragmas)
+        .context("applicazione dei PRAGMA di performance fallita")?;
+    Ok(())
 }
 
 /// Porta il database alla [`SCHEMA_VERSION`] corrente applicando, in ordine, le
@@ -156,57 +189,76 @@ impl GraphStorage for SqliteStorage {
 
         // Ordine: prima le relazioni rimosse, poi le entità rimosse, poi le
         // entità aggiunte, infine le relazioni aggiunte (che possono referenziare
-        // entità appena inserite).
-        for rel_id in &delta.removed_relation_ids {
-            tx.execute(
-                "DELETE FROM relations WHERE id = ?1",
-                params![rel_id.0.to_string()],
-            )
-            .context("rimozione relazione fallita")?;
-        }
-        for ent_id in &delta.removed_entity_ids {
-            tx.execute(
-                "DELETE FROM entities WHERE id = ?1",
-                params![ent_id.0.to_string()],
-            )
-            .context("rimozione entità fallita")?;
-        }
-        for entity in &delta.added_entities {
-            let metadata = serde_json::to_string(&entity.metadata)
-                .context("serializzazione metadata entità fallita")?;
-            tx.execute(
-                "INSERT INTO entities \
-                 (id, kind, qualified_name, file_path, start_line, start_column, end_line, end_column, metadata) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    entity.id.0.to_string(),
-                    entity_kind_to_str(entity.kind),
-                    entity.qualified_name,
-                    entity.location.file_path,
-                    entity.location.start_line,
-                    entity.location.start_column,
-                    entity.location.end_line,
-                    entity.location.end_column,
-                    metadata,
-                ],
-            )
-            .with_context(|| format!("inserimento entità '{}' fallito", entity.qualified_name))?;
-        }
-        for relation in &delta.added_relations {
-            let metadata = serde_json::to_string(&relation.metadata)
-                .context("serializzazione metadata relazione fallita")?;
-            tx.execute(
-                "INSERT INTO relations (id, kind, source_id, target_id, metadata) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    relation.id.0.to_string(),
-                    relation_kind_to_str(relation.kind),
-                    relation.source_id.0.to_string(),
-                    relation.target_id.0.to_string(),
-                    metadata,
-                ],
-            )
-            .context("inserimento relazione fallito")?;
+        // entità appena inserite). Ogni fase usa UN prepared statement riusato
+        // su tutte le righe: `tx.execute(sql, …)` ri-compilerebbe l'SQL a ogni
+        // riga — su centinaia di migliaia di INSERT (dotnet-runtime: 600k+)
+        // il costo di re-parse domina. Lo statement va in uno scope che si
+        // chiude prima del commit (borrowa la transazione).
+        {
+            let mut del_rel = tx
+                .prepare("DELETE FROM relations WHERE id = ?1")
+                .context("prepare DELETE relations fallito")?;
+            for rel_id in &delta.removed_relation_ids {
+                del_rel
+                    .execute(params![rel_id.0.to_string()])
+                    .context("rimozione relazione fallita")?;
+            }
+
+            let mut del_ent = tx
+                .prepare("DELETE FROM entities WHERE id = ?1")
+                .context("prepare DELETE entities fallito")?;
+            for ent_id in &delta.removed_entity_ids {
+                del_ent
+                    .execute(params![ent_id.0.to_string()])
+                    .context("rimozione entità fallita")?;
+            }
+
+            let mut ins_ent = tx
+                .prepare(
+                    "INSERT INTO entities \
+                     (id, kind, qualified_name, file_path, start_line, start_column, end_line, end_column, metadata) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )
+                .context("prepare INSERT entities fallito")?;
+            for entity in &delta.added_entities {
+                let metadata = serde_json::to_string(&entity.metadata)
+                    .context("serializzazione metadata entità fallita")?;
+                ins_ent
+                    .execute(params![
+                        entity.id.0.to_string(),
+                        entity_kind_to_str(entity.kind),
+                        entity.qualified_name,
+                        entity.location.file_path,
+                        entity.location.start_line,
+                        entity.location.start_column,
+                        entity.location.end_line,
+                        entity.location.end_column,
+                        metadata,
+                    ])
+                    .with_context(|| {
+                        format!("inserimento entità '{}' fallito", entity.qualified_name)
+                    })?;
+            }
+
+            let mut ins_rel = tx
+                .prepare(
+                    "INSERT INTO relations (id, kind, source_id, target_id, metadata) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .context("prepare INSERT relations fallito")?;
+            for relation in &delta.added_relations {
+                let metadata = serde_json::to_string(&relation.metadata)
+                    .context("serializzazione metadata relazione fallita")?;
+                ins_rel
+                    .execute(params![
+                        relation.id.0.to_string(),
+                        relation_kind_to_str(relation.kind),
+                        relation.source_id.0.to_string(),
+                        relation.target_id.0.to_string(),
+                        metadata,
+                    ])
+                    .context("inserimento relazione fallito")?;
+            }
         }
 
         tx.commit().context("commit della transazione fallito")?;
