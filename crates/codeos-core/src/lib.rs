@@ -160,7 +160,15 @@ pub fn spawn_with_storage_decisions_and_repo(
     tokio::spawn(
         codeos_query::QueryActor::with_decisions(storage.clone(), decisions.clone()).run(query_rx),
     );
-    tokio::spawn(MemoryActor::new(decisions.clone()).run(memory_rx));
+    // Il MemoryActor riceve lo STESSO storage del grafo per ANCORARE le
+    // decisioni alle entità reali alla registrazione (auto-anchoring, racc. #1
+    // del report A/B sul moat): senza, le decisioni umane «fluttuanti» cadono
+    // fuori dal context builder proprio dove il *perché* non-derivabile conta.
+    tokio::spawn(
+        MemoryActor::new(decisions.clone())
+            .with_graph(storage.clone())
+            .run(memory_rx),
+    );
 
     // Radice del progetto per il resolver del grafo: la deriviamo dalla root del
     // repo (quando nota). Serve a rendere i `qualified_name` RELATIVI alla radice —
