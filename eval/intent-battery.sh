@@ -25,7 +25,14 @@ PORT="${5:-50090}"
 
 ROOT="$(cd "$REPO" && pwd)"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$HERE/target/release"; [ -x "$BIN/codeos" ] || BIN="$HERE/target/debug"
+# Il binario PIÙ RECENTE tra release e debug (un binario stantio mente).
+BIN="$HERE/target/release"
+if [ -x "$HERE/target/debug/codeos" ] \
+   && [ "$HERE/target/debug/codeos" -nt "$HERE/target/release/codeos" ]; then
+  BIN="$HERE/target/debug"
+fi
+[ -x "$BIN/codeos" ] || { echo "errore: nessun binario codeos compilato"; exit 1; }
+echo "(binario: $BIN)"
 TMP="$(mktemp -d /tmp/codeos-intent.XXXXXX)"
 SRV=""
 trap 'kill "${SRV:-}" 2>/dev/null; rm -rf "$TMP"' EXIT

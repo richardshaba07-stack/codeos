@@ -27,8 +27,16 @@ PORT="${4:-50094}"
 EXT_RE='\.(rs|py|ts|tsx|js|go|java)$'
 
 ROOT="$(cd "$REPO" && pwd)"
-BIN="$ROOT/target/debug"
-[ -x "$BIN/codeos-server" ] || BIN="$ROOT/target/release"
+# Il binario PIÙ RECENTE tra release e debug: un binario stantio invalida la
+# misura senza dirlo (successo: il 2026-06-13 un debug del giorno prima ha
+# prodotto un A/B nullo — il "miglioramento" era rumore a motore identico).
+BIN="$ROOT/target/release"
+if [ -x "$ROOT/target/debug/codeos-server" ] \
+   && [ "$ROOT/target/debug/codeos-server" -nt "$ROOT/target/release/codeos-server" ]; then
+  BIN="$ROOT/target/debug"
+fi
+[ -x "$BIN/codeos-server" ] || { echo "errore: nessun codeos-server compilato (target/release o target/debug)"; exit 1; }
+echo "(binario: $BIN)"
 TMP="$(mktemp -d /tmp/codeos-loc.XXXXXX)"
 SRV=""
 trap 'kill "${SRV:-}" 2>/dev/null; rm -rf "$TMP"' EXIT
