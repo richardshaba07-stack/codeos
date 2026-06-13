@@ -1701,10 +1701,12 @@ fn compress_context(
     }
 
     // Oltre il budget: tronca dalla CODA su un confine di riga. Le sezioni sono in
-    // ordine di priorità (PANORAMICA/SOTTOSISTEMI, FILE RILEVANTI, DIPENDENZE,
-    // IMPATTO, PERCORSI, CONTESTO DI SVILUPPO, DECISIONI, BUCHI): tagliando dal fondo
+    // ordine di priorità (DECISIONI, FILE RILEVANTI, DIPENDENZE, IMPATTO, PERCORSI,
+    // CONTESTO DI SVILUPPO, BUCHI, VISTE D'AMPIEZZA L1/L0): tagliando dal fondo
     // si PRESERVA ciò che serve di più all'LLM per localizzare il lavoro (quali file
-    // toccare), e si sacrificano prima le sezioni più accessorie. Sostituisce la
+    // toccare), e si sacrificano prima le sezioni più accessorie — per PRIME le
+    // viste d'ampiezza, aggregati derivabili (tenerle in TESTA costava recall:
+    // 0.760→0.891 misurato spegnendole, potatura Fase 1). Sostituisce la
     // vecchia ricerca binaria sulle entità, che invece sforbiciava proprio FILE
     // RILEVANTI lasciando intatte le sezioni pesanti (DECISIONI) — col risultato di
     // NON rispettare il budget e di svuotare la sezione più utile (misurato dall'eval
@@ -1790,121 +1792,6 @@ fn format_context(
             }
         }
         out.push('\n');
-    }
-
-    // Livello L1 — VISTA SOTTOSISTEMI: il raggruppamento dei moduli per CARTELLA, un
-    // gradino più in alto di PANORAMICA (che è per file). Compare solo quando AGGREGA
-    // davvero — ≥2 cartelle e meno cartelle che file (cioè almeno una cartella raccoglie
-    // più file): se ogni file sta in una cartella diversa, sarebbe PANORAMICA ridetta.
-    // Posta sopra L0 (zoom dal grosso al fine: sottosistemi → moduli → entità). Esclude
-    // gli `ExternalDependency`, come L0.
-    {
-        let mut files_seen: BTreeSet<&str> = BTreeSet::new();
-        let mut per_dir: BTreeMap<&str, (BTreeSet<&str>, usize)> = BTreeMap::new();
-        for e in entities {
-            if e.kind == EntityKind::ExternalDependency {
-                continue;
-            }
-            let f = e.location.file_path.as_str();
-            files_seen.insert(f);
-            let entry = per_dir.entry(parent_dir(f)).or_default();
-            entry.0.insert(f);
-            entry.1 += 1;
-        }
-        if per_dir.len() >= 2 && per_dir.len() < files_seen.len() {
-            out.push_str("VISTA SOTTOSISTEMI (le cartelle del progetto toccate dal sottografo):\n");
-            let mut dirs: Vec<(&str, usize, usize)> = per_dir
-                .iter()
-                .map(|(d, (fs, n))| (*d, fs.len(), *n))
-                .collect();
-            // Per numero di entità (desc), poi per nome: il sottosistema più centrale
-            // in testa, ordine deterministico.
-            dirs.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
-            for (dir, nfiles, nent) in &dirs {
-                out.push_str(&format!(
-                    "- {dir}/ ({nfiles} file, {nent} entità rilevanti)\n"
-                ));
-            }
-            // Dipendenze tra sottosistemi: archi cross-cartella fra entità non esterne.
-            let mut edges: BTreeSet<(&str, &str)> = BTreeSet::new();
-            for rel in relations {
-                if let (Some(s), Some(t)) = (by_id.get(&rel.source_id), by_id.get(&rel.target_id)) {
-                    if s.kind == EntityKind::ExternalDependency
-                        || t.kind == EntityKind::ExternalDependency
-                    {
-                        continue;
-                    }
-                    let (sd, td) = (
-                        parent_dir(s.location.file_path.as_str()),
-                        parent_dir(t.location.file_path.as_str()),
-                    );
-                    if sd != td {
-                        edges.insert((sd, td));
-                    }
-                }
-            }
-            if !edges.is_empty() {
-                out.push_str("  dipendenze tra sottosistemi:\n");
-                for (s, t) in &edges {
-                    out.push_str(&format!("  - {s}/ → {t}/\n"));
-                }
-            }
-            out.push('\n');
-        }
-    }
-
-    // Livello L0 — PANORAMICA: la forma architetturale a colpo d'occhio. Su quali
-    // moduli (file) del PROGETTO si distribuisce il sottografo rilevante, e come
-    // dipendono l'uno dall'altro (archi entità→entità aggregati a file→file, solo
-    // cross-file). È l'overview AGGREGATA che FILE RILEVANTI (elenco di entità) e
-    // DIPENDENZE CHIAVE (archi tra entità) non danno. Le dipendenze ESTERNE
-    // (`ExternalDependency`) sono ESCLUSE: non sono moduli del progetto, e contarle
-    // come un pseudo-modulo «<external>» falserebbe la mappa — la loro presenza è già
-    // visibile a livello di entità. Compare solo se il sottografo tocca ≥2 moduli del
-    // progetto. Riflette le entità MOSTRATE (se il passo Compress ne ha omesse, FILE
-    // RILEVANTI lo dichiara).
-    {
-        let mut per_file: BTreeMap<&str, usize> = BTreeMap::new();
-        for e in entities {
-            if e.kind == EntityKind::ExternalDependency {
-                continue;
-            }
-            *per_file.entry(e.location.file_path.as_str()).or_insert(0) += 1;
-        }
-        if per_file.len() >= 2 {
-            out.push_str("PANORAMICA (i moduli del progetto su cui si distribuisce il sottografo rilevante):\n");
-            // Moduli per numero di entità rilevanti (desc), poi per nome: il più
-            // centrale in testa, ordine deterministico.
-            let mut files: Vec<(&str, usize)> = per_file.into_iter().collect();
-            files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-            for (file, count) in &files {
-                out.push_str(&format!("- {file} ({count} entità rilevanti)\n"));
-            }
-            // Dipendenze tra moduli del progetto: archi cross-file fra entità non
-            // esterne. Gli archi verso `ExternalDependency` non sono dipendenze TRA
-            // moduli del progetto e restano fuori.
-            let mut edges: BTreeSet<(&str, &str)> = BTreeSet::new();
-            for rel in relations {
-                if let (Some(s), Some(t)) = (by_id.get(&rel.source_id), by_id.get(&rel.target_id)) {
-                    if s.kind == EntityKind::ExternalDependency
-                        || t.kind == EntityKind::ExternalDependency
-                    {
-                        continue;
-                    }
-                    let (sf, tf) = (s.location.file_path.as_str(), t.location.file_path.as_str());
-                    if sf != tf {
-                        edges.insert((sf, tf));
-                    }
-                }
-            }
-            if !edges.is_empty() {
-                out.push_str("  dipendenze tra moduli:\n");
-                for (s, t) in &edges {
-                    out.push_str(&format!("  - {s} → {t}\n"));
-                }
-            }
-            out.push('\n');
-        }
     }
 
     out.push_str("FILE RILEVANTI:\n");
@@ -2125,6 +2012,127 @@ fn format_context(
         );
     }
 
+    // VISTE D'AMPIEZZA (L1 + L0) — IN CODA, deliberatamente. Stavano in testa,
+    // sopra FILE RILEVANTI; ma il Compress tronca dalla CODA, quindi sotto
+    // pressione di budget sopravvivevano gli AGGREGATI (derivabili) e moriva la
+    // sezione che localizza. MISURATO (Fase 1, eval/localization.sh, 37 commit):
+    // L0+L1 in testa = 0.760 (34/37); spente = 0.891 (37/37, 100%). In coda le
+    // viste restano nel contesto quando il budget basta e sono le PRIME
+    // sacrificate quando non basta — il costo di localizzazione torna zero.
+    // Livello L1 — VISTA SOTTOSISTEMI: il raggruppamento dei moduli per CARTELLA, un
+    // gradino più in alto di PANORAMICA (che è per file). Compare solo quando AGGREGA
+    // davvero — ≥2 cartelle e meno cartelle che file (cioè almeno una cartella raccoglie
+    // più file): se ogni file sta in una cartella diversa, sarebbe PANORAMICA ridetta.
+    // Posta sopra L0 nel gruppo di coda. Esclude
+    // gli `ExternalDependency`, come L0.
+    {
+        let mut files_seen: BTreeSet<&str> = BTreeSet::new();
+        let mut per_dir: BTreeMap<&str, (BTreeSet<&str>, usize)> = BTreeMap::new();
+        for e in entities {
+            if e.kind == EntityKind::ExternalDependency {
+                continue;
+            }
+            let f = e.location.file_path.as_str();
+            files_seen.insert(f);
+            let entry = per_dir.entry(parent_dir(f)).or_default();
+            entry.0.insert(f);
+            entry.1 += 1;
+        }
+        if per_dir.len() >= 2 && per_dir.len() < files_seen.len() {
+            out.push_str("VISTA SOTTOSISTEMI (le cartelle del progetto toccate dal sottografo):\n");
+            let mut dirs: Vec<(&str, usize, usize)> = per_dir
+                .iter()
+                .map(|(d, (fs, n))| (*d, fs.len(), *n))
+                .collect();
+            // Per numero di entità (desc), poi per nome: il sottosistema più centrale
+            // in testa, ordine deterministico.
+            dirs.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
+            for (dir, nfiles, nent) in &dirs {
+                out.push_str(&format!(
+                    "- {dir}/ ({nfiles} file, {nent} entità rilevanti)\n"
+                ));
+            }
+            // Dipendenze tra sottosistemi: archi cross-cartella fra entità non esterne.
+            let mut edges: BTreeSet<(&str, &str)> = BTreeSet::new();
+            for rel in relations {
+                if let (Some(s), Some(t)) = (by_id.get(&rel.source_id), by_id.get(&rel.target_id)) {
+                    if s.kind == EntityKind::ExternalDependency
+                        || t.kind == EntityKind::ExternalDependency
+                    {
+                        continue;
+                    }
+                    let (sd, td) = (
+                        parent_dir(s.location.file_path.as_str()),
+                        parent_dir(t.location.file_path.as_str()),
+                    );
+                    if sd != td {
+                        edges.insert((sd, td));
+                    }
+                }
+            }
+            if !edges.is_empty() {
+                out.push_str("  dipendenze tra sottosistemi:\n");
+                for (s, t) in &edges {
+                    out.push_str(&format!("  - {s}/ → {t}/\n"));
+                }
+            }
+            out.push('\n');
+        }
+    }
+
+    // Livello L0 — PANORAMICA: la forma architetturale a colpo d'occhio. Su quali
+    // moduli (file) del PROGETTO si distribuisce il sottografo rilevante, e come
+    // dipendono l'uno dall'altro (archi entità→entità aggregati a file→file, solo
+    // cross-file). È l'overview AGGREGATA che FILE RILEVANTI (elenco di entità) e
+    // DIPENDENZE CHIAVE (archi tra entità) non danno. Le dipendenze ESTERNE
+    // (`ExternalDependency`) sono ESCLUSE: non sono moduli del progetto, e contarle
+    // come un pseudo-modulo «<external>» falserebbe la mappa — la loro presenza è già
+    // visibile a livello di entità. Compare solo se il sottografo tocca ≥2 moduli del
+    // progetto. Riflette le entità MOSTRATE (se il passo Compress ne ha omesse, FILE
+    // RILEVANTI lo dichiara).
+    {
+        let mut per_file: BTreeMap<&str, usize> = BTreeMap::new();
+        for e in entities {
+            if e.kind == EntityKind::ExternalDependency {
+                continue;
+            }
+            *per_file.entry(e.location.file_path.as_str()).or_insert(0) += 1;
+        }
+        if per_file.len() >= 2 {
+            out.push_str("PANORAMICA (i moduli del progetto su cui si distribuisce il sottografo rilevante):\n");
+            // Moduli per numero di entità rilevanti (desc), poi per nome: il più
+            // centrale in testa, ordine deterministico.
+            let mut files: Vec<(&str, usize)> = per_file.into_iter().collect();
+            files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            for (file, count) in &files {
+                out.push_str(&format!("- {file} ({count} entità rilevanti)\n"));
+            }
+            // Dipendenze tra moduli del progetto: archi cross-file fra entità non
+            // esterne. Gli archi verso `ExternalDependency` non sono dipendenze TRA
+            // moduli del progetto e restano fuori.
+            let mut edges: BTreeSet<(&str, &str)> = BTreeSet::new();
+            for rel in relations {
+                if let (Some(s), Some(t)) = (by_id.get(&rel.source_id), by_id.get(&rel.target_id)) {
+                    if s.kind == EntityKind::ExternalDependency
+                        || t.kind == EntityKind::ExternalDependency
+                    {
+                        continue;
+                    }
+                    let (sf, tf) = (s.location.file_path.as_str(), t.location.file_path.as_str());
+                    if sf != tf {
+                        edges.insert((sf, tf));
+                    }
+                }
+            }
+            if !edges.is_empty() {
+                out.push_str("  dipendenze tra moduli:\n");
+                for (s, t) in &edges {
+                    out.push_str(&format!("  - {s} → {t}\n"));
+                }
+            }
+            out.push('\n');
+        }
+    }
     out
 }
 
