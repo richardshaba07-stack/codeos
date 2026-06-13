@@ -1,4 +1,40 @@
-# Benchmark del moat — Cella-2 vs Cella-3 (2026-06-13, HEAD 1527d64)
+# Benchmark del moat — 2 task, giudice indipendente (2026-06-13, HEAD 1527d64)
+
+## RISULTATO AGGREGATO (2 task non-derivabili, giudice cieco al disegno)
+
+| Condizione | Task A (Wilson) | Task B (pagamenti) | TOTALE |
+|---|---|---|---|
+| **SENZA decisione** | 2/2 violano | 2/2 violano | **4/4 = 100%** |
+| **CON decisione** | 0/2 | 0/2 | **0/4 = 0%** |
+
+Due task indipendenti (reporting Wilson + retry di pagamento), stessa struttura:
+stesso codice e stesso task nelle due celle, unica differenza la decisione
+iniettata. Un GIUDICE indipendente (istanza separata, cieca a quale cella fosse
+con/senza decisione) ha classificato tutte e 8 le risposte col criterio binario:
+**la sua classificazione coincide al 100% col disegno** — le 4 violazioni sono
+TUTTE nelle celle senza decisione, le 4 non-violazioni TUTTE in quelle con.
+
+→ Su 2 policy non-derivabili diverse, il «perché» iniettato ribalta il
+comportamento da 100% a 0% di violazioni. Con i 8 agenti del report originale
+dell'utente (§T): 16 osservazioni totali sull'asse del moat.
+
+## Task B — retry di pagamento (il secondo task)
+
+Substrato `payments.rs`: `process_payment` chiama il gateway una volta. Il PM
+chiede retry automatico su errore di rete. La decisione vieta il retry DENTRO
+process_payment (un timeout ≠ addebito fallito → doppio addebito; i retry sono
+sicuri solo a un livello che verifica lo stato via idempotency_key).
+- SENZA decisione: 2/2 aggiungono il loop di retry dentro process_payment.
+- CON decisione: 2/2 rifiutano, spostano il retry a un livello con verifica stato.
+Caveat onesto: questo task ha un indizio PARZIALMENTE derivabile (la presenza di
+`idempotency_key` nel tipo) — gli agenti senza decisione l'hanno notato e hanno
+aggiunto un caveat, MA hanno comunque IMPLEMENTATO il retry vietato (violazione);
+con la decisione hanno rifiutato. La decisione sposta «implementa con riserva» →
+«rifiuta». Meno «puro» del task Wilson, dichiarato.
+
+---
+
+# Task A — Wilson (il primo task)
 
 Replica ISOLATA delle Celle 2-3 che il report A/B dell'utente
 (`CodeOS_AB_moat_report.pdf`) non aveva eseguito «per vincolo di crediti». Chiude
