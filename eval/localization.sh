@@ -30,12 +30,18 @@ ROOT="$(cd "$REPO" && pwd)"
 # Il binario PIÙ RECENTE tra release e debug: un binario stantio invalida la
 # misura senza dirlo (successo: il 2026-06-13 un debug del giorno prima ha
 # prodotto un A/B nullo — il "miglioramento" era rumore a motore identico).
-BIN="$ROOT/target/release"
-if [ -x "$ROOT/target/debug/codeos-server" ] \
-   && [ "$ROOT/target/debug/codeos-server" -nt "$ROOT/target/release/codeos-server" ]; then
-  BIN="$ROOT/target/debug"
+# CODEOS_BIN sovrascrive: serve per misurare un repo TERZO (che non ha
+# target/) coi binari di codeos-3.
+if [ -n "${CODEOS_BIN:-}" ]; then
+  BIN="$CODEOS_BIN"
+else
+  BIN="$ROOT/target/release"
+  if [ -x "$ROOT/target/debug/codeos-server" ] \
+     && [ "$ROOT/target/debug/codeos-server" -nt "$ROOT/target/release/codeos-server" ]; then
+    BIN="$ROOT/target/debug"
+  fi
 fi
-[ -x "$BIN/codeos-server" ] || { echo "errore: nessun codeos-server compilato (target/release o target/debug)"; exit 1; }
+[ -x "$BIN/codeos-server" ] || { echo "errore: nessun codeos-server in $BIN (compila, o passa CODEOS_BIN)"; exit 1; }
 echo "(binario: $BIN)"
 TMP="$(mktemp -d /tmp/codeos-loc.XXXXXX)"
 SRV=""
