@@ -31,6 +31,7 @@ mod java_lang;
 mod python;
 mod ruby_lang;
 mod rust_lang;
+mod swift_lang;
 mod traits;
 mod typescript;
 mod workspace;

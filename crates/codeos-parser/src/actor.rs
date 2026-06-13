@@ -13,6 +13,7 @@ use crate::java_lang::JavaParser;
 use crate::python::PythonParser;
 use crate::ruby_lang::RubyParser;
 use crate::rust_lang::RustParser;
+use crate::swift_lang::SwiftParser;
 use crate::traits::LanguageParser;
 use crate::typescript::TypeScriptParser;
 use crate::workspace::WorkspaceModel;
@@ -51,6 +52,7 @@ impl ParserActor {
                 Box::new(JavaParser::new()),
                 Box::new(CppParser::new()),
                 Box::new(RubyParser::new()),
+                Box::new(SwiftParser::new()),
             ],
             events,
         }
