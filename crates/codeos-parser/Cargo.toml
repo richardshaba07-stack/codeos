@@ -13,6 +13,7 @@ tree-sitter-rust = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 tree-sitter-go = { workspace = true }
 tree-sitter-java = { workspace = true }
+tree-sitter-cpp = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

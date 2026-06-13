@@ -7,6 +7,7 @@ use codeos_types::bus::{CodeOsEvent, Command};
 use codeos_types::ParsedFileResult;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::cpp::CppParser;
 use crate::go::GoParser;
 use crate::java_lang::JavaParser;
 use crate::python::PythonParser;
@@ -47,6 +48,7 @@ impl ParserActor {
                 Box::new(TypeScriptParser::new()),
                 Box::new(GoParser::new()),
                 Box::new(JavaParser::new()),
+                Box::new(CppParser::new()),
             ],
             events,
         }

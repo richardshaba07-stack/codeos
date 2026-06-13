@@ -25,6 +25,7 @@ pub(crate) const STACK_RED_ZONE: usize = 128 * 1024;
 pub(crate) const STACK_GROW_BY: usize = 2 * 1024 * 1024;
 
 mod actor;
+mod cpp;
 mod go;
 mod java_lang;
 mod python;
