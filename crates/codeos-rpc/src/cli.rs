@@ -544,6 +544,7 @@ async fn main() -> anyhow::Result<()> {
             let mut repo: Option<String> = None;
             let mut max: Option<usize> = Some(1000);
             let mut strong_only = false;
+            let mut write = false;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -557,6 +558,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                     "--strong-only" => {
                         strong_only = true;
+                        i += 1;
+                    }
+                    "--write" => {
+                        write = true;
                         i += 1;
                     }
                     arg if !arg.starts_with('-') && repo.is_none() => {
@@ -598,29 +603,100 @@ async fn main() -> anyhow::Result<()> {
                      È un'astensione onesta, non un errore.)"
                 );
             }
-            for d in &mined {
-                let short = if d.hash.len() >= 9 { &d.hash[..9] } else { &d.hash };
+            if write {
+                use codeos_memory::DecisionStore;
+                // Persiste nel LEDGER passando per Proposal→confirm, così l'evidenza
+                // (l'hash del commit) SOPRAVVIVE nel file Markdown — la provenienza è
+                // il cuore anti-FP. Idempotente: salta i commit già nel ledger, così
+                // ri-eseguire `learn --write` non duplica.
+                let dir = std::env::var("CODEOS_DECISIONS").unwrap_or_else(|_| {
+                    Path::new(&repo)
+                        .join(".codeos")
+                        .join("decisions")
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                let store = codeos_memory::MarkdownDecisionStore::new(&dir).await?;
+                let existing = store.all().await?;
+                // I commit già registrati (citati come Evidence::Commit): non riscriverli.
+                let already: std::collections::HashSet<String> = existing
+                    .iter()
+                    .flat_map(|d| d.evidence.iter())
+                    .filter_map(|e| match e {
+                        codeos_memory::Evidence::Commit(h) => Some(h.clone()),
+                        _ => None,
+                    })
+                    .collect();
+
+                let mut written = 0usize;
+                let mut skipped = 0usize;
+                for d in &mined {
+                    if already.contains(&d.hash) {
+                        skipped += 1;
+                        continue;
+                    }
+                    let draft = codeos_types::bus::NewDecision {
+                        author: "ai:DecisionMiner".to_string(),
+                        title: d.title.clone(),
+                        context: format!(
+                            "Estratto dalla storia git ({}) — segnale: {}.",
+                            d.confidence.as_str(),
+                            d.marker
+                        ),
+                        rationale: d.rationale.clone(),
+                        related_entity_ids: Vec::new(),
+                        related_decision_ids: Vec::new(),
+                        supersedes: Vec::new(),
+                        deprecates: Vec::new(),
+                        tags: vec!["learned".to_string(), "from-git".to_string()],
+                    };
+                    // L'hash del commit È l'evidenza: la Proposal lo esige (trap #1),
+                    // e confirm() lo trasferisce nel ledger.
+                    let proposal = codeos_memory::Proposal::new(
+                        draft,
+                        codeos_memory::DecisionKind::Decision,
+                        vec![codeos_memory::Evidence::Commit(d.hash.clone())],
+                    )?;
+                    store.record(&proposal.confirm()).await?;
+                    written += 1;
+                }
                 println!(
-                    "\n[{} · {}]  commit {short}",
-                    d.confidence.as_str(),
-                    d.marker
+                    "\n✅ {written} decisioni scritte nel ledger: {dir}"
                 );
-                println!("  «{}»", d.title);
-                println!("   ↳ {}", d.rationale);
-                let context = format!("Estratto dal commit {}", d.hash);
+                if skipped > 0 {
+                    println!("   ({skipped} già presenti, saltate — `learn --write` è idempotente)");
+                }
                 println!(
-                    "   registra:  codeos decide --title {} --why {} --context {} --tags 'learned,from-git'",
-                    shell_quote(&d.title),
-                    shell_quote(&d.rationale),
-                    shell_quote(&context)
+                    "   Autore: ai:DecisionMiner · tag: learned,from-git · ognuna cita il suo commit.\n \
+                     Sono file Markdown ispezionabili: rivedile e cancella quelle che non sono\n \
+                     vere decisioni (il gate umano resta tuo)."
                 );
-            }
-            if !mined.is_empty() {
-                println!(
-                    "\nℹ️  Sono PROPOSTE da rivedere: registra solo quelle che sono davvero\n \
-                     decisioni (il gate umano Candidate→Decision resta tuo). Ogni riga cita\n \
-                     l'hash, così il perché resta verificabile nella storia."
-                );
+            } else {
+                for d in &mined {
+                    let short = if d.hash.len() >= 9 { &d.hash[..9] } else { &d.hash };
+                    println!(
+                        "\n[{} · {}]  commit {short}",
+                        d.confidence.as_str(),
+                        d.marker
+                    );
+                    println!("  «{}»", d.title);
+                    println!("   ↳ {}", d.rationale);
+                    let context = format!("Estratto dal commit {}", d.hash);
+                    println!(
+                        "   registra:  codeos decide --title {} --why {} --context {} --tags 'learned,from-git'",
+                        shell_quote(&d.title),
+                        shell_quote(&d.rationale),
+                        shell_quote(&context)
+                    );
+                }
+                if !mined.is_empty() {
+                    println!(
+                        "\nℹ️  Sono PROPOSTE da rivedere: registra solo quelle che sono davvero\n \
+                         decisioni (il gate umano Candidate→Decision resta tuo). Ogni riga cita\n \
+                         l'hash, così il perché resta verificabile nella storia.\n \
+                         Oppure scrivile tutte con  codeos learn --write  (idempotente, revisionabili)."
+                    );
+                }
             }
         }
         "help" | "--help" | "-h" => {
@@ -951,8 +1027,8 @@ const COMMANDS: &[(&str, &str)] = &[
         "Time machine: perché esiste il confine tra due elementi (nascita, intento, decisioni correlate).",
     ),
     (
-        "learn [path] [--max N | --all] [--strong-only]",
-        "Estrae il PERCHÉ esplicito dai messaggi di commit (DECISION:/BREAKING CHANGE:/ADR-… o un perché causale nel corpo) e lo propone come decisioni da registrare. Anti-FP: razionale verbatim + hash citato, astensione sui commit terse. Sola lettura di git, non scrive il ledger (lo confermi tu con `codeos decide`).",
+        "learn [path] [--max N | --all] [--strong-only] [--write]",
+        "Estrae il PERCHÉ esplicito dai messaggi di commit (DECISION:/BREAKING CHANGE:/ADR-… o un perché causale nel corpo) e lo propone come decisioni. Anti-FP: razionale verbatim + hash citato, astensione sui commit terse. Senza --write stampa proposte da rivedere; con --write le scrive nel ledger (<repo>/.codeos/decisions) preservando l'evidenza del commit, idempotente. Sola lettura di git, mai il server (:50051 intoccato).",
     ),
     (
         "simulate \"move <src> to <dst>\"",
