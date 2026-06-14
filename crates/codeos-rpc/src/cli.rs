@@ -731,6 +731,73 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        "audit" => {
+            use codeos_memory::DecisionStore;
+            // Tiene il ledger VERO: segnala le decisioni la cui PROVENIENZA è sparita
+            // (commit riscritto/squashato, file ADR cancellato). Anti-FP: solo fatti
+            // verificati (git/filesystem), per-citazione. Sola lettura, mai il server.
+            let repo = args
+                .get(2)
+                .filter(|a| !a.starts_with('-'))
+                .cloned()
+                .or_else(|| std::env::var("CODEOS_REPO").ok())
+                .unwrap_or_else(|| ".".to_string());
+            let dir = std::env::var("CODEOS_DECISIONS").unwrap_or_else(|_| {
+                Path::new(&repo)
+                    .join(".codeos")
+                    .join("decisions")
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            let store = codeos_memory::MarkdownDecisionStore::new(&dir).await?;
+            let decisions = store.all().await?;
+
+            // Predicati di esistenza REALI, iniettati nella logica pura.
+            let repo_for_commit = repo.clone();
+            let commit_exists = |hash: &str| git_commit_exists(&repo_for_commit, hash);
+            let doc_exists = |path: &str| Path::new(&repo).join(path).exists();
+            let broken =
+                codeos_memory::find_broken_provenance(&decisions, commit_exists, doc_exists);
+
+            println!("🔎 AUDIT — integrità del ledger di intento");
+            println!("   (anti-FP: segnalo SOLO provenienze davvero sparite — commit irraggiungibile / file assente)");
+            println!("------------------------------------------------------------");
+            // Quante decisioni distinte sono toccate (una può avere più citazioni rotte).
+            let touched: std::collections::HashSet<_> =
+                broken.iter().map(|b| b.decision_id).collect();
+            println!(
+                "📊 {} decisioni nel ledger · {} con provenienza rotta",
+                decisions.len(),
+                touched.len()
+            );
+            for b in &broken {
+                let detail = match &b.reason {
+                    codeos_memory::BreakReason::CommitGone(h) => {
+                        let short = if h.len() >= 9 { &h[..9] } else { h };
+                        format!("commit {short} non più raggiungibile nel repo")
+                    }
+                    codeos_memory::BreakReason::DocumentGone(p) => {
+                        format!("documento «{p}» assente")
+                    }
+                };
+                println!("\n[provenienza rotta]  «{}»", b.decision_title);
+                println!("   ↳ {detail}");
+            }
+            if broken.is_empty() {
+                if decisions.is_empty() {
+                    println!("\n(Ledger vuoto: niente da verificare.)");
+                } else {
+                    println!("\n✅ Ogni decisione con provenienza cita una fonte ancora viva.");
+                }
+            } else {
+                println!(
+                    "\n⚠️  Rivedi: una decisione che punta a una fonte sparita va ri-ancorata a\n \
+                     una prova viva, oppure ritirata onestamente (supersedes/deprecates).\n \
+                     Esce con codice ≠0 per il gate CI."
+                );
+                std::process::exit(1);
+            }
+        }
         "help" | "--help" | "-h" => {
             print_usage();
         }
@@ -1063,6 +1130,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Estrae il PERCHÉ esplicito da dove già vive — messaggi di commit (DECISION:/BREAKING CHANGE:/ADR-… o un perché causale) e file ADR (docs/adr) — e lo propone come decisioni. Anti-FP: razionale verbatim + fonte citata, astensione su commit terse, template e ADR superati. Senza --write stampa proposte da rivedere; con --write le scrive nel ledger (<repo>/.codeos/decisions) preservando l'evidenza (commit/documento), idempotente. Sola lettura di git+file, mai il server (:50051 intoccato).",
     ),
     (
+        "audit [path]",
+        "Verifica l'integrità del ledger: segnala le decisioni la cui PROVENIENZA è sparita (commit riscritto/squashato, file ADR cancellato). Anti-FP: solo fatti verificati via git/filesystem, per-citazione; le decisioni umane senza evidenza non vengono mai segnalate. Exit 1 se trova provenienze rotte (gate CI). Sola lettura, mai il server.",
+    ),
+    (
         "simulate \"move <src> to <dst>\"",
         "What-if di refactoring: cosa cambierebbe spostando un elemento da <src> a <dst>.",
     ),
@@ -1105,6 +1176,22 @@ fn print_usage() {
 /// testo. Wrap in `'…'` e ogni apostrofo interno diventa `'\''`.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// `true` se `hash` esiste ed è un commit nel repo. Usa `git cat-file -e
+/// <hash>^{{commit}}`: conservativo per `audit` (finché l'oggetto è recuperabile
+/// non si grida al lupo). `false` se git non c'è o il comando fallisce: meglio non
+/// segnalare che segnalare a vanvera.
+fn git_commit_exists(repo: &str, hash: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("cat-file")
+        .arg("-e")
+        .arg(format!("{hash}^{{commit}}"))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Opzioni del comando `report`, derivate dai flag CLI.
@@ -1633,7 +1720,7 @@ mod tests {
         let usage = usage_text();
         for cmd in [
             "index", "report", "query", "path", "impact", "doctor", "guard", "context", "mri",
-            "why", "simulate", "help", "decide", "mcp", "licenses", "learn",
+            "why", "simulate", "help", "decide", "mcp", "licenses", "learn", "audit",
         ] {
             assert!(
                 usage.contains(cmd),
