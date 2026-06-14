@@ -197,6 +197,18 @@ fn tool_definitions() -> Value {
                     "path": {"type": "string", "description": "Radice del repository (default: CODEOS_REPO o la cartella corrente)."}
                 }
             }
+        },
+        {
+            "name": "codeos_learn",
+            "description": "Scopre il PERCHÉ già scritto nella storia del repo — messaggi di commit (DECISION:/BREAKING CHANGE:/ADR-… o un perché causale) e file ADR (docs/adr) — e lo propone come decisioni, ancorate ai moduli toccati. Anti-FP: razionale verbatim + fonte citata, astensione su commit terse/template/ADR superati. SOLO lettura e dry-run (non scrive il ledger): da usare per orientarsi sull'intento di un sottosistema prima di toccarlo.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Radice del repository (default: CODEOS_REPO o la cartella corrente)."},
+                    "max": {"type": "integer", "description": "Quanti commit recenti scansionare (default 1000)."},
+                    "strong_only": {"type": "boolean", "description": "Solo i segnali forti (marcatori espliciti/ADR), niente causali (default false)."}
+                }
+            }
         }
     ])
 }
@@ -420,10 +432,33 @@ async fn dispatch_tool(name: &str, args: &Value) -> anyhow::Result<String> {
             let (text, _broken) = crate::audit_report(&repo).await?;
             Ok(text)
         }
+        "codeos_learn" => {
+            // Sola lettura git+file, dry-run: NESSUNA scrittura del ledger (il gate
+            // umano resta fuori dall'MCP) e nessun server. Riusa crate::mine_repo.
+            let repo = arg_str(args, "path")
+                .ok()
+                .or_else(|| std::env::var("CODEOS_REPO").ok())
+                .unwrap_or_else(|| ".".to_string());
+            let max = args
+                .get("max")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .or(Some(1000));
+            let strong_only = args
+                .get("strong_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let r = crate::mine_repo(&repo, max, strong_only)?;
+            Ok(format!(
+                "{}{}",
+                crate::learn_summary(&r),
+                crate::learn_proposals(&r)
+            ))
+        }
         other => anyhow::bail!(
             "tool sconosciuto: '{other}' (disponibili: codeos_query, codeos_why, \
              codeos_impact, codeos_context_pack, codeos_decide, codeos_report, \
-             codeos_licenses, codeos_audit)"
+             codeos_licenses, codeos_audit, codeos_learn)"
         ),
     }
 }
@@ -460,6 +495,7 @@ mod tests {
             "codeos_decide",
             "codeos_report",
             "codeos_audit",
+            "codeos_learn",
         ] {
             assert!(names.contains(&expected), "manca {expected}: {names:?}");
         }

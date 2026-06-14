@@ -577,68 +577,11 @@ async fn main() -> anyhow::Result<()> {
                 .or_else(|| std::env::var("CODEOS_REPO").ok())
                 .unwrap_or_else(|| ".".to_string());
 
-            // Fonte 1: i messaggi di commit (intento scritto a parole nei commit).
-            let messages = codeos_paleo::read_commit_messages(&repo, max)?;
-            let scanned = messages.len();
-            let mut mined = codeos_paleo::mine(&messages);
-
-            // Mappa hash→file toccati: serve ad ANCORARE le decisioni minate alle aree
-            // di codice del commit (tag di modulo), così affiorano nel pack mirato.
-            // Best-effort: se git non risponde, restano i soli tag generici.
-            let file_map: std::collections::HashMap<String, Vec<String>> = {
-                use codeos_paleo::CommitHistory;
-                codeos_paleo::GitLog::new(&repo)
-                    .commits()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|c| (c.hash, c.changed_files))
-                    .collect()
-            };
-            // I tag di modulo per una decisione minata da commit (vuoto per gli ADR).
-            let anchor_tags = |d: &codeos_paleo::MinedDecision| -> Vec<String> {
-                match &d.source {
-                    codeos_paleo::DecisionSource::Commit(h) => file_map
-                        .get(h)
-                        .map(|files| module_tags_from_files(files, 5))
-                        .unwrap_or_default(),
-                    codeos_paleo::DecisionSource::Document(_) => Vec::new(),
-                }
-            };
-            if strong_only {
-                mined.retain(|d| d.confidence == codeos_paleo::IntentConfidence::Strong);
-            }
-            let commit_mined = mined.len();
-
-            // Fonte 2: gli ADR (decisioni architetturali già deliberate in docs/adr).
-            let adrs = codeos_paleo::read_adrs(&repo);
-            let adr_files = adrs.len();
-            let mut adr_mined = codeos_paleo::mine_adrs(&adrs);
-            let adr_count = adr_mined.len();
-            mined.append(&mut adr_mined);
-
-            // I segnali forti prima dei causali: l'umano tria dall'alto.
-            mined.sort_by_key(|d| match d.confidence {
-                codeos_paleo::IntentConfidence::Strong => 0,
-                codeos_paleo::IntentConfidence::Causal => 1,
-            });
-
-            println!("🔎 LEARN — il «perché» estratto dalle fonti dove già vive");
-            println!("   (anti-FP: razionale verbatim + fonte citata; ciò che non porta intento esplicito si astiene, mai inventato)");
-            println!("------------------------------------------------------------");
-            let commit_abstained = scanned.saturating_sub(commit_mined);
-            println!(
-                "📊 commit: {scanned} scansionati · {commit_mined} con intento · {commit_abstained} astenuti"
-            );
-            println!("   ADR:    {adr_files} file · {adr_count} decisioni");
-            if mined.is_empty() {
-                println!(
-                    "\n(Nessuna decisione esplicita trovata: né marcatori nei commit\n \
-                     (`DECISION:`/`BREAKING CHANGE:`/`ADR-…`/un perché causale) né ADR in docs/adr.\n \
-                     È un'astensione onesta, non un errore.)"
-                );
-            }
+            // Minatura condivisa con il tool MCP `codeos_learn` (mine_repo).
+            let r = mine_repo(&repo, max, strong_only)?;
             if write {
                 use codeos_memory::DecisionStore;
+                print!("{}", learn_summary(&r));
                 // Persiste nel LEDGER passando per Proposal→confirm, così l'evidenza
                 // (l'hash del commit) SOPRAVVIVE nel file Markdown — la provenienza è
                 // il cuore anti-FP. Idempotente: salta i commit già nel ledger, così
@@ -665,7 +608,7 @@ async fn main() -> anyhow::Result<()> {
 
                 let mut written = 0usize;
                 let mut skipped = 0usize;
-                for d in &mined {
+                for d in &r.mined {
                     if already.contains(d.source.key()) {
                         skipped += 1;
                         continue;
@@ -689,7 +632,7 @@ async fn main() -> anyhow::Result<()> {
                         ),
                     };
                     let mut tags = vec!["learned".to_string(), source_tag.to_string()];
-                    tags.extend(anchor_tags(d)); // ancora alle aree di codice del commit
+                    tags.extend(anchor_tags_for(d, &r.file_map)); // ancora alle aree del commit
                     let draft = codeos_types::bus::NewDecision {
                         author: "ai:DecisionMiner".to_string(),
                         title: d.title.clone(),
@@ -722,41 +665,8 @@ async fn main() -> anyhow::Result<()> {
                      quelle che non sono vere decisioni (il gate umano resta tuo)."
                 );
             } else {
-                for d in &mined {
-                    println!(
-                        "\n[{} · {}]  {}",
-                        d.confidence.as_str(),
-                        d.marker,
-                        d.source.short()
-                    );
-                    println!("  «{}»", d.title);
-                    println!("   ↳ {}", d.rationale);
-                    let (context, source_tag) = match &d.source {
-                        codeos_paleo::DecisionSource::Commit(h) => {
-                            (format!("Estratto dal commit {h}"), "from-git")
-                        }
-                        codeos_paleo::DecisionSource::Document(p) => {
-                            (format!("Estratto dall'ADR {p}"), "from-adr")
-                        }
-                    };
-                    let mut all_tags = vec!["learned".to_string(), source_tag.to_string()];
-                    all_tags.extend(anchor_tags(d));
-                    println!(
-                        "   registra:  codeos decide --title {} --why {} --context {} --tags {}",
-                        shell_quote(&d.title),
-                        shell_quote(&d.rationale),
-                        shell_quote(&context),
-                        shell_quote(&all_tags.join(","))
-                    );
-                }
-                if !mined.is_empty() {
-                    println!(
-                        "\nℹ️  Sono PROPOSTE da rivedere: registra solo quelle che sono davvero\n \
-                         decisioni (il gate umano Candidate→Decision resta tuo). Ogni riga cita\n \
-                         la fonte, così il perché resta verificabile.\n \
-                         Oppure scrivile tutte con  codeos learn --write  (idempotente, revisionabili)."
-                    );
-                }
+                // Dry-run: sommario + proposte, stessi formatter del tool MCP.
+                print!("{}{}", learn_summary(&r), learn_proposals(&r));
             }
         }
         "audit" => {
@@ -1117,7 +1027,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "mcp",
-        "Avvia il server MCP su stdio: CodeOS come tool nativo per gli agenti (Claude Code, Cursor…). Tool esposti: codeos_query, codeos_why, codeos_impact, codeos_context_pack, codeos_decide, codeos_report, codeos_licenses, codeos_audit.",
+        "Avvia il server MCP su stdio: CodeOS come tool nativo per gli agenti (Claude Code, Cursor…). Tool esposti: codeos_query, codeos_why, codeos_impact, codeos_context_pack, codeos_decide, codeos_report, codeos_licenses, codeos_audit, codeos_learn.",
     ),
     ("help", "Mostra questo aiuto."),
 ];
@@ -1266,6 +1176,142 @@ pub(crate) async fn audit_report(repo: &str) -> anyhow::Result<(String, usize)> 
         );
     }
     Ok((s, touched.len()))
+}
+
+/// Il risultato della MINIATURA di un repo: le decisioni estratte (commit + ADR),
+/// la mappa hash→file per l'anchoring, e i conteggi per il sommario. Condiviso dalla
+/// CLI `learn` e dal tool MCP `codeos_learn`.
+pub(crate) struct MineResult {
+    mined: Vec<codeos_paleo::MinedDecision>,
+    file_map: std::collections::HashMap<String, Vec<String>>,
+    scanned: usize,
+    commit_mined: usize,
+    adr_files: usize,
+    adr_count: usize,
+}
+
+/// Mina i commit + gli ADR di un repo, pronto per l'anchoring, ordinato (forti
+/// prima). Sola lettura git+file, NESSUN server. Fonte unica per CLI `learn` e MCP.
+pub(crate) fn mine_repo(
+    repo: &str,
+    max: Option<usize>,
+    strong_only: bool,
+) -> anyhow::Result<MineResult> {
+    // Fonte 1: i messaggi di commit.
+    let messages = codeos_paleo::read_commit_messages(repo, max)?;
+    let scanned = messages.len();
+    let mut mined = codeos_paleo::mine(&messages);
+
+    // Mappa hash→file toccati, per ancorare le decisioni alle aree di codice.
+    let file_map: std::collections::HashMap<String, Vec<String>> = {
+        use codeos_paleo::CommitHistory;
+        codeos_paleo::GitLog::new(repo)
+            .commits()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| (c.hash, c.changed_files))
+            .collect()
+    };
+    if strong_only {
+        mined.retain(|d| d.confidence == codeos_paleo::IntentConfidence::Strong);
+    }
+    let commit_mined = mined.len();
+
+    // Fonte 2: gli ADR.
+    let adrs = codeos_paleo::read_adrs(repo);
+    let adr_files = adrs.len();
+    let mut adr_mined = codeos_paleo::mine_adrs(&adrs);
+    let adr_count = adr_mined.len();
+    mined.append(&mut adr_mined);
+
+    // I segnali forti prima dei causali.
+    mined.sort_by_key(|d| match d.confidence {
+        codeos_paleo::IntentConfidence::Strong => 0,
+        codeos_paleo::IntentConfidence::Causal => 1,
+    });
+    Ok(MineResult {
+        mined,
+        file_map,
+        scanned,
+        commit_mined,
+        adr_files,
+        adr_count,
+    })
+}
+
+/// I tag di modulo per una decisione minata da commit (vuoto per gli ADR, che non
+/// hanno un mapping commit→file). Ancora la decisione alle aree di codice toccate.
+fn anchor_tags_for(
+    d: &codeos_paleo::MinedDecision,
+    file_map: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    match &d.source {
+        codeos_paleo::DecisionSource::Commit(h) => file_map
+            .get(h)
+            .map(|files| module_tags_from_files(files, 5))
+            .unwrap_or_default(),
+        codeos_paleo::DecisionSource::Document(_) => Vec::new(),
+    }
+}
+
+/// Il SOMMARIO di `learn` (header + conteggi). Condiviso CLI/MCP.
+pub(crate) fn learn_summary(r: &MineResult) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(s, "🔎 LEARN — il «perché» estratto dalle fonti dove già vive");
+    let _ = writeln!(s, "   (anti-FP: razionale verbatim + fonte citata; ciò che non porta intento esplicito si astiene, mai inventato)");
+    let _ = writeln!(s, "------------------------------------------------------------");
+    let commit_abstained = r.scanned.saturating_sub(r.commit_mined);
+    let _ = writeln!(
+        s,
+        "📊 commit: {} scansionati · {} con intento · {} astenuti",
+        r.scanned, r.commit_mined, commit_abstained
+    );
+    let _ = writeln!(s, "   ADR:    {} file · {} decisioni", r.adr_files, r.adr_count);
+    if r.mined.is_empty() {
+        let _ = writeln!(s, "\n(Nessuna decisione esplicita trovata: né marcatori nei commit (`DECISION:`/`BREAKING CHANGE:`/`ADR-…`/un perché causale) né ADR in docs/adr. È un'astensione onesta, non un errore.)");
+    }
+    s
+}
+
+/// Le PROPOSTE di `learn` (un blocco per decisione + nota finale). Dry-run, da
+/// rivedere e confermare a mano. Condiviso CLI/MCP.
+pub(crate) fn learn_proposals(r: &MineResult) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    for d in &r.mined {
+        let _ = writeln!(
+            s,
+            "\n[{} · {}]  {}",
+            d.confidence.as_str(),
+            d.marker,
+            d.source.short()
+        );
+        let _ = writeln!(s, "  «{}»", d.title);
+        let _ = writeln!(s, "   ↳ {}", d.rationale);
+        let (context, source_tag) = match &d.source {
+            codeos_paleo::DecisionSource::Commit(h) => {
+                (format!("Estratto dal commit {h}"), "from-git")
+            }
+            codeos_paleo::DecisionSource::Document(p) => {
+                (format!("Estratto dall'ADR {p}"), "from-adr")
+            }
+        };
+        let mut all_tags = vec!["learned".to_string(), source_tag.to_string()];
+        all_tags.extend(anchor_tags_for(d, &r.file_map));
+        let _ = writeln!(
+            s,
+            "   registra:  codeos decide --title {} --why {} --context {} --tags {}",
+            shell_quote(&d.title),
+            shell_quote(&d.rationale),
+            shell_quote(&context),
+            shell_quote(&all_tags.join(","))
+        );
+    }
+    if !r.mined.is_empty() {
+        let _ = writeln!(s, "\nℹ️  Sono PROPOSTE da rivedere: registra solo quelle che sono davvero decisioni (il gate umano Candidate→Decision resta tuo). Ogni riga cita la fonte, così il perché resta verificabile. Oppure scrivile tutte con  codeos learn --write  (idempotente, revisionabili).");
+    }
+    s
 }
 
 /// Opzioni del comando `report`, derivate dai flag CLI.
