@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use codeos_memory::{Decision, DecisionKind, DecisionStore, InMemoryDecisionStore};
+use codeos_memory::{Decision, DecisionStore, InMemoryDecisionStore};
 use codeos_storage::{GraphStorage, RelationFilter};
 use codeos_types::bus::{
     CallPathReply, CallPathStatus, ImpactReply, ImpactStatus, ImpactTransitiveReply,
@@ -193,25 +193,15 @@ impl QueryEngine {
         // testa (~1.3k char di razionali) accorciavano FILE RILEVANTI su OGNI query
         // ⇒ localization-recall 0.836 → 0.649. Il *perché* non-derivabile (umano) è
         // piccolo e prezioso; il derivabile non deve costargli localizzazione.
-        let mut decisions: Vec<Decision> = self
-            .decisions
-            .current_decisions()
-            .await?
-            .into_iter()
-            .filter(|d| d.kind == DecisionKind::Decision)
-            .filter(|d| {
-                d.related_entity_ids
-                    .iter()
-                    .any(|id| selected_ids.contains(id))
-                    || d.tags.iter().any(|t| {
-                        !t.is_empty()
-                            && selected
-                                .iter()
-                                .any(|e| e.qualified_name.split("::").any(|seg| seg == t))
-                    })
-            })
-            .collect();
-        decisions.truncate(MAX_CONTEXT_DECISIONS);
+        // Punto UNICO di verità condiviso col Guardian (vedi
+        // codeos_memory::select_human_decisions): l'aggancio per ID o per
+        // tag=segmento, il filtro alle sole UMANE e il cap vivono ora in un posto
+        // solo, così i due siti non possono più divergere.
+        let decisions = codeos_memory::select_human_decisions(
+            self.decisions.current_decisions().await?,
+            &selected,
+            MAX_CONTEXT_DECISIONS,
+        );
 
         // Tieni solo le relazioni i cui due estremi sono nel set selezionato.
         let mut relations: Vec<Relation> = expansion

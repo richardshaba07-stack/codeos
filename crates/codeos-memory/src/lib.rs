@@ -15,6 +15,7 @@ mod decision;
 mod evidence;
 mod markdown;
 mod proposal;
+mod selection;
 mod store;
 
 pub use actor::MemoryActor;
@@ -22,4 +23,5 @@ pub use decision::{Decision, DecisionKind, DecisionStatus};
 pub use evidence::Evidence;
 pub use markdown::MarkdownDecisionStore;
 pub use proposal::Proposal;
+pub use selection::select_human_decisions;
 pub use store::{DecisionStore, InMemoryDecisionStore};

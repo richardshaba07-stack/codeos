@@ -1207,26 +1207,17 @@ impl Guardian {
         // struttura ma non il perché — proprio lo strato che distingue CodeOS.
         let mut pack_decisions: Vec<String> = Vec::new();
         if let Some(store) = &self.decisions {
-            let target_ids: HashSet<EntityId> = target_entities.iter().map(|e| e.id).collect();
-            if let Ok(mut current) = store.current_decisions().await {
-                // SOLO le decisioni UMANE (kind `Decision`): gli invarianti
-                // auto-derivati sono GIÀ nelle BOUNDARIES di questo stesso pack —
-                // ripeterli nel WHY è un doppione che costa token all'agente (e il
-                // metro ha misurato il costo del doppione nel contesto di query).
-                current.retain(|d| d.kind == DecisionKind::Decision);
-                current.retain(|d| {
-                    d.related_entity_ids
-                        .iter()
-                        .any(|id| target_ids.contains(id))
-                        || d.tags.iter().any(|t| {
-                            !t.is_empty()
-                                && target_entities
-                                    .iter()
-                                    .any(|e| e.qualified_name.split("::").any(|seg| seg == t))
-                        })
-                });
-                current.truncate(MAX_PACK_DECISIONS);
-                pack_decisions = current
+            if let Ok(current) = store.current_decisions().await {
+                // Le decisioni UMANE pertinenti — punto UNICO di verità condiviso
+                // col context pack di codeos-query (codeos_memory::select_human_decisions).
+                // SOLO `Decision` (gli invarianti auto-derivati sono già nelle
+                // BOUNDARIES: ripeterli nel WHY costa token all'agente).
+                let kept = codeos_memory::select_human_decisions(
+                    current,
+                    &target_entities,
+                    MAX_PACK_DECISIONS,
+                );
+                pack_decisions = kept
                     .iter()
                     .map(|d| {
                         let rationale = d.rationale.trim();
