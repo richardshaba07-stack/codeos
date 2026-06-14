@@ -3121,6 +3121,86 @@ mod tests {
         );
     }
 
+    /// Guard di REGRESSIONE end-to-end della PRECISIONE della retrieval (istituziona-
+    /// lizza i risultati misurati a mano in eval/moat-benchmark/scaled/RETRIEVAL_PRECISION.md
+    /// e blinda il fix anti-flood `7dac120` sull'intero percorso del pack). Tre moduli,
+    /// qualified_name CON un segmento `src` (il vettore del flood): un tag `src`
+    /// aggancerebbe OGNI entità. Il pack deve: (a) far emergere la decisione del modulo
+    /// giusto (recall), (b) NON far comparire mai il tag strutturale `src` (niente
+    /// flood), (c) non sconfinare in un altro modulo (niente leak). Senza il fix questo
+    /// test fallisce: la decisione `src` comparirebbe su ogni goal.
+    #[tokio::test]
+    async fn context_pack_retrieval_is_precise_and_a_structural_tag_never_floods() {
+        use codeos_memory::{Decision, DecisionKind, DecisionStore, InMemoryDecisionStore};
+        use codeos_types::bus::NewDecision;
+
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let ents: Vec<Entity> = [
+            "shop::src::billing::charge::run",
+            "shop::src::billing::refund::run",
+            "shop::src::auth::login::run",
+            "shop::src::auth::logout::run",
+            "shop::src::core::db::run",
+            "shop::src::core::cache::run",
+        ]
+        .iter()
+        .map(|q| entity(q))
+        .collect();
+        storage
+            .apply_delta(GraphDelta {
+                added_entities: ents,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let store = Arc::new(InMemoryDecisionStore::new());
+        let mk = |title: &str, tags: &[&str]| {
+            Decision::from_new(
+                NewDecision {
+                    author: "human:test".into(),
+                    title: title.into(),
+                    context: String::new(),
+                    rationale: "perché".into(),
+                    related_entity_ids: vec![],
+                    related_decision_ids: vec![],
+                    supersedes: vec![],
+                    deprecates: vec![],
+                    tags: tags.iter().map(|s| s.to_string()).collect(),
+                },
+                DecisionKind::Decision,
+            )
+        };
+        store
+            .record(&mk("addebito idempotente mai due volte", &["billing"]))
+            .await
+            .unwrap();
+        store
+            .record(&mk("nota strutturale che non deve floodare", &["src"]))
+            .await
+            .unwrap();
+        store
+            .record(&mk("sessione validata lato server", &["auth"]))
+            .await
+            .unwrap();
+
+        let guardian = Guardian::with_memory(storage, store);
+
+        // Goal sul modulo billing.
+        let billing = guardian.get_context_pack("billing charge", true).await.unwrap();
+        let b = billing.decisions.join(" | ");
+        assert!(b.contains("addebito idempotente"), "recall: manca la decisione billing: {b}");
+        assert!(!b.contains("non deve floodare"), "FLOOD: il tag strutturale `src` non deve comparire: {b}");
+        assert!(!b.contains("sessione validata"), "leak: la decisione auth non c'entra col billing: {b}");
+
+        // Goal sul modulo auth: simmetrico.
+        let auth = guardian.get_context_pack("auth login", true).await.unwrap();
+        let a = auth.decisions.join(" | ");
+        assert!(a.contains("sessione validata"), "recall: manca la decisione auth: {a}");
+        assert!(!a.contains("non deve floodare"), "FLOOD: `src` non deve comparire neanche qui: {a}");
+        assert!(!a.contains("addebito idempotente"), "leak: la decisione billing non c'entra con l'auth: {a}");
+    }
+
     #[tokio::test]
     async fn learn_anchors_the_promotion_to_its_birth_commit() {
         use codeos_memory::InMemoryDecisionStore;
