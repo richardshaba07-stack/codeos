@@ -535,6 +535,94 @@ async fn main() -> anyhow::Result<()> {
                 println!("  {}", step);
             }
         }
+        "learn" => {
+            // Riemerge il PERCHÉ che gli autori hanno scritto nei messaggi di commit
+            // e lo propone come decisioni da registrare nel ledger. Anti-FP: razionale
+            // VERBATIM + hash citato, e astensione sui commit terse (mai inventato).
+            // Sola lettura di git, NESSUNA connessione al server: il ledger lo scrive
+            // l'umano confermando le proposte (gate Candidate→Decision).
+            let mut repo: Option<String> = None;
+            let mut max: Option<usize> = Some(1000);
+            let mut strong_only = false;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--max" if i + 1 < args.len() => {
+                        max = args[i + 1].parse::<usize>().ok();
+                        i += 2;
+                    }
+                    "--all" => {
+                        max = None;
+                        i += 1;
+                    }
+                    "--strong-only" => {
+                        strong_only = true;
+                        i += 1;
+                    }
+                    arg if !arg.starts_with('-') && repo.is_none() => {
+                        repo = Some(arg.to_string());
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            // Default del repo: l'argomento, poi CODEOS_REPO, poi la cwd.
+            let repo = repo
+                .or_else(|| std::env::var("CODEOS_REPO").ok())
+                .unwrap_or_else(|| ".".to_string());
+
+            let messages = codeos_paleo::read_commit_messages(&repo, max)?;
+            let scanned = messages.len();
+            let mut mined = codeos_paleo::mine(&messages);
+            if strong_only {
+                mined.retain(|d| d.confidence == codeos_paleo::IntentConfidence::Strong);
+            }
+            // I segnali forti prima dei causali: l'umano tria dall'alto.
+            mined.sort_by_key(|d| match d.confidence {
+                codeos_paleo::IntentConfidence::Strong => 0,
+                codeos_paleo::IntentConfidence::Causal => 1,
+            });
+
+            println!("🔎 LEARN — il «perché» estratto dalla storia git");
+            println!("   (anti-FP: razionale verbatim + hash citato; i commit senza intento esplicito si astengono, mai inventati)");
+            println!("------------------------------------------------------------");
+            let abstained = scanned.saturating_sub(mined.len());
+            println!(
+                "📊 {scanned} commit scansionati · {} con intento esplicito · {abstained} astenuti",
+                mined.len()
+            );
+            if mined.is_empty() {
+                println!(
+                    "\n(Nessuna decisione esplicita trovata: questa storia non porta marcatori\n \
+                     come `DECISION:`/`BREAKING CHANGE:`/`ADR-…` né un perché causale nel corpo.\n \
+                     È un'astensione onesta, non un errore.)"
+                );
+            }
+            for d in &mined {
+                let short = if d.hash.len() >= 9 { &d.hash[..9] } else { &d.hash };
+                println!(
+                    "\n[{} · {}]  commit {short}",
+                    d.confidence.as_str(),
+                    d.marker
+                );
+                println!("  «{}»", d.title);
+                println!("   ↳ {}", d.rationale);
+                let context = format!("Estratto dal commit {}", d.hash);
+                println!(
+                    "   registra:  codeos decide --title {} --why {} --context {} --tags 'learned,from-git'",
+                    shell_quote(&d.title),
+                    shell_quote(&d.rationale),
+                    shell_quote(&context)
+                );
+            }
+            if !mined.is_empty() {
+                println!(
+                    "\nℹ️  Sono PROPOSTE da rivedere: registra solo quelle che sono davvero\n \
+                     decisioni (il gate umano Candidate→Decision resta tuo). Ogni riga cita\n \
+                     l'hash, così il perché resta verificabile nella storia."
+                );
+            }
+        }
         "help" | "--help" | "-h" => {
             print_usage();
         }
@@ -863,6 +951,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Time machine: perché esiste il confine tra due elementi (nascita, intento, decisioni correlate).",
     ),
     (
+        "learn [path] [--max N | --all] [--strong-only]",
+        "Estrae il PERCHÉ esplicito dai messaggi di commit (DECISION:/BREAKING CHANGE:/ADR-… o un perché causale nel corpo) e lo propone come decisioni da registrare. Anti-FP: razionale verbatim + hash citato, astensione sui commit terse. Sola lettura di git, non scrive il ledger (lo confermi tu con `codeos decide`).",
+    ),
+    (
         "simulate \"move <src> to <dst>\"",
         "What-if di refactoring: cosa cambierebbe spostando un elemento da <src> a <dst>.",
     ),
@@ -898,6 +990,13 @@ fn usage_text() -> String {
 
 fn print_usage() {
     print!("{}", usage_text());
+}
+
+/// Cita una stringa per la shell POSIX (single-quote), così i comandi `codeos decide`
+/// suggeriti da `learn` si possono copiare-incollare anche con apostrofi e spazi nel
+/// testo. Wrap in `'…'` e ogni apostrofo interno diventa `'\''`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Opzioni del comando `report`, derivate dai flag CLI.
@@ -1426,7 +1525,7 @@ mod tests {
         let usage = usage_text();
         for cmd in [
             "index", "report", "query", "path", "impact", "doctor", "guard", "context", "mri",
-            "why", "simulate", "help", "decide", "mcp", "licenses",
+            "why", "simulate", "help", "decide", "mcp", "licenses", "learn",
         ] {
             assert!(
                 usage.contains(cmd),

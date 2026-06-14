@@ -375,6 +375,7 @@ dependencies = [
  "anyhow",
  "codeos-core",
  "codeos-memory",
+ "codeos-paleo",
  "codeos-storage",
  "codeos-types",
  "prost",

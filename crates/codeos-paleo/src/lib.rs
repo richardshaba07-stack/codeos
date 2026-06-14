@@ -41,13 +41,18 @@
 //! - [`abstention`]: la matematica pura — conteggio delle [`occasions`] e lower
 //!   bound di Wilson su [`Abstention`].
 //! - [`fossil`]: la datazione dei confini — [`excavate`] scava il [`DecisionFossil`].
+//! - [`miner`]: l'estrazione del *perché esplicito* dai messaggi di commit —
+//!   [`mine`] riemerge le decisioni che l'autore ha scritto a parole (verbatim,
+//!   citando l'hash), astenendosi sui commit terse invece di inventare.
 
 pub mod abstention;
 pub mod fossil;
 pub mod history;
+pub mod miner;
 
 pub use abstention::{
     boundary_story, occasion_window, occasions, Abstention, BoundaryOccasion, OccasionWindow, Z_95,
 };
 pub use fossil::{excavate, is_history_insufficient, DecisionFossil};
 pub use history::{head_commit, CachedHistory, Commit, CommitHistory, GitLog, InMemoryHistory};
+pub use miner::{mine, read_commit_messages, CommitMessage, IntentConfidence, MinedDecision};

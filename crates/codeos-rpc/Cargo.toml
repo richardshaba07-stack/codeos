@@ -21,6 +21,7 @@ codeos-types = { workspace = true }
 codeos-core = { workspace = true }
 codeos-storage = { workspace = true }
 codeos-memory = { workspace = true }
+codeos-paleo = { workspace = true }
 
 tonic = { workspace = true }
 prost = { workspace = true }
