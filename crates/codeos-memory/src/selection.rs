@@ -40,13 +40,19 @@ const STRUCTURAL_SEGMENTS: &[&str] = &[
     "tmp",
     "temp",
     "__pycache__",
+    // Nomi-FILE non semantici (un tag derivato da `mod.rs`/`index.ts`/`__init__.py`
+    // non identifica un dominio): esclusi qui così valgono sia per il filtro anti-flood
+    // sia per la derivazione dei tag dai path (un punto solo di verità).
+    "mod",
+    "index",
+    "__init__",
 ];
 
 /// `true` se `tag` è un segmento strutturale (confronto case-insensitive), quindi
 /// inadatto come ancora di intento. Nel dubbio si esclude: meglio una decisione che
 /// non emerge (la ritrovi con `why`) che una che inonda ogni pack — un arco mancante
 /// è meglio di uno che mente.
-fn is_structural_segment(tag: &str) -> bool {
+pub fn is_structural_segment(tag: &str) -> bool {
     let t = tag.to_ascii_lowercase();
     STRUCTURAL_SEGMENTS.contains(&t.as_str())
 }

@@ -581,6 +581,29 @@ async fn main() -> anyhow::Result<()> {
             let messages = codeos_paleo::read_commit_messages(&repo, max)?;
             let scanned = messages.len();
             let mut mined = codeos_paleo::mine(&messages);
+
+            // Mappa hash→file toccati: serve ad ANCORARE le decisioni minate alle aree
+            // di codice del commit (tag di modulo), così affiorano nel pack mirato.
+            // Best-effort: se git non risponde, restano i soli tag generici.
+            let file_map: std::collections::HashMap<String, Vec<String>> = {
+                use codeos_paleo::CommitHistory;
+                codeos_paleo::GitLog::new(&repo)
+                    .commits()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|c| (c.hash, c.changed_files))
+                    .collect()
+            };
+            // I tag di modulo per una decisione minata da commit (vuoto per gli ADR).
+            let anchor_tags = |d: &codeos_paleo::MinedDecision| -> Vec<String> {
+                match &d.source {
+                    codeos_paleo::DecisionSource::Commit(h) => file_map
+                        .get(h)
+                        .map(|files| module_tags_from_files(files, 5))
+                        .unwrap_or_default(),
+                    codeos_paleo::DecisionSource::Document(_) => Vec::new(),
+                }
+            };
             if strong_only {
                 mined.retain(|d| d.confidence == codeos_paleo::IntentConfidence::Strong);
             }
@@ -665,6 +688,8 @@ async fn main() -> anyhow::Result<()> {
                             "from-adr",
                         ),
                     };
+                    let mut tags = vec!["learned".to_string(), source_tag.to_string()];
+                    tags.extend(anchor_tags(d)); // ancora alle aree di codice del commit
                     let draft = codeos_types::bus::NewDecision {
                         author: "ai:DecisionMiner".to_string(),
                         title: d.title.clone(),
@@ -674,7 +699,7 @@ async fn main() -> anyhow::Result<()> {
                         related_decision_ids: Vec::new(),
                         supersedes: Vec::new(),
                         deprecates: Vec::new(),
-                        tags: vec!["learned".to_string(), source_tag.to_string()],
+                        tags,
                     };
                     let proposal = codeos_memory::Proposal::new(
                         draft,
@@ -691,9 +716,10 @@ async fn main() -> anyhow::Result<()> {
                     println!("   ({skipped} già presenti, saltate — `learn --write` è idempotente)");
                 }
                 println!(
-                    "   Autore: ai:DecisionMiner · tag: learned + from-git/from-adr · ognuna cita la sua fonte.\n \
-                     Sono file Markdown ispezionabili: rivedile e cancella quelle che non sono\n \
-                     vere decisioni (il gate umano resta tuo)."
+                    "   Autore: ai:DecisionMiner · tag: learned + from-git/from-adr + i MODULI\n \
+                     toccati dal commit (così affiorano nel context pack di quell'area) · ognuna\n \
+                     cita la sua fonte. Sono file Markdown ispezionabili: rivedile e cancella\n \
+                     quelle che non sono vere decisioni (il gate umano resta tuo)."
                 );
             } else {
                 for d in &mined {
@@ -713,12 +739,14 @@ async fn main() -> anyhow::Result<()> {
                             (format!("Estratto dall'ADR {p}"), "from-adr")
                         }
                     };
+                    let mut all_tags = vec!["learned".to_string(), source_tag.to_string()];
+                    all_tags.extend(anchor_tags(d));
                     println!(
                         "   registra:  codeos decide --title {} --why {} --context {} --tags {}",
                         shell_quote(&d.title),
                         shell_quote(&d.rationale),
                         shell_quote(&context),
-                        shell_quote(&format!("learned,{source_tag}"))
+                        shell_quote(&all_tags.join(","))
                     );
                 }
                 if !mined.is_empty() {
@@ -1127,7 +1155,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "learn [path] [--max N | --all] [--strong-only] [--write]",
-        "Estrae il PERCHÉ esplicito da dove già vive — messaggi di commit (DECISION:/BREAKING CHANGE:/ADR-… o un perché causale) e file ADR (docs/adr) — e lo propone come decisioni. Anti-FP: razionale verbatim + fonte citata, astensione su commit terse, template e ADR superati. Senza --write stampa proposte da rivedere; con --write le scrive nel ledger (<repo>/.codeos/decisions) preservando l'evidenza (commit/documento), idempotente. Sola lettura di git+file, mai il server (:50051 intoccato).",
+        "Estrae il PERCHÉ esplicito da dove già vive — messaggi di commit (DECISION:/BREAKING CHANGE:/ADR-… o un perché causale) e file ADR (docs/adr) — e lo propone come decisioni, ANCORATE ai moduli che il commit ha toccato (così affiorano nel context pack di quell'area). Anti-FP: razionale verbatim + fonte citata, astensione su commit terse, template e ADR superati, tag di modulo senza i segmenti strutturali (no flood). Senza --write stampa proposte da rivedere; con --write le scrive nel ledger (<repo>/.codeos/decisions) preservando l'evidenza (commit/documento), idempotente. Sola lettura di git+file, mai il server (:50051 intoccato).",
     ),
     (
         "audit [path]",
@@ -1176,6 +1204,38 @@ fn print_usage() {
 /// testo. Wrap in `'…'` e ogni apostrofo interno diventa `'\''`.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Deriva i tag di MODULO dai file che un commit ha toccato: per ogni file prende
+/// la cartella che lo contiene e il nome-file senza estensione — i segmenti più
+/// SPECIFICI e meno flood-prone — scartando i segmenti strutturali (src/tests/mod…
+/// via `codeos_memory::is_structural_segment`, fonte unica di verità condivisa col
+/// filtro anti-flood). È l'auto-anchoring delle decisioni minate alle aree di codice
+/// del commit: così affiorano nel context pack senza tag a mano. Dedup conservando
+/// l'ordine, cap a `max`. Anti-FP: i tag vengono dai file REALMENTE toccati (verifica-
+/// bili), e i segmenti strutturali — il vettore del flood — sono già esclusi a monte.
+fn module_tags_from_files(files: &[String], max: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for file in files {
+        let segs: Vec<&str> = file.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+        let Some(last) = segs.last() else { continue };
+        // Nome-file senza estensione (`charge.py` → `charge`, `a.test.ts` → `a`).
+        let stem = last.split('.').next().unwrap_or(last);
+        let parent = (segs.len() >= 2).then(|| segs[segs.len() - 2]);
+        for cand in parent.into_iter().chain(std::iter::once(stem)) {
+            let c = cand.trim();
+            if c.len() >= 2
+                && !codeos_memory::is_structural_segment(c)
+                && !out.iter().any(|t| t == c)
+            {
+                out.push(c.to_string());
+                if out.len() >= max {
+                    return out;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `true` se `hash` esiste ed è un commit nel repo. Usa `git cat-file -e
@@ -1859,5 +1919,40 @@ mod tests {
         assert_eq!(needed_phrase(1), "gli manca 1 arco");
         assert_eq!(needed_phrase(2), "gli mancano 2 archi");
         assert_eq!(needed_phrase(3), "gli mancano 3 archi");
+    }
+
+    /// L'auto-anchoring: dai file toccati si ricavano i tag di MODULO (cartella +
+    /// nome-file senza estensione), scartando i segmenti strutturali (`src`/`tests`/
+    /// `mod`…) — il vettore del flood — e deduplicando.
+    #[test]
+    fn module_tags_pick_module_and_stem_skipping_structural() {
+        use super::module_tags_from_files;
+        let files = vec![
+            "/abs/repo/shop/src/billing/charge.py".to_string(),
+            "/abs/repo/shop/src/billing/refund.py".to_string(),
+            "/abs/repo/shop/src/auth/login.py".to_string(),
+        ];
+        let tags = module_tags_from_files(&files, 10);
+        // moduli e nomi-file specifici…
+        assert!(tags.contains(&"billing".to_string()));
+        assert!(tags.contains(&"charge".to_string()));
+        assert!(tags.contains(&"auth".to_string()));
+        // …ma MAI il segmento strutturale `src` (sarebbe il flood).
+        assert!(!tags.iter().any(|t| t == "src"));
+        // dedup: `billing` compare una volta sola pur toccando due file.
+        assert_eq!(tags.iter().filter(|t| *t == "billing").count(), 1);
+    }
+
+    #[test]
+    fn module_tags_strip_extensions_and_respect_the_cap() {
+        use super::module_tags_from_files;
+        let files = vec!["/x/payments/gateway.test.ts".to_string()];
+        let tags = module_tags_from_files(&files, 10);
+        assert!(tags.contains(&"payments".to_string()));
+        // estensione e suffisso `.test` via: resta lo stem `gateway`.
+        assert!(tags.contains(&"gateway".to_string()));
+        // il cap è rispettato.
+        let many: Vec<String> = (0..20).map(|i| format!("/r/mod{i}/file{i}.rs")).collect();
+        assert!(module_tags_from_files(&many, 3).len() <= 3);
     }
 }

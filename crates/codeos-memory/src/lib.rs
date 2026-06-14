@@ -25,5 +25,5 @@ pub use evidence::Evidence;
 pub use integrity::{find_broken_provenance, BreakReason, BrokenCitation};
 pub use markdown::MarkdownDecisionStore;
 pub use proposal::Proposal;
-pub use selection::select_human_decisions;
+pub use selection::{is_structural_segment, select_human_decisions};
 pub use store::{DecisionStore, InMemoryDecisionStore};
