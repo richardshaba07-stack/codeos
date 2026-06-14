@@ -9,8 +9,8 @@ use std::collections::{HashMap, HashSet};
 
 use codeos_storage::{GraphStorage, RelationFilter};
 use codeos_types::{
-    CommitContext, Entity, EntityId, GraphDelta, ParsedEntity, ParsedFileResult, Relation,
-    RelationKind,
+    CommitContext, Entity, EntityId, EntityKind, GraphDelta, ParsedEntity, ParsedFileResult,
+    Relation, RelationKind,
 };
 
 /// Risolve i risultati grezzi del parser in un delta del grafo.
@@ -508,6 +508,35 @@ impl GraphResolver {
             }
         }
 
+        // Passo 4 — Archi `Tests`: collega le entità di test alla prod che
+        // esercitano, per nome e SOLO se l'aggancio è univoco (anti-FP). Era una
+        // capability dichiarata ma MORTA: nessun parser produceva archi `Tests`,
+        // e `include_tests` (codeos-query) li cercava invano. v1 batch-only — un
+        // target presente in storage ma non nel batch non viene agganciato:
+        // astensione onesta, mai un arco finto.
+        let test_inputs: Vec<(EntityId, String, EntityKind, bool)> = delta
+            .added_entities
+            .iter()
+            .map(|e| {
+                let leaf = e
+                    .qualified_name
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&e.qualified_name)
+                    .to_string();
+                let is_test = new_by_id_source_kind
+                    .get(&e.id)
+                    .map(|s| s.as_str() == "test")
+                    .unwrap_or(false);
+                (e.id, leaf, e.kind, is_test)
+            })
+            .collect();
+        let test_refs: Vec<(EntityId, &str, EntityKind, bool)> = test_inputs
+            .iter()
+            .map(|(id, leaf, kind, t)| (*id, leaf.as_str(), *kind, *t))
+            .collect();
+        delta.added_relations.extend(link_test_edges(&test_refs));
+
         Ok(delta)
     }
 
@@ -622,6 +651,162 @@ impl GraphResolver {
             }
         }
         parts.join("::")
+    }
+}
+
+/// Vero per i tipi di entità che un test può legittimamente esercitare (il
+/// TARGET di un arco `Tests`). Restare stretti riduce i falsi positivi.
+fn is_testable_target(kind: EntityKind) -> bool {
+    matches!(
+        kind,
+        EntityKind::Function
+            | EntityKind::Method
+            | EntityKind::Struct
+            | EntityKind::Class
+            | EntityKind::Interface
+    )
+}
+
+/// Dal nome-foglia di un'entità di test ricava il nome dell'entità ESERCITATA,
+/// togliendo l'affisso di test secondo le convenzioni comuni
+/// (`test_foo`→`foo`, `TestFoo`→`Foo` [Go], `foo_test`→`foo`,
+/// `FooTest`/`FooTests`/`FooSpec`→`Foo`). `None` se non sembra un test o il
+/// residuo è vuoto.
+fn strip_test_affix(leaf: &str) -> Option<String> {
+    if let Some(rest) = leaf.strip_prefix("test_") {
+        return (!rest.is_empty()).then(|| rest.to_string());
+    }
+    // Go: `TestFoo` — prefisso `Test` seguito da una maiuscola (così `Tester`
+    // [t minuscola dopo Test? no: `Tester` = Test+er, 'e' minuscola] non scatta).
+    if let Some(rest) = leaf.strip_prefix("Test") {
+        if rest.chars().next().is_some_and(|c| c.is_uppercase()) {
+            return Some(rest.to_string());
+        }
+    }
+    for suffix in ["_test", "Tests", "Test", "Spec"] {
+        if let Some(rest) = leaf.strip_suffix(suffix) {
+            return (!rest.is_empty()).then(|| rest.to_string());
+        }
+    }
+    None
+}
+
+/// Genera archi `Tests` (test → entità esercitata) per NOME, in modo anti-FP.
+/// `entities`: `(id, leaf, kind, is_test)` per ogni entità del batch. Un'entità di
+/// test (Function/Method) il cui nome, tolto l'affisso, combacia con UNA SOLA
+/// entità prod testabile riceve un arco verso quella; 0 o >1 candidati ⇒
+/// astensione (un arco mancante è meglio di uno che mente). L'arco va dal test
+/// alla prod (come si aspetta `include_tests` in codeos-query).
+fn link_test_edges(entities: &[(EntityId, &str, EntityKind, bool)]) -> Vec<Relation> {
+    let mut prod_by_leaf: HashMap<&str, Vec<EntityId>> = HashMap::new();
+    for (id, leaf, kind, is_test) in entities {
+        if !is_test && is_testable_target(*kind) {
+            prod_by_leaf.entry(leaf).or_default().push(*id);
+        }
+    }
+    let mut out = Vec::new();
+    for (id, leaf, kind, is_test) in entities {
+        if !is_test
+            || !matches!(
+                kind,
+                EntityKind::Function | EntityKind::Method | EntityKind::Test
+            )
+        {
+            continue;
+        }
+        let Some(target) = strip_test_affix(leaf) else {
+            continue;
+        };
+        if let Some(cands) = prod_by_leaf.get(target.as_str()) {
+            if cands.len() == 1 {
+                let mut metadata = HashMap::new();
+                metadata.insert(
+                    "resolution_strategy".to_string(),
+                    "test_name_heuristic".to_string(),
+                );
+                metadata.insert("resolution_confidence".to_string(), "medium".to_string());
+                // Una Tests-edge nasce sempre da un'entità di test:
+                metadata.insert("source_kind".to_string(), "test".to_string());
+                out.push(Relation {
+                    id: EntityId::new(),
+                    kind: RelationKind::Tests,
+                    source_id: *id,
+                    target_id: cands[0],
+                    metadata,
+                });
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod test_edge_heuristic {
+    use super::{is_testable_target, link_test_edges, strip_test_affix};
+    use codeos_types::{EntityId, EntityKind, RelationKind};
+
+    #[test]
+    fn strip_affix_covers_common_conventions() {
+        assert_eq!(strip_test_affix("test_foo").as_deref(), Some("foo"));
+        assert_eq!(strip_test_affix("TestFoo").as_deref(), Some("Foo"));
+        assert_eq!(strip_test_affix("foo_test").as_deref(), Some("foo"));
+        assert_eq!(strip_test_affix("FooTest").as_deref(), Some("Foo"));
+        assert_eq!(strip_test_affix("FooTests").as_deref(), Some("Foo"));
+        assert_eq!(strip_test_affix("FooSpec").as_deref(), Some("Foo"));
+        assert_eq!(strip_test_affix("foo"), None);
+        assert_eq!(strip_test_affix("test_"), None);
+        assert_eq!(strip_test_affix("Test"), None); // niente maiuscola dopo `Test`
+    }
+
+    #[test]
+    fn links_a_test_to_its_unique_target() {
+        let t = EntityId::new();
+        let prod = EntityId::new();
+        let ents = vec![
+            (t, "test_foo", EntityKind::Function, true),
+            (prod, "foo", EntityKind::Function, false),
+        ];
+        let edges = link_test_edges(&ents);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].kind, RelationKind::Tests);
+        assert_eq!(edges[0].source_id, t, "il test è la SORGENTE dell'arco");
+        assert_eq!(edges[0].target_id, prod);
+    }
+
+    #[test]
+    fn abstains_when_target_is_ambiguous() {
+        let ents = vec![
+            (EntityId::new(), "test_foo", EntityKind::Function, true),
+            (EntityId::new(), "foo", EntityKind::Function, false),
+            (EntityId::new(), "foo", EntityKind::Method, false), // due `foo` prod
+        ];
+        assert!(
+            link_test_edges(&ents).is_empty(),
+            "aggancio ambiguo ⇒ astensione anti-FP"
+        );
+    }
+
+    #[test]
+    fn abstains_when_no_target_exists() {
+        let ents = vec![(EntityId::new(), "test_orphan", EntityKind::Function, true)];
+        assert!(link_test_edges(&ents).is_empty());
+    }
+
+    #[test]
+    fn a_prod_function_named_like_a_test_does_not_link() {
+        // is_test=false ⇒ non è un test: niente arco anche se il nome combacia.
+        let ents = vec![
+            (EntityId::new(), "test_foo", EntityKind::Function, false),
+            (EntityId::new(), "foo", EntityKind::Function, false),
+        ];
+        assert!(link_test_edges(&ents).is_empty());
+    }
+
+    #[test]
+    fn testable_target_is_strict() {
+        assert!(is_testable_target(EntityKind::Struct));
+        assert!(is_testable_target(EntityKind::Function));
+        assert!(!is_testable_target(EntityKind::Module));
     }
 }
 
