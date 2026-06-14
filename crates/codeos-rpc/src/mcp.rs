@@ -187,6 +187,16 @@ fn tool_definitions() -> Value {
             "name": "codeos_report",
             "description": "Referto architetturale in JSON: invarianti di layering (confidenza Wilson calibrata su git), candidati in formazione, fossili di decisione, lacune, qualità del grafo. Per orientarsi prima di toccare l'architettura.",
             "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "codeos_audit",
+            "description": "Verifica l'integrità del ledger di intento: segnala le decisioni la cui PROVENIENZA è sparita (commit riscritto/squashato o file ADR cancellato). Anti-FP: solo fatti verificati via git/filesystem, mai un sospetto. Sola lettura, nessun server. Utile prima di fidarsi del ledger o come gate in CI.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Radice del repository (default: CODEOS_REPO o la cartella corrente)."}
+                }
+            }
         }
     ])
 }
@@ -400,10 +410,20 @@ async fn dispatch_tool(name: &str, args: &Value) -> anyhow::Result<String> {
                 .into_inner();
             Ok(serde_json::to_string_pretty(&crate::report_to_json(&res))?)
         }
+        "codeos_audit" => {
+            // Sola lettura del ledger + git/filesystem: NESSUNA connessione al server.
+            // Riusa la stessa logica della CLI `audit` (crate::audit_report).
+            let repo = arg_str(args, "path")
+                .ok()
+                .or_else(|| std::env::var("CODEOS_REPO").ok())
+                .unwrap_or_else(|| ".".to_string());
+            let (text, _broken) = crate::audit_report(&repo).await?;
+            Ok(text)
+        }
         other => anyhow::bail!(
             "tool sconosciuto: '{other}' (disponibili: codeos_query, codeos_why, \
              codeos_impact, codeos_context_pack, codeos_decide, codeos_report, \
-             codeos_licenses)"
+             codeos_licenses, codeos_audit)"
         ),
     }
 }
@@ -439,6 +459,7 @@ mod tests {
             "codeos_context_pack",
             "codeos_decide",
             "codeos_report",
+            "codeos_audit",
         ] {
             assert!(names.contains(&expected), "manca {expected}: {names:?}");
         }

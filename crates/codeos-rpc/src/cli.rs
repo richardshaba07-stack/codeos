@@ -760,69 +760,19 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         "audit" => {
-            use codeos_memory::DecisionStore;
-            // Tiene il ledger VERO: segnala le decisioni la cui PROVENIENZA è sparita
-            // (commit riscritto/squashato, file ADR cancellato). Anti-FP: solo fatti
-            // verificati (git/filesystem), per-citazione. Sola lettura, mai il server.
+            // Tiene il ledger VERO: segnala le decisioni la cui PROVENIENZA è sparita.
+            // Logica condivisa col tool MCP `codeos_audit` (audit_report). Exit 1 se
+            // trova provenienze rotte (gate CI). Sola lettura, mai il server.
             let repo = args
                 .get(2)
                 .filter(|a| !a.starts_with('-'))
                 .cloned()
                 .or_else(|| std::env::var("CODEOS_REPO").ok())
                 .unwrap_or_else(|| ".".to_string());
-            let dir = std::env::var("CODEOS_DECISIONS").unwrap_or_else(|_| {
-                Path::new(&repo)
-                    .join(".codeos")
-                    .join("decisions")
-                    .to_string_lossy()
-                    .into_owned()
-            });
-            let store = codeos_memory::MarkdownDecisionStore::new(&dir).await?;
-            let decisions = store.all().await?;
-
-            // Predicati di esistenza REALI, iniettati nella logica pura.
-            let repo_for_commit = repo.clone();
-            let commit_exists = |hash: &str| git_commit_exists(&repo_for_commit, hash);
-            let doc_exists = |path: &str| Path::new(&repo).join(path).exists();
-            let broken =
-                codeos_memory::find_broken_provenance(&decisions, commit_exists, doc_exists);
-
-            println!("🔎 AUDIT — integrità del ledger di intento");
-            println!("   (anti-FP: segnalo SOLO provenienze davvero sparite — commit irraggiungibile / file assente)");
-            println!("------------------------------------------------------------");
-            // Quante decisioni distinte sono toccate (una può avere più citazioni rotte).
-            let touched: std::collections::HashSet<_> =
-                broken.iter().map(|b| b.decision_id).collect();
-            println!(
-                "📊 {} decisioni nel ledger · {} con provenienza rotta",
-                decisions.len(),
-                touched.len()
-            );
-            for b in &broken {
-                let detail = match &b.reason {
-                    codeos_memory::BreakReason::CommitGone(h) => {
-                        let short = if h.len() >= 9 { &h[..9] } else { h };
-                        format!("commit {short} non più raggiungibile nel repo")
-                    }
-                    codeos_memory::BreakReason::DocumentGone(p) => {
-                        format!("documento «{p}» assente")
-                    }
-                };
-                println!("\n[provenienza rotta]  «{}»", b.decision_title);
-                println!("   ↳ {detail}");
-            }
-            if broken.is_empty() {
-                if decisions.is_empty() {
-                    println!("\n(Ledger vuoto: niente da verificare.)");
-                } else {
-                    println!("\n✅ Ogni decisione con provenienza cita una fonte ancora viva.");
-                }
-            } else {
-                println!(
-                    "\n⚠️  Rivedi: una decisione che punta a una fonte sparita va ri-ancorata a\n \
-                     una prova viva, oppure ritirata onestamente (supersedes/deprecates).\n \
-                     Esce con codice ≠0 per il gate CI."
-                );
+            let (text, broken) = audit_report(&repo).await?;
+            print!("{text}");
+            if broken > 0 {
+                println!("   (Esce con codice ≠0 per il gate CI.)");
                 std::process::exit(1);
             }
         }
@@ -1167,7 +1117,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "mcp",
-        "Avvia il server MCP su stdio: CodeOS come tool nativo per gli agenti (Claude Code, Cursor…). Tool esposti: codeos_query, codeos_why, codeos_impact, codeos_context_pack, codeos_decide, codeos_report, codeos_licenses.",
+        "Avvia il server MCP su stdio: CodeOS come tool nativo per gli agenti (Claude Code, Cursor…). Tool esposti: codeos_query, codeos_why, codeos_impact, codeos_context_pack, codeos_decide, codeos_report, codeos_licenses, codeos_audit.",
     ),
     ("help", "Mostra questo aiuto."),
 ];
@@ -1252,6 +1202,70 @@ fn git_commit_exists(repo: &str, hash: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Report di integrità del ledger — fonte UNICA usata dalla CLI `audit` E dal tool
+/// MCP `codeos_audit`. Restituisce `(testo formattato, numero di decisioni con
+/// provenienza rotta)`. Sola lettura (git + filesystem), nessun server: il ledger è
+/// in `CODEOS_DECISIONS` o `<repo>/.codeos/decisions`. La logica di rilevamento è
+/// pura ([`codeos_memory::find_broken_provenance`]); qui si iniettano i predicati di
+/// esistenza reali e si formatta.
+pub(crate) async fn audit_report(repo: &str) -> anyhow::Result<(String, usize)> {
+    use codeos_memory::DecisionStore;
+    use std::fmt::Write as _;
+
+    let dir = std::env::var("CODEOS_DECISIONS").unwrap_or_else(|_| {
+        Path::new(repo)
+            .join(".codeos")
+            .join("decisions")
+            .to_string_lossy()
+            .into_owned()
+    });
+    let store = codeos_memory::MarkdownDecisionStore::new(&dir).await?;
+    let decisions = store.all().await?;
+
+    let commit_exists = |hash: &str| git_commit_exists(repo, hash);
+    let doc_exists = |path: &str| Path::new(repo).join(path).exists();
+    let broken = codeos_memory::find_broken_provenance(&decisions, commit_exists, doc_exists);
+
+    // Una decisione può avere più citazioni rotte: contiamo quelle DISTINTE.
+    let touched: std::collections::HashSet<_> = broken.iter().map(|b| b.decision_id).collect();
+
+    let mut s = String::new();
+    let _ = writeln!(s, "🔎 AUDIT — integrità del ledger di intento");
+    let _ = writeln!(s, "   (anti-FP: segnalo SOLO provenienze davvero sparite — commit irraggiungibile / file assente)");
+    let _ = writeln!(s, "------------------------------------------------------------");
+    let _ = writeln!(
+        s,
+        "📊 {} decisioni nel ledger · {} con provenienza rotta",
+        decisions.len(),
+        touched.len()
+    );
+    for b in &broken {
+        let detail = match &b.reason {
+            codeos_memory::BreakReason::CommitGone(h) => {
+                let short = if h.len() >= 9 { &h[..9] } else { h };
+                format!("commit {short} non più raggiungibile nel repo")
+            }
+            codeos_memory::BreakReason::DocumentGone(p) => format!("documento «{p}» assente"),
+        };
+        let _ = writeln!(s, "\n[provenienza rotta]  «{}»", b.decision_title);
+        let _ = writeln!(s, "   ↳ {detail}");
+    }
+    if broken.is_empty() {
+        if decisions.is_empty() {
+            let _ = writeln!(s, "\n(Ledger vuoto: niente da verificare.)");
+        } else {
+            let _ = writeln!(s, "\n✅ Ogni decisione con provenienza cita una fonte ancora viva.");
+        }
+    } else {
+        let _ = writeln!(
+            s,
+            "\n⚠️  Rivedi: una decisione che punta a una fonte sparita va ri-ancorata a una prova\n \
+             viva, oppure ritirata onestamente (supersedes/deprecates)."
+        );
+    }
+    Ok((s, touched.len()))
 }
 
 /// Opzioni del comando `report`, derivate dai flag CLI.
