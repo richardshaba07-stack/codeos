@@ -32,6 +32,12 @@ pub enum Evidence {
     Test(String),
     /// Un'altra decisione del ledger. Provato da: il ledger la contiene.
     PriorDecision(EntityId),
+    /// Un **documento** di provenienza: un ADR, una RFC, un design doc — per path
+    /// relativo o URI. Provato da: il file esiste nel repository (o all'URI citato).
+    /// È la fonte delle decisioni che un team ha già scritto come documento, non
+    /// derivate dal grafo: il razionale vive lì, questo lo àncora e lo rende
+    /// verificabile.
+    Document(String),
 }
 
 impl std::fmt::Display for Evidence {
@@ -50,6 +56,7 @@ impl std::fmt::Display for Evidence {
             Evidence::Entity(qname) => write!(f, "entità {qname}"),
             Evidence::Test(name) => write!(f, "test {name}"),
             Evidence::PriorDecision(id) => write!(f, "decisione {id}"),
+            Evidence::Document(src) => write!(f, "documento {src}"),
         }
     }
 }

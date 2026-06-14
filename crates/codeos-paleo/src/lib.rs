@@ -44,8 +44,12 @@
 //! - [`miner`]: l'estrazione del *perché esplicito* dai messaggi di commit —
 //!   [`mine`] riemerge le decisioni che l'autore ha scritto a parole (verbatim,
 //!   citando l'hash), astenendosi sui commit terse invece di inventare.
+//! - [`adr`]: l'ingestione degli **ADR** (`docs/adr/*.md`) — [`mine_adrs`] legge le
+//!   decisioni architetturali già deliberate, citando il file e astenendosi su
+//!   template e ADR superati.
 
 pub mod abstention;
+pub mod adr;
 pub mod fossil;
 pub mod history;
 pub mod miner;
@@ -53,6 +57,9 @@ pub mod miner;
 pub use abstention::{
     boundary_story, occasion_window, occasions, Abstention, BoundaryOccasion, OccasionWindow, Z_95,
 };
+pub use adr::{mine_adrs, read_adrs, AdrDoc};
 pub use fossil::{excavate, is_history_insufficient, DecisionFossil};
 pub use history::{head_commit, CachedHistory, Commit, CommitHistory, GitLog, InMemoryHistory};
-pub use miner::{mine, read_commit_messages, CommitMessage, IntentConfidence, MinedDecision};
+pub use miner::{
+    mine, read_commit_messages, CommitMessage, DecisionSource, IntentConfidence, MinedDecision,
+};

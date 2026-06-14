@@ -72,20 +72,54 @@ impl IntentConfidence {
     }
 }
 
-/// Una decisione estratta da un commit: il perché **verbatim** dell'autore, con la
-/// fonte che lo prova. È volutamente disaccoppiata da `codeos-memory`: il minatore
-/// resta puro, e chi la consuma (la CLI) la trasforma in una *proposta* da
-/// confermare a mano (`codeos decide …`), citando l'hash.
+/// La **fonte** verificabile di una decisione minata: dove vive il perché.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionSource {
+    /// Un commit git, per hash: il perché era nel messaggio.
+    Commit(String),
+    /// Un documento (ADR/RFC/design doc), per path: il perché era scritto lì.
+    Document(String),
+}
+
+impl DecisionSource {
+    /// Un riferimento breve e leggibile per l'output a terminale (hash corto /
+    /// nome del file).
+    pub fn short(&self) -> String {
+        match self {
+            DecisionSource::Commit(h) => {
+                let s = if h.len() >= 9 { &h[..9] } else { h };
+                format!("commit {s}")
+            }
+            DecisionSource::Document(p) => {
+                let name = p.rsplit('/').next().unwrap_or(p);
+                format!("ADR {name}")
+            }
+        }
+    }
+
+    /// La chiave stabile per la deduplica (hash pieno / path intero).
+    pub fn key(&self) -> &str {
+        match self {
+            DecisionSource::Commit(h) => h,
+            DecisionSource::Document(p) => p,
+        }
+    }
+}
+
+/// Una decisione estratta da una fonte verificabile: il perché **verbatim**
+/// dell'autore, con la prova che lo sostiene. È volutamente disaccoppiata da
+/// `codeos-memory`: il minatore resta puro, e chi la consuma (la CLI) la trasforma
+/// in una *proposta* da confermare, citando la fonte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MinedDecision {
-    /// Hash del commit di origine — la prova citabile.
-    pub hash: String,
-    /// Il soggetto del commit: il titolo della decisione.
+    /// Da dove viene il perché — la prova citabile (commit o documento).
+    pub source: DecisionSource,
+    /// Il titolo della decisione (il soggetto del commit / l'H1 dell'ADR).
     pub title: String,
     /// Il testo di intento dell'autore, **copiato verbatim** (mai parafrasato).
     pub rationale: String,
     /// Quale segnale ha innescato l'estrazione (tracciabilità: l'umano vede *perché*
-    /// CodeOS ha proposto questa, ed es. `DECISION`, `BREAKING CHANGE`, `because`).
+    /// CodeOS ha proposto questa, es. `DECISION`, `BREAKING CHANGE`, `because`, `ADR`).
     pub marker: String,
     /// La forza del segnale.
     pub confidence: IntentConfidence,
@@ -164,7 +198,7 @@ pub fn mine(messages: &[CommitMessage]) -> Vec<MinedDecision> {
         .filter_map(|m| {
             extract_intent(&m.subject, &m.body).map(|(rationale, marker, confidence)| {
                 MinedDecision {
-                    hash: m.hash.clone(),
+                    source: DecisionSource::Commit(m.hash.clone()),
                     title: m.subject.trim().to_string(),
                     rationale,
                     marker,
@@ -456,7 +490,7 @@ mod tests {
         );
         let out = mine(&[m]);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].hash, "abc123");
+        assert_eq!(out[0].source, DecisionSource::Commit("abc123".to_string()));
         assert_eq!(out[0].title, "Passa a SQLite");
         assert_eq!(out[0].marker, "DECISION");
         assert_eq!(out[0].confidence, IntentConfidence::Strong);

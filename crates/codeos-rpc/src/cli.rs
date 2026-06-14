@@ -536,11 +536,12 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         "learn" => {
-            // Riemerge il PERCHÉ che gli autori hanno scritto nei messaggi di commit
-            // e lo propone come decisioni da registrare nel ledger. Anti-FP: razionale
-            // VERBATIM + hash citato, e astensione sui commit terse (mai inventato).
-            // Sola lettura di git, NESSUNA connessione al server: il ledger lo scrive
-            // l'umano confermando le proposte (gate Candidate→Decision).
+            // Riemerge il PERCHÉ che gli autori hanno già scritto — nei messaggi di
+            // commit e negli ADR (docs/adr) — e lo propone come decisioni del ledger.
+            // Anti-FP: razionale VERBATIM + fonte citata, astensione su ciò che non
+            // porta intento esplicito (mai inventato). Sola lettura di git + file,
+            // NESSUNA connessione al server: il ledger lo scrive l'umano confermando
+            // le proposte (gate Candidate→Decision), o `--write` (revisionabile).
             let mut repo: Option<String> = None;
             let mut max: Option<usize> = Some(1000);
             let mut strong_only = false;
@@ -576,30 +577,40 @@ async fn main() -> anyhow::Result<()> {
                 .or_else(|| std::env::var("CODEOS_REPO").ok())
                 .unwrap_or_else(|| ".".to_string());
 
+            // Fonte 1: i messaggi di commit (intento scritto a parole nei commit).
             let messages = codeos_paleo::read_commit_messages(&repo, max)?;
             let scanned = messages.len();
             let mut mined = codeos_paleo::mine(&messages);
             if strong_only {
                 mined.retain(|d| d.confidence == codeos_paleo::IntentConfidence::Strong);
             }
+            let commit_mined = mined.len();
+
+            // Fonte 2: gli ADR (decisioni architetturali già deliberate in docs/adr).
+            let adrs = codeos_paleo::read_adrs(&repo);
+            let adr_files = adrs.len();
+            let mut adr_mined = codeos_paleo::mine_adrs(&adrs);
+            let adr_count = adr_mined.len();
+            mined.append(&mut adr_mined);
+
             // I segnali forti prima dei causali: l'umano tria dall'alto.
             mined.sort_by_key(|d| match d.confidence {
                 codeos_paleo::IntentConfidence::Strong => 0,
                 codeos_paleo::IntentConfidence::Causal => 1,
             });
 
-            println!("🔎 LEARN — il «perché» estratto dalla storia git");
-            println!("   (anti-FP: razionale verbatim + hash citato; i commit senza intento esplicito si astengono, mai inventati)");
+            println!("🔎 LEARN — il «perché» estratto dalle fonti dove già vive");
+            println!("   (anti-FP: razionale verbatim + fonte citata; ciò che non porta intento esplicito si astiene, mai inventato)");
             println!("------------------------------------------------------------");
-            let abstained = scanned.saturating_sub(mined.len());
+            let commit_abstained = scanned.saturating_sub(commit_mined);
             println!(
-                "📊 {scanned} commit scansionati · {} con intento esplicito · {abstained} astenuti",
-                mined.len()
+                "📊 commit: {scanned} scansionati · {commit_mined} con intento · {commit_abstained} astenuti"
             );
+            println!("   ADR:    {adr_files} file · {adr_count} decisioni");
             if mined.is_empty() {
                 println!(
-                    "\n(Nessuna decisione esplicita trovata: questa storia non porta marcatori\n \
-                     come `DECISION:`/`BREAKING CHANGE:`/`ADR-…` né un perché causale nel corpo.\n \
+                    "\n(Nessuna decisione esplicita trovata: né marcatori nei commit\n \
+                     (`DECISION:`/`BREAKING CHANGE:`/`ADR-…`/un perché causale) né ADR in docs/adr.\n \
                      È un'astensione onesta, non un errore.)"
                 );
             }
@@ -618,12 +629,13 @@ async fn main() -> anyhow::Result<()> {
                 });
                 let store = codeos_memory::MarkdownDecisionStore::new(&dir).await?;
                 let existing = store.all().await?;
-                // I commit già registrati (citati come Evidence::Commit): non riscriverli.
+                // Le fonti già registrate (commit o documento): non riscriverle.
                 let already: std::collections::HashSet<String> = existing
                     .iter()
                     .flat_map(|d| d.evidence.iter())
                     .filter_map(|e| match e {
                         codeos_memory::Evidence::Commit(h) => Some(h.clone()),
+                        codeos_memory::Evidence::Document(p) => Some(p.clone()),
                         _ => None,
                     })
                     .collect();
@@ -631,31 +643,43 @@ async fn main() -> anyhow::Result<()> {
                 let mut written = 0usize;
                 let mut skipped = 0usize;
                 for d in &mined {
-                    if already.contains(&d.hash) {
+                    if already.contains(d.source.key()) {
                         skipped += 1;
                         continue;
                     }
+                    // La fonte È l'evidenza (commit o ADR): la Proposal la esige
+                    // (trap #1) e confirm() la trasferisce nel ledger.
+                    let (evidence, context, source_tag) = match &d.source {
+                        codeos_paleo::DecisionSource::Commit(h) => (
+                            codeos_memory::Evidence::Commit(h.clone()),
+                            format!(
+                                "Estratto dalla storia git ({}) — segnale: {}.",
+                                d.confidence.as_str(),
+                                d.marker
+                            ),
+                            "from-git",
+                        ),
+                        codeos_paleo::DecisionSource::Document(p) => (
+                            codeos_memory::Evidence::Document(p.clone()),
+                            format!("Estratto dall'ADR {p}."),
+                            "from-adr",
+                        ),
+                    };
                     let draft = codeos_types::bus::NewDecision {
                         author: "ai:DecisionMiner".to_string(),
                         title: d.title.clone(),
-                        context: format!(
-                            "Estratto dalla storia git ({}) — segnale: {}.",
-                            d.confidence.as_str(),
-                            d.marker
-                        ),
+                        context,
                         rationale: d.rationale.clone(),
                         related_entity_ids: Vec::new(),
                         related_decision_ids: Vec::new(),
                         supersedes: Vec::new(),
                         deprecates: Vec::new(),
-                        tags: vec!["learned".to_string(), "from-git".to_string()],
+                        tags: vec!["learned".to_string(), source_tag.to_string()],
                     };
-                    // L'hash del commit È l'evidenza: la Proposal lo esige (trap #1),
-                    // e confirm() lo trasferisce nel ledger.
                     let proposal = codeos_memory::Proposal::new(
                         draft,
                         codeos_memory::DecisionKind::Decision,
-                        vec![codeos_memory::Evidence::Commit(d.hash.clone())],
+                        vec![evidence],
                     )?;
                     store.record(&proposal.confirm()).await?;
                     written += 1;
@@ -667,33 +691,41 @@ async fn main() -> anyhow::Result<()> {
                     println!("   ({skipped} già presenti, saltate — `learn --write` è idempotente)");
                 }
                 println!(
-                    "   Autore: ai:DecisionMiner · tag: learned,from-git · ognuna cita il suo commit.\n \
+                    "   Autore: ai:DecisionMiner · tag: learned + from-git/from-adr · ognuna cita la sua fonte.\n \
                      Sono file Markdown ispezionabili: rivedile e cancella quelle che non sono\n \
                      vere decisioni (il gate umano resta tuo)."
                 );
             } else {
                 for d in &mined {
-                    let short = if d.hash.len() >= 9 { &d.hash[..9] } else { &d.hash };
                     println!(
-                        "\n[{} · {}]  commit {short}",
+                        "\n[{} · {}]  {}",
                         d.confidence.as_str(),
-                        d.marker
+                        d.marker,
+                        d.source.short()
                     );
                     println!("  «{}»", d.title);
                     println!("   ↳ {}", d.rationale);
-                    let context = format!("Estratto dal commit {}", d.hash);
+                    let (context, source_tag) = match &d.source {
+                        codeos_paleo::DecisionSource::Commit(h) => {
+                            (format!("Estratto dal commit {h}"), "from-git")
+                        }
+                        codeos_paleo::DecisionSource::Document(p) => {
+                            (format!("Estratto dall'ADR {p}"), "from-adr")
+                        }
+                    };
                     println!(
-                        "   registra:  codeos decide --title {} --why {} --context {} --tags 'learned,from-git'",
+                        "   registra:  codeos decide --title {} --why {} --context {} --tags {}",
                         shell_quote(&d.title),
                         shell_quote(&d.rationale),
-                        shell_quote(&context)
+                        shell_quote(&context),
+                        shell_quote(&format!("learned,{source_tag}"))
                     );
                 }
                 if !mined.is_empty() {
                     println!(
                         "\nℹ️  Sono PROPOSTE da rivedere: registra solo quelle che sono davvero\n \
                          decisioni (il gate umano Candidate→Decision resta tuo). Ogni riga cita\n \
-                         l'hash, così il perché resta verificabile nella storia.\n \
+                         la fonte, così il perché resta verificabile.\n \
                          Oppure scrivile tutte con  codeos learn --write  (idempotente, revisionabili)."
                     );
                 }
@@ -1028,7 +1060,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "learn [path] [--max N | --all] [--strong-only] [--write]",
-        "Estrae il PERCHÉ esplicito dai messaggi di commit (DECISION:/BREAKING CHANGE:/ADR-… o un perché causale nel corpo) e lo propone come decisioni. Anti-FP: razionale verbatim + hash citato, astensione sui commit terse. Senza --write stampa proposte da rivedere; con --write le scrive nel ledger (<repo>/.codeos/decisions) preservando l'evidenza del commit, idempotente. Sola lettura di git, mai il server (:50051 intoccato).",
+        "Estrae il PERCHÉ esplicito da dove già vive — messaggi di commit (DECISION:/BREAKING CHANGE:/ADR-… o un perché causale) e file ADR (docs/adr) — e lo propone come decisioni. Anti-FP: razionale verbatim + fonte citata, astensione su commit terse, template e ADR superati. Senza --write stampa proposte da rivedere; con --write le scrive nel ledger (<repo>/.codeos/decisions) preservando l'evidenza (commit/documento), idempotente. Sola lettura di git+file, mai il server (:50051 intoccato).",
     ),
     (
         "simulate \"move <src> to <dst>\"",

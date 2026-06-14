@@ -161,6 +161,7 @@ fn render_evidence_line(e: &Evidence) -> String {
         Evidence::Entity(q) => format!("entity: {}", one_line(q)),
         Evidence::Test(t) => format!("test: {}", one_line(t)),
         Evidence::PriorDecision(id) => format!("decision: {id}"),
+        Evidence::Document(src) => format!("doc: {}", one_line(src)),
     }
 }
 
@@ -184,6 +185,7 @@ fn parse_evidence_line(line: &str) -> Option<Evidence> {
         "entity" => Some(Evidence::Entity(payload.to_string())),
         "test" => Some(Evidence::Test(payload.to_string())),
         "decision" => parse_id(payload).ok().map(Evidence::PriorDecision),
+        "doc" => Some(Evidence::Document(payload.to_string())),
         "edge" => {
             let (source, rest) = payload.split_once(" --")?;
             let (kind, target) = rest.split_once("--> ")?;
@@ -351,6 +353,7 @@ mod tests {
                 },
                 Evidence::Entity("crate::auth::login".to_string()),
                 Evidence::PriorDecision(EntityId::new()),
+                Evidence::Document("docs/adr/0001-login-lato-server.md".to_string()),
             ],
             tags: vec!["sicurezza".to_string(), "login".to_string()],
             timestamp: "2026-05-31T10:00:00+00:00".to_string(),
