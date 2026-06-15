@@ -240,3 +240,5 @@ validato anche su codice reale (`eval/real-world-validation.md`). Server MCP a
 10 tool per gli agenti. Test verdi sull'intero workspace.
 
 Costo: **0** — tutto open source, in locale, nessuna API a pagamento.
+
+> **Provalo in 1 minuto:** `cargo build --release -p codeos-rpc` poi `codeos learn .` (scopre il perché dalla storia, senza server).
