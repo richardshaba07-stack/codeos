@@ -288,6 +288,44 @@ async fn main() -> anyhow::Result<()> {
                 println!("  • {}", t);
             }
         }
+        "certify" => {
+            // Cancello di non-regressione (Fase 3): l'MRI di una PR ridotto a un
+            // VERDETTO binario per CI/agenti. Exit 1 su ⚠️ (la PR non passa il gate).
+            let mut base = String::new();
+            let mut head = "HEAD".to_string();
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "--base" && i + 1 < args.len() {
+                    base = args[i + 1].clone();
+                    i += 2;
+                } else if args[i] == "--head" && i + 1 < args.len() {
+                    head = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            let mut client = connect_server().await?;
+            let res = client
+                .pr_mri(proto::PrMriRequest { base, head })
+                .await?
+                .into_inner();
+            let v = regression_verdict(&res.risk_score, &res.violated_boundaries);
+            println!("🔏 CODEOS CERTIFY — verdetto di non-regressione architetturale");
+            println!("--------------------------------------------------------------");
+            println!("{}", v.headline);
+            if !v.reasons.is_empty() {
+                println!("\n🔴 Motivi:");
+                for r in &v.reasons {
+                    println!("  • {r}");
+                }
+            }
+            println!("\n📋 Sintesi MRI: {}", res.summary);
+            println!("⚠️  Livello di rischio: {}", res.risk_score.to_uppercase());
+            if !v.ok {
+                std::process::exit(1);
+            }
+        }
         "licenses" => {
             let mut client = connect_server().await?;
             let res = client
@@ -1002,6 +1040,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "\"MRI\" architetturale di un PR: confronta due ref git e misura il rischio. Senza --base usa il branch di default del repo (origin/HEAD → main → master), rilevato non indovinato.",
     ),
     (
+        "certify [--base <ref>] [--head <ref>]",
+        "Cancello di NON-REGRESSIONE: riduce l'MRI di una PR a un verdetto binario ✅ NO REGRESSION / ⚠️ REGRESSION POSSIBLE (col confine governato violato e la severità). Anti-FP: ⚠️ è «possibile» non certa, ✅ è «non rilevata rispetto agli invarianti noti» non «provato sicuro». Exit 1 su ⚠️ (gate CI). Pensato per GitHub Actions e per gli agenti (anche via MCP codeos_certify).",
+    ),
+    (
         "licenses",
         "Scansiona le licenze delle dipendenze (metadati locali; sconosciuta = astensione) E i sorgenti (tag SPDX, intestazioni di copyright, file LICENSE vendored), confrontando con la policy del ledger (decisioni con tag license-deny:<ID>). Exit 1 su violazioni.",
     ),
@@ -1027,7 +1069,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "mcp",
-        "Avvia il server MCP su stdio: CodeOS come tool nativo per gli agenti (Claude Code, Cursor…). Tool esposti: codeos_query, codeos_why, codeos_impact, codeos_context_pack, codeos_decide, codeos_report, codeos_licenses, codeos_audit, codeos_learn.",
+        "Avvia il server MCP su stdio: CodeOS come tool nativo per gli agenti (Claude Code, Cursor…). Tool esposti: codeos_query, codeos_why, codeos_impact, codeos_context_pack, codeos_decide, codeos_report, codeos_licenses, codeos_audit, codeos_learn, codeos_certify.",
     ),
     ("help", "Mostra questo aiuto."),
 ];
@@ -1096,6 +1138,39 @@ fn module_tags_from_files(files: &[String], max: usize) -> Vec<String> {
         }
     }
     out
+}
+
+/// Esito BINARIO di non-regressione (Fase 3 «nel ciclo»): da un MRI di PR a un
+/// verdetto per CI e agenti. La semantica anti-FP è NON-negoziabile:
+/// - ⚠️ è «REGRESSION POSSIBLE», non certa — CodeOS segnala un confine governato
+///   attraversato, non garantisce un bug;
+/// - ✅ è «nessuna regressione architetturale RILEVATA (rispetto agli invarianti
+///   noti)», MAI «provato sicuro»: non si promette un'assenza che non si dimostra.
+pub(crate) struct Verdict {
+    pub ok: bool,
+    pub headline: String,
+    pub reasons: Vec<String>,
+}
+
+/// Calcola il verdetto dai campi dell'MRI. **Puro** (testabile senza server). ⚠️ se
+/// un confine GOVERNATO è attraversato (segnale forte dallo spazio-negativo) o se il
+/// rischio è alto; ✅ altrimenti, col disclaimer onesto su cosa significa il verde.
+pub(crate) fn regression_verdict(risk_score: &str, violated_boundaries: &[String]) -> Verdict {
+    let mut reasons: Vec<String> = violated_boundaries
+        .iter()
+        .map(|b| format!("confine architetturale violato: {b}"))
+        .collect();
+    let high_risk = risk_score.eq_ignore_ascii_case("high");
+    if high_risk && violated_boundaries.is_empty() {
+        reasons.push("rischio alto: ampio raggio d'impatto su hotspot storici".to_string());
+    }
+    let ok = violated_boundaries.is_empty() && !high_risk;
+    let headline = if ok {
+        "✅ NO REGRESSION — nessuna regressione architetturale rilevata (rispetto agli invarianti noti; NON è una prova di assenza di bug)".to_string()
+    } else {
+        "⚠️  REGRESSION POSSIBLE — la modifica attraversa un confine governato o ha rischio alto".to_string()
+    };
+    Verdict { ok, headline, reasons }
 }
 
 /// `true` se `hash` esiste ed è un commit nel repo. Usa `git cat-file -e
@@ -1840,7 +1915,7 @@ mod tests {
         let usage = usage_text();
         for cmd in [
             "index", "report", "query", "path", "impact", "doctor", "guard", "context", "mri",
-            "why", "simulate", "help", "decide", "mcp", "licenses", "learn", "audit",
+            "why", "simulate", "help", "decide", "mcp", "licenses", "learn", "audit", "certify",
         ] {
             assert!(
                 usage.contains(cmd),
@@ -2001,6 +2076,38 @@ mod tests {
         assert!(!tags.iter().any(|t| t == "src"));
         // dedup: `billing` compare una volta sola pur toccando due file.
         assert_eq!(tags.iter().filter(|t| *t == "billing").count(), 1);
+    }
+
+    /// Il verdetto del certificatore: ⚠️ su confine violato / rischio alto, ✅
+    /// altrimenti — e il ✅ NON deve mai promettere «sicuro», solo «non rilevata».
+    #[test]
+    fn regression_verdict_is_binary_and_honest() {
+        use super::regression_verdict;
+
+        // Pulito: nessun confine, rischio basso ⇒ ✅, e il verde è onesto.
+        let clean = regression_verdict("low", &[]);
+        assert!(clean.ok);
+        assert!(clean.headline.contains("NO REGRESSION"));
+        assert!(
+            clean.headline.contains("NON è una prova"),
+            "il verde non deve promettere sicurezza: {}",
+            clean.headline
+        );
+        assert!(clean.reasons.is_empty());
+
+        // Confine governato attraversato ⇒ ⚠️, e il motivo cita il confine.
+        let crossed = regression_verdict("medium", &["core -> rpc".to_string()]);
+        assert!(!crossed.ok);
+        assert!(crossed.headline.contains("REGRESSION POSSIBLE"));
+        assert!(crossed.reasons.iter().any(|r| r.contains("core -> rpc")));
+
+        // Rischio alto senza confini espliciti ⇒ ⚠️ comunque (con la sua ragione).
+        let risky = regression_verdict("HIGH", &[]);
+        assert!(!risky.ok);
+        assert!(risky.reasons.iter().any(|r| r.contains("rischio alto")));
+
+        // Rischio medio senza confini ⇒ ✅ (non si grida al lupo).
+        assert!(regression_verdict("medium", &[]).ok);
     }
 
     #[test]

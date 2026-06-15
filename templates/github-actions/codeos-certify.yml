@@ -1,0 +1,72 @@
+# CodeOS Certify — cancello di NON-REGRESSIONE architetturale su ogni PR.
+#
+# Copia questo file in `.github/workflows/` del TUO repository.
+# A ogni pull request: costruisce CodeOS, indicizza il repo, riduce l'MRI a un
+# verdetto binario e lo commenta sulla PR. Esce ≠0 (la PR non passa il gate)
+# quando la modifica attraversa un confine architetturale governato.
+#
+# Onestà del verdetto (vedi `codeos certify`):
+#   ✅ NO REGRESSION   = nessuna regressione architetturale RILEVATA (rispetto agli
+#                        invarianti noti) — NON è una prova di assenza di bug.
+#   ⚠️  REGRESSION POSSIBLE = la modifica tocca un confine governato o ha rischio alto.
+#
+# NB: questo template assume che CodeOS sia disponibile nel repo o via release.
+# Adatta i passi di build/avvio al tuo setup (qui si assume un workspace cargo).
+
+name: CodeOS Certify
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write   # per commentare la PR
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # la storia git completa serve agli invarianti calibrati
+
+      - name: Build CodeOS
+        run: cargo build --release -p codeos-rpc
+
+      - name: Avvia il server e indicizza
+        run: |
+          CODEOS_REPO="$GITHUB_WORKSPACE" CODEOS_DB=/tmp/codeos.db \
+            ./target/release/codeos-server &
+          for i in $(seq 1 30); do
+            ./target/release/codeos doctor >/dev/null 2>&1 && break || sleep 1
+          done
+          ./target/release/codeos index "$GITHUB_WORKSPACE"
+
+      - name: Certifica la PR
+        id: certify
+        # `|| true` per NON far fallire lo step: il verdetto va commentato comunque,
+        # e il gate vero è l'exit code letto sotto.
+        run: |
+          set -o pipefail
+          ./target/release/codeos certify \
+            --base "origin/${{ github.base_ref }}" \
+            --head "${{ github.sha }}" | tee verdict.txt || echo "EXIT=$?" >> verdict.txt
+
+      - name: Commenta il verdetto sulla PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('verdict.txt', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '### 🔏 CodeOS Certify\n```\n' + body + '\n```'
+            });
+
+      - name: Applica il gate (fallisce su ⚠️)
+        run: |
+          ./target/release/codeos certify \
+            --base "origin/${{ github.base_ref }}" \
+            --head "${{ github.sha }}"

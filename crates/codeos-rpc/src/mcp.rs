@@ -199,6 +199,17 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "codeos_certify",
+            "description": "VERDETTO di non-regressione architetturale per una modifica/PR: ✅ NO REGRESSION o ⚠️ REGRESSION POSSIBLE (col confine governato violato e la severità). Da chiamare PRIMA di proporre codice: se ⚠️, ripensa la modifica. Anti-FP: ⚠️ è «possibile» non certa, ✅ è «non rilevata rispetto agli invarianti noti», mai «provato sicuro».",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "base": {"type": "string", "description": "Ref git di base (default: branch di default del repo, rilevato dal server)."},
+                    "head": {"type": "string", "description": "Ref git di head (default: HEAD)."}
+                }
+            }
+        },
+        {
             "name": "codeos_learn",
             "description": "Scopre il PERCHÉ già scritto nella storia del repo — messaggi di commit (DECISION:/BREAKING CHANGE:/ADR-… o un perché causale) e file ADR (docs/adr) — e lo propone come decisioni, ancorate ai moduli toccati. Anti-FP: razionale verbatim + fonte citata, astensione su commit terse/template/ADR superati. SOLO lettura e dry-run (non scrive il ledger): da usare per orientarsi sull'intento di un sottosistema prima di toccarlo.",
             "inputSchema": {
@@ -432,6 +443,29 @@ async fn dispatch_tool(name: &str, args: &Value) -> anyhow::Result<String> {
             let (text, _broken) = crate::audit_report(&repo).await?;
             Ok(text)
         }
+        "codeos_certify" => {
+            // Verdetto di non-regressione: wrappa l'MRI (server) in ✅/⚠️.
+            let base = arg_str(args, "base").unwrap_or_default();
+            let head = arg_str(args, "head").unwrap_or_else(|_| "HEAD".to_string());
+            let mut client = connect_server().await?;
+            let res = client
+                .pr_mri(proto::PrMriRequest { base, head })
+                .await?
+                .into_inner();
+            let v = crate::regression_verdict(&res.risk_score, &res.violated_boundaries);
+            let mut out = format!("{}\n", v.headline);
+            if !v.reasons.is_empty() {
+                out.push_str("Motivi:\n");
+                for r in &v.reasons {
+                    out.push_str(&format!("  - {r}\n"));
+                }
+            }
+            out.push_str(&format!(
+                "Sintesi MRI: {}\nRischio: {}\n",
+                res.summary, res.risk_score
+            ));
+            Ok(out)
+        }
         "codeos_learn" => {
             // Sola lettura git+file, dry-run: NESSUNA scrittura del ledger (il gate
             // umano resta fuori dall'MCP) e nessun server. Riusa crate::mine_repo.
@@ -458,7 +492,7 @@ async fn dispatch_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         other => anyhow::bail!(
             "tool sconosciuto: '{other}' (disponibili: codeos_query, codeos_why, \
              codeos_impact, codeos_context_pack, codeos_decide, codeos_report, \
-             codeos_licenses, codeos_audit, codeos_learn)"
+             codeos_licenses, codeos_audit, codeos_learn, codeos_certify)"
         ),
     }
 }
@@ -496,6 +530,7 @@ mod tests {
             "codeos_report",
             "codeos_audit",
             "codeos_learn",
+            "codeos_certify",
         ] {
             assert!(names.contains(&expected), "manca {expected}: {names:?}");
         }
