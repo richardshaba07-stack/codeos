@@ -999,7 +999,7 @@ impl EnvDiag {
 fn diagnose_repo(value: Option<&str>, exists: bool, is_git: bool) -> EnvDiag {
     match value {
         None => EnvDiag::note(
-            "CODEOS_REPO non impostata: referto solo strutturale (Campo di Astensione e Fossili git disattivati)",
+            "CODEOS_REPO non impostata in QUESTA shell — la legge il processo SERVER: se l'hai avviato con CODEOS_REPO, il server ce l'ha già (questo controllo guarda l'ambiente della CLI, non del server)",
         ),
         Some(path) if !exists => EnvDiag::problem(
             format!("CODEOS_REPO impostata ma il percorso non esiste: '{path}'"),
@@ -1024,7 +1024,7 @@ fn diagnose_db(
 ) -> EnvDiag {
     match value {
         None => EnvDiag::note(
-            "CODEOS_DB non impostata: grafo SQLite in memoria (effimero), nessuna persistenza tra i riavvii",
+            "CODEOS_DB non impostata in QUESTA shell — la legge il processo SERVER (questo controllo guarda l'ambiente della CLI; il server avviato con CODEOS_DB ce l'ha già)",
         ),
         Some(_) if looks_like_uri => {
             EnvDiag::note("CODEOS_DB in forma URI (file:…): salto il controllo del filesystem")
