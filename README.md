@@ -5,234 +5,225 @@
 
 **Architectural intelligence layer for codebases.**
 
+CodeOS builds a **living semantic graph** of a codebase to answer two questions no
+linter can ask:
 
-CodeOS costruisce un **grafo semantico vivo** di una codebase per rispondere a due
-domande che nessun linter sa porsi:
+- **"What breaks if I touch X?"** — the structural impact of a change.
+- **"Why is it written this way?"** — the historical intent behind an architectural
+  boundary.
 
-- **«Cosa cambia se tocco X?»** — l'impatto strutturale di una modifica.
-- **«Perché è scritto così?»** — l'intento storico dietro un confine architetturale.
+The core thesis is **reading the negative space**: not what the code *does*, but what
+it — systematically — *never does*. CodeOS applies that lens to four axes:
 
-La tesi portante è **leggere lo spazio negativo**: non ciò che il codice fa, ma ciò
-che — sistematicamente — *non fa mai*. CodeOS applica questa lente a quattro assi:
-
-| Asse | Osservabile | Primitiva |
-|------|-------------|-----------|
-| **Struttura** | quale arco di dipendenza non esiste mai? | Invarianti di layering |
-| **Tempo** | quante volte hai avuto l'occasione di violarlo e ti sei astenuto? | Campo di Astensione (Wilson lower bound) |
-| **Intento** | qual era il diff nell'istante in cui il confine è nato? | Fossili di Decisione (dalla storia git) |
-| **Meta** | quale invariante *manca* dove dovrebbe esserci? | Spazio Negativo del 2° ordine |
+| Axis | Observable | Primitive |
+|------|------------|-----------|
+| **Structure** | which dependency edge never exists? | Layering invariants |
+| **Time** | how many times could you have violated it, and abstained? | Abstention Field (Wilson lower bound) |
+| **Intent** | what was the diff the instant the boundary was born? | Decision Fossils (from git history) |
+| **Meta** | which invariant is *missing* where it should be? | 2nd-order Negative Space |
 
 ---
 
-## Installazione
+## Results
 
-Requisiti: **Rust** (1.96+, via [rustup](https://rustup.rs)). Tutte le dipendenze
-sono open source (MIT/Apache) e girano **in locale**: nessun servizio o API a pagamento.
-`protoc` è incluso (vendored), non va installato a mano.
+Everything below is **anti-false-positive**: a missing edge is better than one that
+lies. The tool abstains rather than inventing.
+
+- **Anti-fabrication, measured.** On real repositories, `learn` abstains on **~96%**
+  of commits — it surfaces only genuine decisions (verbatim, with a cited source) and
+  **refuses to invent the rest. Zero fabrications.**
+- **The recorded "why" changes agent behavior.** In a **blind, pre-registered**
+  benchmark (n=36), an AI agent violated a non-derivable policy **18/18 times without**
+  CodeOS's recorded intent — and **0/18 with it**.
+- **Robust at scale.** Indexed **80 public repositories, ~3.5M entities, 13
+  languages, with 0 panics.**
+- **9 languages**, 7 validated against compiler oracles (clang, ripper, swiftc,
+  Roslyn, the Python `ast`, …).
+- **364 tests**, green across the whole workspace.
+
+> Honesty note: `certify`'s ✅ means "no architectural regression *detected* against
+> the known invariants" — **not** "proven bug-free". A `⚠️` means *possible*, not
+> certain. Same discipline everywhere.
+
+---
+
+## Install
+
+Requirements: **Rust** (1.96+, via [rustup](https://rustup.rs)). All dependencies are
+open source (MIT/Apache) and run **locally** — no paid service or API. `protoc` is
+vendored, no manual install needed.
 
 ```bash
-# Costruisce server + CLI
+# Builds the server + CLI
 cargo build --release -p codeos-rpc --bin codeos-server --bin codeos
 ```
 
-Risultato: due eseguibili in `target/release/`:
+Result: two executables in `target/release/`:
 
-- `codeos-server` — il motore, dietro una facciata gRPC.
-- `codeos` — la CLI per parlarci da terminale.
+- `codeos-server` — the engine, behind a gRPC facade.
+- `codeos` — the CLI to talk to it from the terminal.
 
 ---
 
-## Avvio rapido (CLI, senza VS Code)
+## Quick start (CLI, no VS Code)
 
 ```bash
-# 1. Avvia il server, agganciato al repo git che vuoi analizzare.
-#    CODEOS_REPO abilita Campo di Astensione + Fossili (serve un repo con storia).
+# 1. Start the server, attached to the git repo you want to analyze.
+#    CODEOS_REPO enables the Abstention Field + Fossils (needs a repo with history).
 CODEOS_REPO="$(pwd)" ./target/release/codeos-server &
 
-# 2. Verifica che tutto sia a posto.
+# 2. Check everything is ready.
 ./target/release/codeos doctor
 
-# 3. Indicizza il progetto.
+# 3. Index the project.
 ./target/release/codeos index .
 
-# 4. Leggi il referto architetturale.
+# 4. Read the architectural report.
 ./target/release/codeos report
 
-# 5. Chiedi il contesto minimo per un LLM su una modifica ipotetica.
-./target/release/codeos query "cosa cambia se modifico il parser?"
+# 5. Ask for the minimal context an LLM needs for a hypothetical change.
+./target/release/codeos query "what changes if I modify the parser?"
 ```
 
-### Comandi della CLI
+### CLI commands
 
-`codeos help` elenca tutto; i principali:
+`codeos help` lists them all; the main ones:
 
-| Comando | Cosa fa |
-|---------|---------|
-| `codeos index <path>` | Indicizza il progetto (canonicalizza il path). |
-| `codeos report` | Referto architetturale completo sui quattro assi. |
-| `codeos query "<testo>"` | Genera il contesto minimo rilevante per un LLM. |
-| `codeos why "<a>\|<b>"` | Time machine: perché esiste il confine tra due elementi. |
-| `codeos impact <nome>` | Chi chiama un'entità (confermati vs possibili). |
-| `codeos context "<goal>"` | "Context pack" per un obiettivo (`--for ai` per gli agenti). |
-| `codeos decide --title … --why …` | Registra a mano una decisione nel ledger di intento. |
-| `codeos learn [path]` | **Riempie** il ledger dal perché già scritto (commit + ADR). |
-| `codeos audit [path]` | **Verifica** il ledger: provenienze sparite (gate CI). |
-| `codeos certify [--base --head]` | **Verdetto** di non-regressione su una PR (gate CI). |
-| `codeos mri` / `guard` / `simulate` | Rischio di una PR / firewall / what-if di refactoring. |
-| `codeos licenses` | Licenze + policy del ledger (`license-deny:`). |
-| `codeos mcp` | Server MCP su stdio: 10 tool nativi per gli agenti AI. |
-| `codeos doctor` | Diagnostica indirizzo / porta / liveness del server. |
+| Command | What it does |
+|---------|--------------|
+| `codeos index <path>` | Index the project (populates the semantic graph). |
+| `codeos report` | Full architectural report across the four axes. |
+| `codeos query "<text>"` | Generate the minimal relevant context for an LLM. |
+| `codeos why "<a>\|<b>"` | Time machine: why the boundary between two elements exists. |
+| `codeos impact <name>` | Who calls an entity (confirmed vs. possible). |
+| `codeos context "<goal>"` | A "context pack" for a goal (`--for ai` for agents). |
+| `codeos decide --title … --why …` | Manually record a decision in the intent ledger. |
+| `codeos learn [path]` | **Fills** the ledger from the "why" already written (commits + ADRs). |
+| `codeos audit [path]` | **Verifies** the ledger: vanished provenance (CI gate). |
+| `codeos certify [--base --head]` | **Non-regression verdict** on a PR (CI gate). |
+| `codeos mri` / `guard` / `simulate` | PR risk / firewall / refactoring what-if. |
+| `codeos licenses` | Dependency licenses + ledger policy (`license-deny:`). |
+| `codeos mcp` | MCP server over stdio: 10 native tools for AI agents. |
+| `codeos doctor` | Diagnose address / port / server liveness. |
 
-### Variabili d'ambiente
+### Environment variables
 
-| Variabile | Default | Significato |
-|-----------|---------|-------------|
-| `CODEOS_ADDR` | `127.0.0.1:50051` | Indirizzo del server gRPC (vale per server e CLI). |
-| `CODEOS_DB` | in memoria | Path del file SQLite del grafo (persistente se impostato). |
-| `CODEOS_DECISIONS` | effimera | Directory della memoria storica Markdown. |
-| `CODEOS_REPO` | nessuna | Root del repo git: abilita confidenza calibrata + Fossili. |
-| `RUST_LOG` | — | Filtro log, es. `info` o `codeos_rpc=debug`. |
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `CODEOS_ADDR` | `127.0.0.1:50051` | gRPC server address (for both server and CLI). |
+| `CODEOS_DB` | in-memory | Path to the graph's SQLite file (persistent if set). |
+| `CODEOS_DECISIONS` | ephemeral | Directory of the Markdown intent ledger. |
+| `CODEOS_REPO` | none | Git repo root: enables calibrated confidence + Fossils. |
+| `RUST_LOG` | — | Log filter, e.g. `info` or `codeos_rpc=debug`. |
 
-> **Nota:** per Fossili e Campo di Astensione, `CODEOS_REPO` deve puntare allo
-> **stesso** path che passi a `codeos index` (il repo git che stai analizzando).
+> **Note:** for Fossils and the Abstention Field, `CODEOS_REPO` must point to the
+> **same** path you pass to `codeos index` (the git repo you're analyzing).
 
 ---
 
-## Il ledger di intento: riempilo e tienilo vero
+## The intent ledger: fill it, keep it true
 
-Il cuore di CodeOS è lo strato **non-derivabile**: il *perché* che git non registra.
-Tre comandi lo riempiono, lo mantengono onesto e lo fanno valere — tutti **anti-FP**
-(mai inventano: citano la fonte e si astengono nel dubbio) e a **costo 0** (sola
-lettura di git + file, nessuna connessione al server per `learn`/`audit`).
+The core of CodeOS is the **non-derivable** layer: the *why* git doesn't record.
+Three commands fill it, keep it honest, and enforce it — all **anti-FP** (they never
+invent: they cite the source and abstain when unsure) and at **zero cost** (read-only
+git + files, no server connection for `learn`/`audit`).
 
 ```bash
-# RIEMPI: scopri il perché già scritto nella storia (commit + ADR) e proponilo come
-# decisioni, ancorate ai moduli toccati. Senza --write stampa proposte da rivedere.
-codeos learn .                 # dry-run: cosa è stato deciso qui, e perché
-codeos learn . --write         # scrive nel ledger SOLO i segnali forti (marcatori/ADR);
-                               # il tier causale è più rumoroso → --include-causal per scriverlo
+# FILL: discover the "why" already written in history (commits + ADRs) and propose it
+# as decisions, anchored to the modules the commit touched. Without --write it prints
+# proposals to review.
+codeos learn .                 # dry-run: what was decided here, and why
+codeos learn . --write         # writes ONLY strong signals (markers/ADRs) to the ledger;
+                               # the causal tier is noisier → --include-causal to write it too
 
-# TIENI VERO: segnala le decisioni la cui fonte è sparita (commit riscritto/squashato,
-# file ADR cancellato). Exit 1 se ne trova → gate CI.
+# KEEP TRUE: flag decisions whose source has vanished (rewritten/squashed commit,
+# deleted ADR file). Exits 1 if any → CI gate.
 codeos audit .
 
-# CERTIFICA: riduce l'MRI di una PR a un verdetto binario. Exit 1 su ⚠️.
-codeos certify --base origin/main --head HEAD     # ✅ NO REGRESSION / ⚠️ REGRESSION POSSIBLE
+# CERTIFY: reduce a PR's MRI to a binary verdict. Exits 1 on ⚠️.
+codeos certify --base origin/main --head HEAD   # ✅ NO REGRESSION / ⚠️ REGRESSION POSSIBLE
 ```
 
-**Onestà del verdetto** (vale per tutto il ledger): `✅` significa «nessuna
-regressione *rilevata* rispetto agli invarianti noti» — **non** «provato sicuro»;
-`⚠️` significa «*possibile*», non certa. Un arco mancante è meglio di uno che mente.
+- **In CI:** `templates/github-actions/codeos-certify.yml` comments every PR with the verdict.
+- **For AI agents:** the MCP server (`codeos mcp`) exposes 10 tools, including
+  `codeos_learn`, `codeos_audit`, `codeos_certify` — an agent discovers the why,
+  verifies the ledger, and **self-certifies** *before* proposing code.
 
-- **In CI:** `templates/github-actions/codeos-certify.yml` commenta ogni PR col verdetto.
-- **Per gli agenti AI:** il server MCP (`codeos mcp`) espone 10 tool, fra cui
-  `codeos_learn`, `codeos_audit`, `codeos_certify` — un agente scopre il perché,
-  verifica il ledger e si **auto-certifica** *prima* di proporre codice.
+### "CodeOS Certified" badge
 
-### Badge «CodeOS Certified»
-
-Aggiungi il sigillo al README del tuo repo:
+Add the seal to your repo's README:
 
 ```markdown
-<!-- Statico (per repo che eseguono `certify` in CI): -->
+<!-- Static (for repos that run `certify` in CI): -->
 ![CodeOS Certified](https://img.shields.io/badge/CodeOS-certified-brightgreen)
 
-<!-- Dinamico (riflette lo stato reale del branch; serve templates/github-actions/codeos-badge.yml): -->
-![CodeOS](https://img.shields.io/endpoint?url=https://richardshaba07-stack.github.io/codeos/badge.json)
+<!-- Dynamic (reflects the branch's real state; needs templates/github-actions/codeos-badge.yml): -->
+![CodeOS](https://img.shields.io/endpoint?url=https://YOUR-USER.github.io/YOUR-REPO/badge.json)
 ```
 
-`codeos certify --badge` produce il JSON endpoint che lo alimenta. **Onestà:**
-«certified» = «nessuna regressione architetturale *rilevata*», non «provato sicuro».
+`codeos certify --badge` produces the endpoint JSON that feeds it. **Honesty:**
+"certified" = "no architectural regression *detected*", not "proven safe".
 
 ---
 
-## Estensione VS Code
+## VS Code extension
 
-Il sistema immunitario diventa **visibile nell'editor**: le violazioni
-architetturali compaiono come `Diagnostic` nel pannello *Problemi*, con la riga
-esatta, più toast e status bar.
+The architectural immune system becomes **visible in the editor**: invariant
+violations show up as `Diagnostic`s in the *Problems* panel, with the exact line,
+plus toasts and a status bar item.
 
-### Sviluppo (Extension Development Host)
+### Development (Extension Development Host)
 
-Il repo include `.vscode/launch.json` e `.vscode/tasks.json`, quindi:
+The repo ships `.vscode/launch.json` and `.vscode/tasks.json`, so:
 
-1. **Terminale → Esegui task → `codeos: run server`** (compila e avvia il server con `CODEOS_REPO` = questo workspace).
-2. Premi **F5** → *«Esegui estensione CodeOS»*: compila l'estensione e apre un Extension Development Host.
-3. Nella nuova finestra: **Riquadro comandi (⇧⌘P) → «CodeOS: Indicizza il progetto»**, poi **«CodeOS: Referto architetturale»**.
-
-### Pacchetto pronto (.vsix)
-
-```bash
-code --install-extension vscode-extension/codeos-0.1.0.vsix
-```
-
-Poi imposta `codeos.serverAddress` nelle impostazioni (default `127.0.0.1:50051`).
-
-> ⚠️ Usa **«Indicizza il progetto»**, non «Indicizza il file»: i Fossili e
-> l'astensione richiedono che la root sia coerente con il repo git.
+1. **Terminal → Run Task → `codeos: run server`** (builds and starts the server with `CODEOS_REPO` = this workspace).
+2. Press **F5** → *"Run CodeOS extension"*: builds the extension and opens an Extension Development Host.
+3. In the new window: **Command Palette (⇧⌘P) → "CodeOS: Index project"**, then **"CodeOS: Architectural report"**.
 
 ---
 
-## Esempio di referto
+## Architecture
+
+A Cargo workspace of 10 crates, in **onion** order (each crate depends only on the
+earlier ones — invariant 1.5):
 
 ```
-📋 SINTESI DIREZIONALE
-  • Fondazioni principali: codeos-types (supportato da 9 layer), codeos-memory (6), ...
-  • Layer più dipendenti:  codeos-guardian (dipende da 5 layer), codeos-rpc (4), ...
-  • Rischi rilevati:       ⚠️  4 lacune architetturali (accoppiamenti bidirezionali).
-
-🧱 INVARIANTI DI LAYERING
-  • 'core::services' NON deve dipendere da 'api::handlers'
-    [Supporto: 8 archi | Confidenza: 74% | Calibrato: tempo / git log]
-
-🦴 FOSSILI DI DECISIONE
-  • Confine 'api::handlers' → 'core::services'
-    Nato nel commit: [909e1c3638f7] «co-touch api+core»
-    File co-modificati: api/handlers.py, core/services.py
+codeos-types      data model + event/command bus (the heart)
+  ├─ codeos-storage   GraphStorage trait + SQLite (rusqlite bundled)
+  ├─ codeos-parser    Tree-sitter: Python, Rust, TS, Go, Java, C, C++, Ruby, Swift, C# → raw data
+codeos-graph      GraphResolver (name resolution → global EntityIds), GraphActor
+codeos-memory     Decision store (versionable Markdown): the "why"
+codeos-paleo      the Paleontologist: reads the negative space of TIME (git history)
+codeos-guardian   immune system: discovers invariants from the negative space
+codeos-query      QueryEngine: weighted BFS → minimal context for an LLM
+codeos-core       Dispatcher + actor orchestration (Actor Model on Tokio)
+codeos-rpc        gRPC facade (tonic) + the codeos-server / codeos binaries
 ```
 
-La **confidenza** non è euristica: è il *Wilson score lower bound* delle
-astensioni osservate nella storia git. Un invariante battle-tested (centinaia di
-occasioni) supera il 98%; uno dedotto da un grafo giovane resta basso — così il
-sistema distingue una regola provata da una coincidenza.
+Non-negotiable principles:
+
+- **Actor Model**: commands over `mpsc`, events over a `broadcast` EventBus, a
+  Dispatcher routes by command type. No actor references another directly (invariant 1.3).
+- **The Parser never touches the graph** (invariant 1.4): it only mints raw data;
+  global `EntityId`s are born in the `GraphResolver`.
+- **Rules discovered, not configured**: layering invariants are *mined* from the
+  asymmetry of dependencies, not hand-written.
 
 ---
 
-## Architettura
+## Status
 
-Workspace Cargo a 10 crate, in ordine **a cipolla** (ogni crate dipende solo dai
-precedenti — invariante 1.5):
+**9 languages** supported (7 validated against compiler oracles). The intent ledger
+**fills itself** (`learn`), **keeps itself true** (`audit`), and **enforces itself in
+CI** (`certify`), all anti-false-positive. MCP server with **10 tools** for AI agents.
+**364 tests** green across the workspace.
 
-```
-codeos-types      modello dati + event/command bus (il cuore)
-  ├─ codeos-storage   trait GraphStorage + SQLite (rusqlite bundled)
-  ├─ codeos-parser    Tree-sitter: Python, Rust, TS, Go, Java, C, C++, Ruby, Swift, C# → dati grezzi
-codeos-graph      GraphResolver (name resolution → EntityId globali), GraphActor
-codeos-memory     Decision store (Markdown versionabile): il "perché"
-codeos-paleo      il Paleontologo: legge il negativo del TEMPO (storia git)
-codeos-guardian   sistema immunitario: scopre invarianti dallo spazio negativo
-codeos-query      QueryEngine: BFS pesata → contesto minimo per LLM
-codeos-core       Dispatcher + orchestrazione attori (Actor Model su Tokio)
-codeos-rpc        facciata gRPC (tonic) + binari codeos-server / codeos
-```
-
-Principi non negoziabili:
-
-- **Actor Model**: comandi via `mpsc`, eventi via `broadcast` EventBus, un
-  Dispatcher instrada per tipo di comando. Nessun attore referenzia un altro
-  direttamente (invariante 1.3).
-- **Il Parser non tocca mai il grafo** (invariante 1.4): conia solo dati grezzi;
-  gli `EntityId` globali nascono nel `GraphResolver`.
-- **Regole scoperte, non configurate**: gli invarianti di layering sono *minati*
-  dall'asimmetria delle dipendenze, non scritti a mano.
+Cost: **0** — fully open source, runs locally, no paid API.
 
 ---
 
-## Stato
+## License
 
-**9 linguaggi** supportati (7 validati contro gli oracoli del compilatore).
-Il **ledger di intento** si **riempie da solo** (`learn`), si **mantiene vero**
-(`audit`) e si fa **valere in CI** (`certify`), il tutto anti-falso-positivo.
-Server MCP a **10 tool** per gli agenti AI. **364 test verdi** sull'intero workspace; provato su repository pubblici reali (incluso il kernel Linux).
-
-Costo: **0** — tutto open source, in locale, nessuna API a pagamento.
+[AGPL-3.0](LICENSE). You're free to use, study, modify and run it; if you distribute a
+modified version — or run it as a network service — you must release your changes
+under the same license.
