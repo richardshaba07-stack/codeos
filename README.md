@@ -125,6 +125,21 @@ regressione *rilevata* rispetto agli invarianti noti» — **non** «provato sic
   `codeos_learn`, `codeos_audit`, `codeos_certify` — un agente scopre il perché,
   verifica il ledger e si **auto-certifica** *prima* di proporre codice.
 
+### Badge «CodeOS Certified»
+
+Aggiungi il sigillo al README del tuo repo:
+
+```markdown
+<!-- Statico (per repo che eseguono `certify` in CI): -->
+![CodeOS Certified](https://img.shields.io/badge/CodeOS-certified-brightgreen)
+
+<!-- Dinamico (riflette lo stato reale del branch; serve templates/github-actions/codeos-badge.yml): -->
+![CodeOS](https://img.shields.io/endpoint?url=https://UTENTE.github.io/REPO/badge.json)
+```
+
+`codeos certify --badge` produce il JSON endpoint che lo alimenta. **Onestà:**
+«certified» = «nessuna regressione architetturale *rilevata*», non «provato sicuro».
+
 ---
 
 ## Estensione VS Code
