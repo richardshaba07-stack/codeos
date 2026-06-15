@@ -1,6 +1,11 @@
 # CodeOS
 
+[![CodeOS](https://img.shields.io/endpoint?url=https://richardshaba07-stack.github.io/codeos/badge.json)](https://github.com/richardshaba07-stack/codeos/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **Architectural intelligence layer for codebases.**
+
+> Anti-fabbricazione, misurata: su **3,8 milioni di commit reali** di 79 progetti pubblici, `learn` si astiene sull'86% — estrae solo le decisioni vere (verbatim, citate), e si rifiuta di inventare il resto.
 
 CodeOS costruisce un **grafo semantico vivo** di una codebase per rispondere a due
 domande che nessun linter sa porsi:
@@ -134,7 +139,7 @@ Aggiungi il sigillo al README del tuo repo:
 ![CodeOS Certified](https://img.shields.io/badge/CodeOS-certified-brightgreen)
 
 <!-- Dinamico (riflette lo stato reale del branch; serve templates/github-actions/codeos-badge.yml): -->
-![CodeOS](https://img.shields.io/endpoint?url=https://UTENTE.github.io/REPO/badge.json)
+![CodeOS](https://img.shields.io/endpoint?url=https://richardshaba07-stack.github.io/codeos/badge.json)
 ```
 
 `codeos certify --badge` produce il JSON endpoint che lo alimenta. **Onestà:**
