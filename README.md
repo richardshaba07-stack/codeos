@@ -60,13 +60,24 @@ CODEOS_REPO="$(pwd)" ./target/release/codeos-server &
 
 ### Comandi della CLI
 
+`codeos help` elenca tutto; i principali:
+
 | Comando | Cosa fa |
 |---------|---------|
 | `codeos index <path>` | Indicizza il progetto (canonicalizza il path). |
 | `codeos report` | Referto architetturale completo sui quattro assi. |
 | `codeos query "<testo>"` | Genera il contesto minimo rilevante per un LLM. |
+| `codeos why "<a>\|<b>"` | Time machine: perché esiste il confine tra due elementi. |
+| `codeos impact <nome>` | Chi chiama un'entità (confermati vs possibili). |
+| `codeos context "<goal>"` | "Context pack" per un obiettivo (`--for ai` per gli agenti). |
+| `codeos decide --title … --why …` | Registra a mano una decisione nel ledger di intento. |
+| `codeos learn [path]` | **Riempie** il ledger dal perché già scritto (commit + ADR). |
+| `codeos audit [path]` | **Verifica** il ledger: provenienze sparite (gate CI). |
+| `codeos certify [--base --head]` | **Verdetto** di non-regressione su una PR (gate CI). |
+| `codeos mri` / `guard` / `simulate` | Rischio di una PR / firewall / what-if di refactoring. |
+| `codeos licenses` | Licenze + policy del ledger (`license-deny:`). |
+| `codeos mcp` | Server MCP su stdio: 10 tool nativi per gli agenti AI. |
 | `codeos doctor` | Diagnostica indirizzo / porta / liveness del server. |
-| `codeos help` | Aiuto. |
 
 ### Variabili d'ambiente
 
@@ -80,6 +91,39 @@ CODEOS_REPO="$(pwd)" ./target/release/codeos-server &
 
 > **Nota:** per Fossili e Campo di Astensione, `CODEOS_REPO` deve puntare allo
 > **stesso** path che passi a `codeos index` (il repo git che stai analizzando).
+
+---
+
+## Il ledger di intento: riempilo e tienilo vero
+
+Il moat di CodeOS è lo strato **non-derivabile**: il *perché* che git non registra.
+Tre comandi lo riempiono, lo mantengono onesto e lo fanno valere — tutti **anti-FP**
+(mai inventano: citano la fonte e si astengono nel dubbio) e a **costo 0** (sola
+lettura di git + file, nessuna connessione al server per `learn`/`audit`).
+
+```bash
+# RIEMPI: scopri il perché già scritto nella storia (commit + ADR) e proponilo come
+# decisioni, ancorate ai moduli toccati. Senza --write stampa proposte da rivedere.
+codeos learn .                 # dry-run: cosa è stato deciso qui, e perché
+codeos learn . --write         # scrive nel ledger SOLO i segnali forti (marcatori/ADR);
+                               # il tier causale è più rumoroso → --include-causal per scriverlo
+
+# TIENI VERO: segnala le decisioni la cui fonte è sparita (commit riscritto/squashato,
+# file ADR cancellato). Exit 1 se ne trova → gate CI.
+codeos audit .
+
+# CERTIFICA: riduce l'MRI di una PR a un verdetto binario. Exit 1 su ⚠️.
+codeos certify --base origin/main --head HEAD     # ✅ NO REGRESSION / ⚠️ REGRESSION POSSIBLE
+```
+
+**Onestà del verdetto** (vale per tutto il ledger): `✅` significa «nessuna
+regressione *rilevata* rispetto agli invarianti noti» — **non** «provato sicuro»;
+`⚠️` significa «*possibile*», non certa. Un arco mancante è meglio di uno che mente.
+
+- **In CI:** `templates/github-actions/codeos-certify.yml` commenta ogni PR col verdetto.
+- **Per gli agenti AI:** il server MCP (`codeos mcp`) espone 10 tool, fra cui
+  `codeos_learn`, `codeos_audit`, `codeos_certify` — un agente scopre il perché,
+  verifica il ledger e si **auto-certifica** *prima* di proporre codice.
 
 ---
 
@@ -143,7 +187,7 @@ precedenti — invariante 1.5):
 ```
 codeos-types      modello dati + event/command bus (il cuore)
   ├─ codeos-storage   trait GraphStorage + SQLite (rusqlite bundled)
-  ├─ codeos-parser    Tree-sitter: Python, Rust, TypeScript → dati grezzi
+  ├─ codeos-parser    Tree-sitter: Python, Rust, TS, Go, Java, C, C++, Ruby, Swift, C# → dati grezzi
 codeos-graph      GraphResolver (name resolution → EntityId globali), GraphActor
 codeos-memory     Decision store (Markdown versionabile): il "perché"
 codeos-paleo      il Paleontologo: legge il negativo del TEMPO (storia git)
@@ -168,6 +212,11 @@ Principi non negoziabili:
 ## Stato
 
 I 7 blocchi della roadmap originale sono chiusi, più le quattro invenzioni R&D
-(i quattro assi dello spazio negativo). Test verdi sull'intero workspace.
+(i quattro assi dello spazio negativo). **9 linguaggi** (7 validati contro oracoli
+del compilatore); robustezza misurata a scala (80 repo, ~3,5M entità, 0 panic).
+Il **ledger di intento** ora si **riempie da solo** (`learn`), si **mantiene vero**
+(`audit`) e si fa **valere in CI** (`certify`), il tutto anti-falso-positivo;
+validato anche su codice reale (`eval/real-world-validation.md`). Server MCP a
+10 tool per gli agenti. Test verdi sull'intero workspace.
 
 Costo: **0** — tutto open source, in locale, nessuna API a pagamento.
