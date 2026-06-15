@@ -54,6 +54,23 @@ design a due tier è **vindicato** dai dati: separare forte da causale serve.
 - Ledger vuoto (gin non ne ha uno) → **«Ledger vuoto: niente da verificare»**,
   exit 0. Comportamento onesto.
 
+### Tier ADR su dati reali — `npryce/adr-tools`
+Repo con 9 ADR Nygard autentici in `doc/adr/`. `learn` ne estrae **9 su 9**:
+titolo ripulito dalla numerazione (`0002-implement-as-shell-scripts` → «Implement
+as shell scripts»), razionale = la sezione `## Decision` **verbatim** (confermato
+carattere-per-carattere). Il tier ADR funziona su file reali.
+
+**Finding (i sintetici lo mascheravano):** la rilevazione `ADR-N` a livello di
+COMMIT over-triggera sui commit di MANUTENZIONE dell'ADR — es. «Fix typo and add
+more consequences to ADR 5» veniva estratto come decisione (marcatore ADR) perché
+il soggetto cita «ADR 5». È un commit che *edita* l'ADR, non una decisione.
+
+→ **Azione presa (questo commit):** `learn` sopprime il segnale ADR a livello di
+commit quando il commit **tocca un file ADR** (l'ADR è già ingerito dalla fonte
+autoritativa). Resta valido il commit che *cita* un ADR senza editarlo. Nuovo
+`codeos_paleo::is_adr_path` + filtro in `mine_repo`. Misurato: su adr-tools il
+commit-rumore sparisce (6→5 commit-decisioni), i 9 ADR-file restano.
+
 ## Conclusione
 
 L'intera pipeline della sessione (mina → scrive → verifica → certifica) **gira
@@ -78,5 +95,4 @@ precisione che gin non poteva esercitare.
   (migliaia di file) per misurare il collo del wall-clock.
 - Non c'è giudice né criterio pre-registrato: è **correttezza** su codice reale,
   non «la prova» con giudice cieco (Fase 1) — quella resta da fare nel mondo.
-- ADR su un repo TERZO non ancora provato (gin/codeos-3 non hanno `docs/adr`; il
-  path ADR è validato solo sui sintetici e sul commit di esempio).
+- Tre repo (gin, codeos-3, adr-tools), tutti medio-piccoli; nessun monorepo.

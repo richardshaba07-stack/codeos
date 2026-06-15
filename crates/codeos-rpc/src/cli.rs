@@ -1348,6 +1348,22 @@ pub(crate) fn mine_repo(
             .map(|c| (c.hash, c.changed_files))
             .collect()
     };
+    // Anti-rumore (finding misurato su adr-tools): un commit che EDITA un file ADR
+    // («fix typo in ADR 5») non è una decisione — l'ADR è ingerito dalla fonte
+    // autoritativa (mine_adrs). Toglie il segnale ADR a livello di commit quando il
+    // commit tocca un ADR; resta valido il commit che *cita* un ADR senza editarlo.
+    mined.retain(|d| {
+        if d.marker != "ADR" {
+            return true;
+        }
+        match &d.source {
+            codeos_paleo::DecisionSource::Commit(h) => !file_map
+                .get(h)
+                .map(|files| files.iter().any(|f| codeos_paleo::is_adr_path(f)))
+                .unwrap_or(false),
+            codeos_paleo::DecisionSource::Document(_) => true,
+        }
+    });
     if strong_only {
         mined.retain(|d| d.confidence == codeos_paleo::IntentConfidence::Strong);
     }

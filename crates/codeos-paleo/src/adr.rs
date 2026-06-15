@@ -81,6 +81,18 @@ pub fn read_adrs(repo_root: impl AsRef<Path>) -> Vec<AdrDoc> {
     docs
 }
 
+/// `true` se `path` vive in una directory ADR convenzionale (confronto su
+/// separatori normalizzati). Serve a distinguere un commit che *implementa* una
+/// decisione citando un ADR (segnale valido) da uno che *edita* un file ADR
+/// (manutenzione: l'ADR è già ingerito dalla fonte autoritativa, quindi il segnale
+/// a livello di commit è solo rumore — finding misurato su adr-tools).
+pub fn is_adr_path(path: &str) -> bool {
+    let norm = path.replace('\\', "/");
+    ADR_DIRS
+        .iter()
+        .any(|dir| norm.contains(&format!("/{dir}/")) || norm.starts_with(&format!("{dir}/")))
+}
+
 /// Estrae le decisioni dagli ADR. **Puro**: nessun I/O, testabile senza filesystem.
 /// Salta i documenti che non hanno la forma di un ADR e gli ADR non più correnti.
 pub fn mine_adrs(docs: &[AdrDoc]) -> Vec<MinedDecision> {
@@ -277,6 +289,16 @@ mod tests {
             "# ADR Template\n\n## Status\n\n## Decision\n\n{decision goes here}",
         );
         assert!(mine_adrs(&[doc]).is_empty());
+    }
+
+    #[test]
+    fn recognizes_adr_paths() {
+        assert!(is_adr_path("/abs/repo/doc/adr/0002-x.md"));
+        assert!(is_adr_path("docs/adr/0001-y.md"));
+        assert!(is_adr_path("/r/docs/architecture/decisions/0003.md"));
+        // Un file qualunque NON è un ADR.
+        assert!(!is_adr_path("/abs/repo/src/billing/charge.rs"));
+        assert!(!is_adr_path("README.md"));
     }
 
     #[test]

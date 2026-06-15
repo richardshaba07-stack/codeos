@@ -57,7 +57,7 @@ pub mod miner;
 pub use abstention::{
     boundary_story, occasion_window, occasions, Abstention, BoundaryOccasion, OccasionWindow, Z_95,
 };
-pub use adr::{mine_adrs, read_adrs, AdrDoc};
+pub use adr::{is_adr_path, mine_adrs, read_adrs, AdrDoc};
 pub use fossil::{excavate, is_history_insufficient, DecisionFossil};
 pub use history::{head_commit, CachedHistory, Commit, CommitHistory, GitLog, InMemoryHistory};
 pub use miner::{
