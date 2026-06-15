@@ -333,7 +333,11 @@ fn capture_from(head: &str, rest: &[&str]) -> String {
         }
         parts.push(t.to_string());
     }
-    parts.join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
+    parts
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `true` se la riga cita un ADR: `ADR-<num>` o `ADR <num>` (case-insensitive).
@@ -413,7 +417,9 @@ pub fn read_commit_messages(
         .arg(repo_root.as_ref())
         .arg("log")
         .arg("--no-merges")
-        .arg(format!("--pretty=format:{MSG_MARKER}%H{FIELD_SEP}%s{FIELD_SEP}%b"));
+        .arg(format!(
+            "--pretty=format:{MSG_MARKER}%H{FIELD_SEP}%s{FIELD_SEP}%b"
+        ));
     if let Some(n) = max {
         cmd.arg(format!("-n{n}"));
     }
@@ -556,7 +562,9 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].confidence, IntentConfidence::Causal);
         // L'intera frase, ricomposta dalle tre righe; il trailer è escluso.
-        assert!(out[0].rationale.contains("per evitare che un monorepo gigante"));
+        assert!(out[0]
+            .rationale
+            .contains("per evitare che un monorepo gigante"));
         assert!(out[0].rationale.contains("blocchi la richiesta gRPC"));
         assert!(!out[0].rationale.contains("Co-authored-by"));
     }
@@ -605,7 +613,11 @@ mod tests {
     /// I merge non sono decisioni di intento.
     #[test]
     fn abstains_on_merge_commits() {
-        let m = msg("mg1", "Merge branch 'feature/x' into main", "because reasons");
+        let m = msg(
+            "mg1",
+            "Merge branch 'feature/x' into main",
+            "because reasons",
+        );
         assert!(mine(&[m]).is_empty());
     }
 
@@ -614,7 +626,11 @@ mod tests {
     #[test]
     fn rationale_is_always_verbatim() {
         let cases = vec![
-            msg("v1", "x", "WHY: scelta dettata dal vincolo di memoria a 64MB"),
+            msg(
+                "v1",
+                "x",
+                "WHY: scelta dettata dal vincolo di memoria a 64MB",
+            ),
             msg("v2", "y", "Lo facciamo perché il vecchio path era O(n^2)"),
             msg("v3", "Implementa retry (ADR-7)", ""),
         ];
@@ -631,7 +647,10 @@ mod tests {
     }
 
     fn normalize(s: &str) -> String {
-        s.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+        s.to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Il parser regge corpi multilinea e corpi vuoti, e non confonde i record.
@@ -659,7 +678,11 @@ mod tests {
     /// `DECISION (D102): …` — l'etichetta con un suffisso non alfabetico combacia.
     #[test]
     fn label_tolerates_a_parenthetical_suffix() {
-        let m = msg("p1", "Soggetto", "DECISION (D102): isolare il dominio dall'infra");
+        let m = msg(
+            "p1",
+            "Soggetto",
+            "DECISION (D102): isolare il dominio dall'infra",
+        );
         let out = mine(&[m]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].marker, "DECISION");

@@ -62,7 +62,9 @@ pub fn find_broken_provenance(
     for d in decisions {
         for e in &d.evidence {
             let reason = match e {
-                Evidence::Commit(h) if !commit_exists(h) => Some(BreakReason::CommitGone(h.clone())),
+                Evidence::Commit(h) if !commit_exists(h) => {
+                    Some(BreakReason::CommitGone(h.clone()))
+                }
                 Evidence::Document(p) if !doc_exists(p) => {
                     Some(BreakReason::DocumentGone(p.clone()))
                 }
@@ -105,7 +107,10 @@ mod tests {
 
     #[test]
     fn flags_a_decision_whose_commit_vanished() {
-        let decisions = vec![decision("Passa a SQLite", vec![Evidence::Commit("deadbeef".into())])];
+        let decisions = vec![decision(
+            "Passa a SQLite",
+            vec![Evidence::Commit("deadbeef".into())],
+        )];
         // Nessun commit esiste, nessun documento esiste.
         let broken = find_broken_provenance(&decisions, |_| false, |_| false);
         assert_eq!(broken.len(), 1);

@@ -152,7 +152,9 @@ fn strip_adr_numbering(title: &str) -> String {
     let mut s = title.trim();
     // Prefisso «ADR» opzionale.
     if s.len() >= 3 && s[..3].eq_ignore_ascii_case("adr") {
-        s = s[3..].trim_start_matches(['-', ' ', '\u{2014}', '#', ':']).trim_start();
+        s = s[3..]
+            .trim_start_matches(['-', ' ', '\u{2014}', '#', ':'])
+            .trim_start();
     }
     // Cifre iniziali (il numero dell'ADR).
     let after_digits = s.trim_start_matches(|c: char| c.is_ascii_digit());

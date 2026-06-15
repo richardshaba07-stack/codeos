@@ -154,7 +154,8 @@ mod tests {
     fn a_layer_tag_still_anchors_like_before() {
         // Non-regressione del comportamento legittimo (api/core): il tag di layer regge.
         let selected = vec![entity("app::api::handler_0::run")];
-        let out = select_human_decisions(vec![tagged("api non tocca il db", &["api"])], &selected, 10);
+        let out =
+            select_human_decisions(vec![tagged("api non tocca il db", &["api"])], &selected, 10);
         assert_eq!(out.len(), 1, "il tag di layer deve ancora agganciare");
     }
 
@@ -167,14 +168,20 @@ mod tests {
             entity("private::tmp::repo::src::auth::login"),
         ];
         let out = select_human_decisions(vec![tagged("nota generica", &["src"])], &selected, 10);
-        assert!(out.is_empty(), "un tag strutturale non deve inondare il pack");
+        assert!(
+            out.is_empty(),
+            "un tag strutturale non deve inondare il pack"
+        );
     }
 
     #[test]
     fn structural_filter_is_case_insensitive() {
         let selected = vec![entity("x::SRC::y")];
         let out = select_human_decisions(vec![tagged("t", &["SRC"])], &selected, 10);
-        assert!(out.is_empty(), "anche `SRC` è strutturale (case-insensitive)");
+        assert!(
+            out.is_empty(),
+            "anche `SRC` è strutturale (case-insensitive)"
+        );
     }
 
     #[test]
@@ -185,6 +192,10 @@ mod tests {
         let mut d = tagged("ancorata per id", &["src"]);
         d.related_entity_ids = vec![e.id];
         let out = select_human_decisions(vec![d], &[e], 10);
-        assert_eq!(out.len(), 1, "l'aggancio esplicito non passa dal filtro tag");
+        assert_eq!(
+            out.len(),
+            1,
+            "l'aggancio esplicito non passa dal filtro tag"
+        );
     }
 }

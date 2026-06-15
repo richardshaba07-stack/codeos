@@ -698,9 +698,7 @@ async fn main() -> anyhow::Result<()> {
                     // non una vera decisione. Restano nel dry-run per la revisione; per
                     // scriverli serve `--include-causal`. Un ledger fidato vale più del
                     // recall: meglio poche decisioni vere che tante da ripulire.
-                    if !include_causal
-                        && d.confidence == codeos_paleo::IntentConfidence::Causal
-                    {
+                    if !include_causal && d.confidence == codeos_paleo::IntentConfidence::Causal {
                         skipped_causal += 1;
                         continue;
                     }
@@ -747,15 +745,17 @@ async fn main() -> anyhow::Result<()> {
                     store.record(&proposal.confirm()).await?;
                     written += 1;
                 }
-                println!(
-                    "\n✅ {written} decisioni scritte nel ledger: {dir}"
-                );
+                println!("\n✅ {written} decisioni scritte nel ledger: {dir}");
                 if skipped > 0 {
-                    println!("   ({skipped} già presenti, saltate — `learn --write` è idempotente)");
+                    println!(
+                        "   ({skipped} già presenti, saltate — `learn --write` è idempotente)"
+                    );
                 }
                 if skipped_causal > 0 {
-                    println!("   ({skipped_causal} causali NON scritte — tier a bassa precisione; \
-                              rivedile nel dry-run, o `--include-causal` per scriverle)");
+                    println!(
+                        "   ({skipped_causal} causali NON scritte — tier a bassa precisione; \
+                              rivedile nel dry-run, o `--include-causal` per scriverle)"
+                    );
                 }
                 println!(
                     "   Autore: ai:DecisionMiner · tag: learned + from-git/from-adr + i MODULI\n \
@@ -1229,9 +1229,14 @@ pub(crate) fn regression_verdict(risk_score: &str, violated_boundaries: &[String
     let headline = if ok {
         "✅ NO REGRESSION — nessuna regressione architetturale rilevata (rispetto agli invarianti noti; NON è una prova di assenza di bug)".to_string()
     } else {
-        "⚠️  REGRESSION POSSIBLE — la modifica attraversa un confine governato o ha rischio alto".to_string()
+        "⚠️  REGRESSION POSSIBLE — la modifica attraversa un confine governato o ha rischio alto"
+            .to_string()
     };
-    Verdict { ok, headline, reasons }
+    Verdict {
+        ok,
+        headline,
+        reasons,
+    }
 }
 
 /// `true` se `hash` esiste ed è un commit nel repo. Usa `git cat-file -e
@@ -1280,7 +1285,10 @@ pub(crate) async fn audit_report(repo: &str) -> anyhow::Result<(String, usize)> 
     let mut s = String::new();
     let _ = writeln!(s, "🔎 AUDIT — integrità del ledger di intento");
     let _ = writeln!(s, "   (anti-FP: segnalo SOLO provenienze davvero sparite — commit irraggiungibile / file assente)");
-    let _ = writeln!(s, "------------------------------------------------------------");
+    let _ = writeln!(
+        s,
+        "------------------------------------------------------------"
+    );
     let _ = writeln!(
         s,
         "📊 {} decisioni nel ledger · {} con provenienza rotta",
@@ -1302,7 +1310,10 @@ pub(crate) async fn audit_report(repo: &str) -> anyhow::Result<(String, usize)> 
         if decisions.is_empty() {
             let _ = writeln!(s, "\n(Ledger vuoto: niente da verificare.)");
         } else {
-            let _ = writeln!(s, "\n✅ Ogni decisione con provenienza cita una fonte ancora viva.");
+            let _ = writeln!(
+                s,
+                "\n✅ Ogni decisione con provenienza cita una fonte ancora viva."
+            );
         }
     } else {
         let _ = writeln!(
@@ -1410,16 +1421,26 @@ fn anchor_tags_for(
 pub(crate) fn learn_summary(r: &MineResult) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
-    let _ = writeln!(s, "🔎 LEARN — il «perché» estratto dalle fonti dove già vive");
+    let _ = writeln!(
+        s,
+        "🔎 LEARN — il «perché» estratto dalle fonti dove già vive"
+    );
     let _ = writeln!(s, "   (anti-FP: razionale verbatim + fonte citata; ciò che non porta intento esplicito si astiene, mai inventato)");
-    let _ = writeln!(s, "------------------------------------------------------------");
+    let _ = writeln!(
+        s,
+        "------------------------------------------------------------"
+    );
     let commit_abstained = r.scanned.saturating_sub(r.commit_mined);
     let _ = writeln!(
         s,
         "📊 commit: {} scansionati · {} con intento · {} astenuti",
         r.scanned, r.commit_mined, commit_abstained
     );
-    let _ = writeln!(s, "   ADR:    {} file · {} decisioni", r.adr_files, r.adr_count);
+    let _ = writeln!(
+        s,
+        "   ADR:    {} file · {} decisioni",
+        r.adr_files, r.adr_count
+    );
     if r.mined.is_empty() {
         let _ = writeln!(s, "\n(Nessuna decisione esplicita trovata: né marcatori nei commit (`DECISION:`/`BREAKING CHANGE:`/`ADR-…`/un perché causale) né ADR in docs/adr. È un'astensione onesta, non un errore.)");
     }

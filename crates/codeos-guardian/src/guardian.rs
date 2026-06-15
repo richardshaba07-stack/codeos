@@ -3187,18 +3187,39 @@ mod tests {
         let guardian = Guardian::with_memory(storage, store);
 
         // Goal sul modulo billing.
-        let billing = guardian.get_context_pack("billing charge", true).await.unwrap();
+        let billing = guardian
+            .get_context_pack("billing charge", true)
+            .await
+            .unwrap();
         let b = billing.decisions.join(" | ");
-        assert!(b.contains("addebito idempotente"), "recall: manca la decisione billing: {b}");
-        assert!(!b.contains("non deve floodare"), "FLOOD: il tag strutturale `src` non deve comparire: {b}");
-        assert!(!b.contains("sessione validata"), "leak: la decisione auth non c'entra col billing: {b}");
+        assert!(
+            b.contains("addebito idempotente"),
+            "recall: manca la decisione billing: {b}"
+        );
+        assert!(
+            !b.contains("non deve floodare"),
+            "FLOOD: il tag strutturale `src` non deve comparire: {b}"
+        );
+        assert!(
+            !b.contains("sessione validata"),
+            "leak: la decisione auth non c'entra col billing: {b}"
+        );
 
         // Goal sul modulo auth: simmetrico.
         let auth = guardian.get_context_pack("auth login", true).await.unwrap();
         let a = auth.decisions.join(" | ");
-        assert!(a.contains("sessione validata"), "recall: manca la decisione auth: {a}");
-        assert!(!a.contains("non deve floodare"), "FLOOD: `src` non deve comparire neanche qui: {a}");
-        assert!(!a.contains("addebito idempotente"), "leak: la decisione billing non c'entra con l'auth: {a}");
+        assert!(
+            a.contains("sessione validata"),
+            "recall: manca la decisione auth: {a}"
+        );
+        assert!(
+            !a.contains("non deve floodare"),
+            "FLOOD: `src` non deve comparire neanche qui: {a}"
+        );
+        assert!(
+            !a.contains("addebito idempotente"),
+            "leak: la decisione billing non c'entra con l'auth: {a}"
+        );
     }
 
     #[tokio::test]
