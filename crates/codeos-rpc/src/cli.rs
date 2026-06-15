@@ -602,6 +602,7 @@ async fn main() -> anyhow::Result<()> {
             let mut max: Option<usize> = Some(1000);
             let mut strong_only = false;
             let mut write = false;
+            let mut include_causal = false;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -619,6 +620,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                     "--write" => {
                         write = true;
+                        i += 1;
+                    }
+                    "--include-causal" => {
+                        include_causal = true;
                         i += 1;
                     }
                     arg if !arg.starts_with('-') && repo.is_none() => {
@@ -664,7 +669,20 @@ async fn main() -> anyhow::Result<()> {
 
                 let mut written = 0usize;
                 let mut skipped = 0usize;
+                let mut skipped_causal = 0usize;
                 for d in &r.mined {
+                    // Precisione sulla scrittura: di default scrive solo i segnali
+                    // FORTI (marcatori espliciti/ADR). Su codice reale (misurato su gin)
+                    // il tier causale è rumoroso — verbatim, mai inventato, ma spesso
+                    // non una vera decisione. Restano nel dry-run per la revisione; per
+                    // scriverli serve `--include-causal`. Un ledger fidato vale più del
+                    // recall: meglio poche decisioni vere che tante da ripulire.
+                    if !include_causal
+                        && d.confidence == codeos_paleo::IntentConfidence::Causal
+                    {
+                        skipped_causal += 1;
+                        continue;
+                    }
                     if already.contains(d.source.key()) {
                         skipped += 1;
                         continue;
@@ -713,6 +731,10 @@ async fn main() -> anyhow::Result<()> {
                 );
                 if skipped > 0 {
                     println!("   ({skipped} già presenti, saltate — `learn --write` è idempotente)");
+                }
+                if skipped_causal > 0 {
+                    println!("   ({skipped_causal} causali NON scritte — tier a bassa precisione; \
+                              rivedile nel dry-run, o `--include-causal` per scriverle)");
                 }
                 println!(
                     "   Autore: ai:DecisionMiner · tag: learned + from-git/from-adr + i MODULI\n \
@@ -1074,8 +1096,8 @@ const COMMANDS: &[(&str, &str)] = &[
         "Time machine: perché esiste il confine tra due elementi (nascita, intento, decisioni correlate).",
     ),
     (
-        "learn [path] [--max N | --all] [--strong-only] [--write]",
-        "Estrae il PERCHÉ esplicito da dove già vive — messaggi di commit (DECISION:/BREAKING CHANGE:/ADR-… o un perché causale) e file ADR (docs/adr) — e lo propone come decisioni, ANCORATE ai moduli che il commit ha toccato (così affiorano nel context pack di quell'area). Anti-FP: razionale verbatim + fonte citata, astensione su commit terse, template e ADR superati, tag di modulo senza i segmenti strutturali (no flood). Senza --write stampa proposte da rivedere; con --write le scrive nel ledger (<repo>/.codeos/decisions) preservando l'evidenza (commit/documento), idempotente. Sola lettura di git+file, mai il server (:50051 intoccato).",
+        "learn [path] [--max N | --all] [--strong-only] [--write] [--include-causal]",
+        "Estrae il PERCHÉ esplicito da dove già vive — messaggi di commit (DECISION:/BREAKING CHANGE:/ADR-… o un perché causale) e file ADR (docs/adr) — e lo propone come decisioni, ANCORATE ai moduli che il commit ha toccato (così affiorano nel context pack di quell'area). Anti-FP: razionale verbatim + fonte citata, astensione su commit terse, template e ADR superati, tag di modulo senza i segmenti strutturali (no flood). Senza --write stampa proposte da rivedere; con --write scrive nel ledger (<repo>/.codeos/decisions) preservando l'evidenza, idempotente — di DEFAULT solo i segnali FORTI (il tier causale è rumoroso su codice reale; --include-causal per scriverlo comunque). Sola lettura di git+file, mai il server (:50051 intoccato).",
     ),
     (
         "audit [path]",
