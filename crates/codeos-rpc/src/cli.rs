@@ -291,8 +291,10 @@ async fn main() -> anyhow::Result<()> {
         "certify" => {
             // Cancello di non-regressione (Fase 3): l'MRI di una PR ridotto a un
             // VERDETTO binario per CI/agenti. Exit 1 su ⚠️ (la PR non passa il gate).
+            // Con --json l'esito è parsabile da CI/agenti (l'exit code resta il gate).
             let mut base = String::new();
             let mut head = "HEAD".to_string();
+            let json = args.iter().any(|a| a == "--json");
             let mut i = 2;
             while i < args.len() {
                 if args[i] == "--base" && i + 1 < args.len() {
@@ -311,17 +313,33 @@ async fn main() -> anyhow::Result<()> {
                 .await?
                 .into_inner();
             let v = regression_verdict(&res.risk_score, &res.violated_boundaries);
-            println!("🔏 CODEOS CERTIFY — verdetto di non-regressione architetturale");
-            println!("--------------------------------------------------------------");
-            println!("{}", v.headline);
-            if !v.reasons.is_empty() {
-                println!("\n🔴 Motivi:");
-                for r in &v.reasons {
-                    println!("  • {r}");
+            if json {
+                // Forma stabile per CI/agenti: nessuna decorazione, solo dati.
+                let out = serde_json::json!({
+                    "verdict": if v.ok { "no_regression" } else { "regression_possible" },
+                    "ok": v.ok,
+                    "headline": v.headline,
+                    "reasons": v.reasons,
+                    "violated_boundaries": res.violated_boundaries,
+                    "risk_score": res.risk_score,
+                    "blast_radius_change": res.blast_radius_change,
+                    "summary": res.summary,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!("🔏 CODEOS CERTIFY — verdetto di non-regressione architetturale");
+                println!("--------------------------------------------------------------");
+                println!("{}", v.headline);
+                if !v.reasons.is_empty() {
+                    println!("\n🔴 Motivi:");
+                    for r in &v.reasons {
+                        println!("  • {r}");
+                    }
                 }
+                println!("\n📋 Sintesi MRI: {}", res.summary);
+                println!("⚠️  Livello di rischio: {}", res.risk_score.to_uppercase());
             }
-            println!("\n📋 Sintesi MRI: {}", res.summary);
-            println!("⚠️  Livello di rischio: {}", res.risk_score.to_uppercase());
+            // Il gate resta l'exit code, in ENTRAMBI i formati: ⚠️ ⇒ ≠0.
             if !v.ok {
                 std::process::exit(1);
             }
@@ -1040,8 +1058,8 @@ const COMMANDS: &[(&str, &str)] = &[
         "\"MRI\" architetturale di un PR: confronta due ref git e misura il rischio. Senza --base usa il branch di default del repo (origin/HEAD → main → master), rilevato non indovinato.",
     ),
     (
-        "certify [--base <ref>] [--head <ref>]",
-        "Cancello di NON-REGRESSIONE: riduce l'MRI di una PR a un verdetto binario ✅ NO REGRESSION / ⚠️ REGRESSION POSSIBLE (col confine governato violato e la severità). Anti-FP: ⚠️ è «possibile» non certa, ✅ è «non rilevata rispetto agli invarianti noti» non «provato sicuro». Exit 1 su ⚠️ (gate CI). Pensato per GitHub Actions e per gli agenti (anche via MCP codeos_certify).",
+        "certify [--base <ref>] [--head <ref>] [--json]",
+        "Cancello di NON-REGRESSIONE: riduce l'MRI di una PR a un verdetto binario ✅ NO REGRESSION / ⚠️ REGRESSION POSSIBLE (col confine governato violato e la severità). Anti-FP: ⚠️ è «possibile» non certa, ✅ è «non rilevata rispetto agli invarianti noti» non «provato sicuro». Exit 1 su ⚠️ (gate CI). Con --json l'esito è parsabile da CI/agenti. Pensato per GitHub Actions e per gli agenti (anche via MCP codeos_certify).",
     ),
     (
         "licenses",

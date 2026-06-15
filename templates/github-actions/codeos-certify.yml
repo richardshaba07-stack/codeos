@@ -41,15 +41,14 @@ jobs:
           done
           ./target/release/codeos index "$GITHUB_WORKSPACE"
 
-      - name: Certifica la PR
-        id: certify
-        # `|| true` per NON far fallire lo step: il verdetto va commentato comunque,
-        # e il gate vero è l'exit code letto sotto.
+      - name: Certifica la PR (JSON, parsabile)
+        # Non fa fallire lo step: il verdetto va commentato comunque; il gate vero
+        # è lo step finale, che rilegge l'exit code.
         run: |
-          set -o pipefail
-          ./target/release/codeos certify \
+          ./target/release/codeos certify --json \
             --base "origin/${{ github.base_ref }}" \
-            --head "${{ github.sha }}" | tee verdict.txt || echo "EXIT=$?" >> verdict.txt
+            --head "${{ github.sha }}" > verdict.json || true
+          cat verdict.json
 
       - name: Commenta il verdetto sulla PR
         if: always()
@@ -57,12 +56,20 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const body = fs.readFileSync('verdict.txt', 'utf8');
+            let v;
+            try { v = JSON.parse(fs.readFileSync('verdict.json', 'utf8')); }
+            catch (e) { return; }   // niente verdetto valido ⇒ niente commento
+            const icon = v.ok ? '✅' : '⚠️';
+            let body = `### 🔏 CodeOS Certify\n\n${icon} **${v.headline}**\n`;
+            if (v.reasons && v.reasons.length) {
+              body += '\n**Motivi:**\n' + v.reasons.map(r => `- ${r}`).join('\n') + '\n';
+            }
+            body += `\n_Rischio: ${v.risk_score} · ${v.summary}_`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '### 🔏 CodeOS Certify\n```\n' + body + '\n```'
+              body,
             });
 
       - name: Applica il gate (fallisce su ⚠️)
