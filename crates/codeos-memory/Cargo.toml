@@ -1,0 +1,16 @@
+[package]
+name = "codeos-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MemoryActor, Decision/ArchitectureRule e storage su file Markdown ispezionabili a mano."
+
+[dependencies]
+codeos-types = { workspace = true }
+codeos-storage = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name = "codeos-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GraphActor, GraphResolver e gestione del GraphDelta."
+
+[dependencies]
+codeos-types = { workspace = true }
+codeos-storage = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+codeos-parser = { workspace = true }
+criterion = { workspace = true }
+async-trait = { workspace = true }
+
+[[bench]]
+name = "resolve"
+harness = false

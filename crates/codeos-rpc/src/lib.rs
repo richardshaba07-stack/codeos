@@ -1,0 +1,1311 @@
+//! `codeos-rpc` — la **facciata gRPC** (tonic) di CodeOS.
+//!
+//! È il guscio più esterno della cipolla (invariante 1.5): può dipendere da
+//! tutto, ma niente dipende da lui. Non contiene business logic — ogni RPC è un
+//! sottile **ponte** che traduce un messaggio gRPC in un [`Command`] per il
+//! Dispatcher di `codeos-core`, attende la risposta sul canale `reply_to` e la
+//! ritraduce in un messaggio gRPC.
+//!
+//! - [`CodeOsService`]: l'implementazione del servizio `CodeOs`.
+//! - [`serve`]: avvia il server su un indirizzo TCP.
+//! - [`proto`]: i tipi generati da `proto/codeos.proto` (client e server).
+//!
+//! Lo stream [`proto::EventMessage`] di `WatchEvents` espone in tempo reale gli
+//! eventi del sistema — in particolare le violazioni del **sistema immunitario** —
+//! a un client come il plugin VS Code.
+
+// `tonic::Status` è il tipo d'errore *imposto* da gRPC su tutto questo crate ed è
+// intrinsecamente grosso (~176 byte). Boxarlo nei nostri helper romperebbe il
+// `?` verso i metodi del servizio (che devono restituire `Status` nudo): qui il
+// lint è un falso positivo, lo silenziamo a livello di crate.
+#![allow(clippy::result_large_err)]
+
+use std::net::SocketAddr;
+use std::pin::Pin;
+
+use codeos_core::DispatcherHandle;
+use codeos_types::bus::{
+    ArchitecturalGapInfo, CallPathStatus, CodeOsEvent, Command, DecisionFossilInfo,
+    GraphQualityInfo, ImpactStatus, LayeringCandidateInfo, LayeringInvariantInfo, NewDecision,
+    PossibleCallerInfo, QueryRequest, TransitiveCallerInfo,
+};
+use codeos_types::{Entity, EntityId, EntityKind, Relation, RelationKind, SourceLocation};
+use tokio::sync::{broadcast, mpsc};
+use tokio::time::{timeout, Duration};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::Stream;
+use tonic::transport::Server;
+use tonic::{Request, Response, Status};
+use uuid::Uuid;
+
+/// I tipi generati a build-time da `proto/codeos.proto`.
+pub mod proto {
+    tonic::include_proto!("codeos.v1");
+}
+
+use proto::code_os_server::{CodeOs, CodeOsServer};
+
+/// Attesa di DEFAULT della conferma `GraphUpdated` (l'attesa è EVENT-DRIVEN: la
+/// risposta arriva nell'istante esatto del commit del grafo, mai un polling — quindi
+/// un tetto generoso non costa nulla nei casi rapidi). I 5s storici producevano un
+/// FALSO NEGATIVO di conferma sui repo grandi (campagna 50 progetti: sqlalchemy
+/// completava a ~15s, guava a ~26s, la CLI usciva exit-1 mentre il server finiva
+/// il lavoro). 10 minuti coprono i repo monster misurati (windows-rs 58s,
+/// TypeScript 82s) con margine; `CODEOS_INDEX_WAIT_SECS` lo regola senza ricompilare.
+const GRAPH_UPDATE_WAIT_DEFAULT: Duration = Duration::from_secs(600);
+
+fn graph_update_wait() -> Duration {
+    std::env::var("CODEOS_INDEX_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(GRAPH_UPDATE_WAIT_DEFAULT)
+}
+
+/// L'implementazione del servizio gRPC. Tiene una [`DispatcherHandle`] clonabile
+/// (un `Sender` verso la front door + il bus eventi): è tutto ciò che serve per
+/// fare da ponte, senza alcun riferimento diretto agli attori (invariante 1.3).
+#[derive(Clone)]
+pub struct CodeOsService {
+    dispatcher: DispatcherHandle,
+}
+
+impl CodeOsService {
+    /// Crea il servizio attorno a un sistema CodeOS già avviato.
+    pub fn new(dispatcher: DispatcherHandle) -> Self {
+        Self { dispatcher }
+    }
+
+    /// Lo avvolge in un [`CodeOsServer`] pronto da montare in un `tonic` router.
+    pub fn into_server(self) -> CodeOsServer<Self> {
+        CodeOsServer::new(self)
+    }
+}
+
+/// Avvia il server gRPC e blocca finché non termina.
+///
+/// `dispatcher` è il sistema CodeOS già avviato (vedi `codeos_core::spawn*`).
+pub async fn serve(
+    dispatcher: DispatcherHandle,
+    addr: SocketAddr,
+) -> Result<(), tonic::transport::Error> {
+    Server::builder()
+        .add_service(CodeOsService::new(dispatcher).into_server())
+        .serve(addr)
+        .await
+}
+
+/// L'esito dell'attesa dell'aggiornamento del grafo dopo un comando di indicizzazione.
+///
+/// Filosofia (P0, «un arco mancante è preferibile a uno che mente»): il ponte gRPC
+/// non deve *mai* dichiarare un successo che non ha osservato. Distinguiamo tre casi
+/// onesti invece di collassarli tutti in «torna comunque».
+enum GraphWaitOutcome {
+    /// Osservato `GraphUpdated`: il grafo riflette i file appena indicizzati.
+    Updated,
+    /// Osservato `GraphUpdateFailed`: il `GraphActor` ha fallito resolution/persistenza.
+    Failed(String),
+    /// Né successo né fallimento entro il timeout, o bus chiuso: esito *ignoto*.
+    /// Non possiamo affermare il successo, quindi lo segnaliamo come tale.
+    Unconfirmed,
+}
+
+async fn wait_for_graph_update(
+    mut graph_rx: broadcast::Receiver<CodeOsEvent>,
+    operation: &str,
+) -> GraphWaitOutcome {
+    let wait = graph_update_wait();
+    let observed = timeout(wait, async {
+        loop {
+            match graph_rx.recv().await {
+                Ok(CodeOsEvent::GraphUpdated { .. }) => return GraphWaitOutcome::Updated,
+                Ok(CodeOsEvent::GraphUpdateFailed { reason }) => {
+                    return GraphWaitOutcome::Failed(reason)
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        operation,
+                        skipped,
+                        "attesa GraphUpdated: eventi persi dal subscriber"
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => return GraphWaitOutcome::Unconfirmed,
+            }
+        }
+    })
+    .await;
+
+    match observed {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            tracing::warn!(
+                operation,
+                timeout_ms = wait.as_millis(),
+                "attesa GraphUpdated scaduta: esito dell'indicizzazione non confermato"
+            );
+            GraphWaitOutcome::Unconfirmed
+        }
+    }
+}
+
+/// Traduce l'esito dell'attesa in un `Result` per il ponte gRPC: solo `Updated`
+/// autorizza a dichiarare successo. `Failed` e `Unconfirmed` diventano errori
+/// onesti (rispettivamente `internal` e `deadline_exceeded`) così che la CLI non
+/// stampi mai «completata con successo» su un grafo che non è stato aggiornato.
+fn ensure_graph_updated(outcome: GraphWaitOutcome, operation: &str) -> Result<(), Status> {
+    match outcome {
+        GraphWaitOutcome::Updated => Ok(()),
+        GraphWaitOutcome::Failed(reason) => Err(Status::internal(format!(
+            "{operation}: aggiornamento del grafo fallito: {reason}"
+        ))),
+        GraphWaitOutcome::Unconfirmed => Err(Status::deadline_exceeded(format!(
+            "{operation}: esito non confermato entro {} s. Il server può star ancora \
+             lavorando in background: verifica con `codeos report`, o alza \
+             CODEOS_INDEX_WAIT_SECS (lato server) per attese più lunghe.",
+            graph_update_wait().as_secs()
+        ))),
+    }
+}
+
+#[tonic::async_trait]
+impl CodeOs for CodeOsService {
+    async fn query_graph(
+        &self,
+        request: Request<proto::QueryGraphRequest>,
+    ) -> Result<Response<proto::QueryGraphResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::QueryGraph {
+                query: QueryRequest::NaturalLanguage {
+                    text: req.natural_language,
+                },
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let response = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal query actor"))?
+            .map_err(|e| Status::internal(format!("query fallita: {e}")))?;
+
+        Ok(Response::new(proto::QueryGraphResponse {
+            formatted_context: response.formatted_context,
+            entities: response.entities.into_iter().map(entity_to_proto).collect(),
+            relations: response
+                .relations
+                .into_iter()
+                .map(relation_to_proto)
+                .collect(),
+        }))
+    }
+
+    async fn call_path(
+        &self,
+        request: Request<proto::CallPathRequest>,
+    ) -> Result<Response<proto::CallPathResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::CallPath {
+                from: req.from,
+                to: req.to,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let reply = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal query actor"))?
+            .map_err(|e| Status::internal(format!("call_path fallita: {e}")))?;
+
+        Ok(Response::new(proto::CallPathResponse {
+            formatted: reply.formatted,
+            status: call_path_status_name(reply.status).to_string(),
+            steps: reply.steps.into_iter().map(entity_to_proto).collect(),
+            candidates: reply.candidates.into_iter().map(entity_to_proto).collect(),
+        }))
+    }
+
+    async fn impact(
+        &self,
+        request: Request<proto::ImpactRequest>,
+    ) -> Result<Response<proto::ImpactResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::Impact {
+                name: req.name,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let reply = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal query actor"))?
+            .map_err(|e| Status::internal(format!("impact fallita: {e}")))?;
+
+        Ok(Response::new(proto::ImpactResponse {
+            formatted: reply.formatted,
+            status: impact_status_name(reply.status).to_string(),
+            confirmed_callers: reply.confirmed.into_iter().map(entity_to_proto).collect(),
+            possible_callers: reply
+                .possible
+                .into_iter()
+                .map(possible_caller_to_proto)
+                .collect(),
+            candidates: reply.candidates.into_iter().map(entity_to_proto).collect(),
+        }))
+    }
+
+    async fn impact_transitive(
+        &self,
+        request: Request<proto::ImpactTransitiveRequest>,
+    ) -> Result<Response<proto::ImpactTransitiveResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::ImpactTransitive {
+                name: req.name,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let reply = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal query actor"))?
+            .map_err(|e| Status::internal(format!("impact_transitive fallita: {e}")))?;
+
+        Ok(Response::new(proto::ImpactTransitiveResponse {
+            formatted: reply.formatted,
+            status: impact_status_name(reply.status).to_string(),
+            callers: reply
+                .callers
+                .into_iter()
+                .map(transitive_caller_to_proto)
+                .collect(),
+            depth_capped: reply.depth_capped,
+            candidates: reply.candidates.into_iter().map(entity_to_proto).collect(),
+        }))
+    }
+
+    async fn record_decision(
+        &self,
+        request: Request<proto::RecordDecisionRequest>,
+    ) -> Result<Response<proto::RecordDecisionResponse>, Status> {
+        let req = request.into_inner();
+        // Le stringhe UUID arrivano dal filo: validale qui, ai confini del sistema,
+        // così gli attori interni lavorano solo con `EntityId` ben formati.
+        let related_entity_ids = req
+            .related_entity_ids
+            .iter()
+            .map(|s| parse_entity_id(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        let related_decision_ids = req
+            .related_decision_ids
+            .iter()
+            .map(|s| parse_entity_id(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        let supersedes = req
+            .supersedes
+            .iter()
+            .map(|s| parse_entity_id(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        let deprecates = req
+            .deprecates
+            .iter()
+            .map(|s| parse_entity_id(s))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::RecordDecision {
+                decision: NewDecision {
+                    author: req.author,
+                    title: req.title,
+                    context: req.context,
+                    rationale: req.rationale,
+                    related_entity_ids,
+                    related_decision_ids,
+                    supersedes,
+                    deprecates,
+                    tags: req.tags,
+                },
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let id = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal memory actor"))?
+            .map_err(|e| Status::internal(format!("registrazione decisione fallita: {e}")))?;
+
+        Ok(Response::new(proto::RecordDecisionResponse {
+            decision_id: id.to_string(),
+        }))
+    }
+
+    async fn index_project(
+        &self,
+        request: Request<proto::IndexProjectRequest>,
+    ) -> Result<Response<proto::IndexProjectResponse>, Status> {
+        let req = request.into_inner();
+        let graph_rx = self.dispatcher.events.subscribe();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::IndexProject {
+                project_root: req.project_root,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal parser actor"))?
+            .map_err(|e| Status::internal(format!("indicizzazione progetto fallita: {e}")))?;
+
+        let outcome = wait_for_graph_update(graph_rx, "IndexProject").await;
+        ensure_graph_updated(outcome, "IndexProject")?;
+        Ok(Response::new(proto::IndexProjectResponse {}))
+    }
+
+    async fn index_files(
+        &self,
+        request: Request<proto::IndexFilesRequest>,
+    ) -> Result<Response<proto::IndexFilesResponse>, Status> {
+        let req = request.into_inner();
+        let graph_rx = self.dispatcher.events.subscribe();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::IndexFiles {
+                files: req.files,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let ids = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal parser actor"))?
+            .map_err(|e| Status::internal(format!("indicizzazione file fallita: {e}")))?;
+
+        let outcome = wait_for_graph_update(graph_rx, "IndexFiles").await;
+        ensure_graph_updated(outcome, "IndexFiles")?;
+        Ok(Response::new(proto::IndexFilesResponse {
+            entity_ids: ids.iter().map(|id| id.to_string()).collect(),
+        }))
+    }
+
+    async fn get_architecture_report(
+        &self,
+        _request: Request<proto::GetArchitectureReportRequest>,
+    ) -> Result<Response<proto::GetArchitectureReportResponse>, Status> {
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::ArchitectureReport { reply_to })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let report = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian"))?
+            .map_err(|e| Status::internal(format!("referto architetturale fallito: {e}")))?;
+
+        Ok(Response::new(proto::GetArchitectureReportResponse {
+            invariants: report
+                .invariants
+                .into_iter()
+                .map(layering_invariant_to_proto)
+                .collect(),
+            fossils: report
+                .fossils
+                .into_iter()
+                .map(decision_fossil_to_proto)
+                .collect(),
+            gaps: report
+                .gaps
+                .into_iter()
+                .map(architectural_gap_to_proto)
+                .collect(),
+            quality: Some(graph_quality_to_proto(report.quality)),
+            history_insufficient: report.history_insufficient,
+            candidates: report
+                .candidates
+                .into_iter()
+                .map(layering_candidate_to_proto)
+                .collect(),
+        }))
+    }
+
+    async fn guard_before(
+        &self,
+        request: Request<proto::GuardBeforeRequest>,
+    ) -> Result<Response<proto::GuardBeforeResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::GuardBefore {
+                goal: req.goal,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let res = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian"))?
+            .map_err(|e| Status::internal(format!("guard_before fallito: {e}")))?;
+
+        Ok(Response::new(proto::GuardBeforeResponse {
+            target_files: res.target_files,
+            boundaries: res.boundaries,
+            blast_radius: res.blast_radius,
+            safe_path: res.safe_path,
+            context_pack: res.context_pack,
+        }))
+    }
+
+    async fn guard_after(
+        &self,
+        _request: Request<proto::GuardAfterRequest>,
+    ) -> Result<Response<proto::GuardAfterResponse>, Status> {
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::GuardAfter { reply_to })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let res = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian"))?
+            .map_err(|e| Status::internal(format!("guard_after fallito: {e}")))?;
+
+        let mut violations = Vec::new();
+        for vio in res.violations {
+            violations.push(proto::ArchitectureViolationEvent {
+                rule_id: vio.rule_id.to_string(),
+                relation_id: vio.relation_id.to_string(),
+                source_id: vio.source_id.to_string(),
+                target_id: vio.target_id.to_string(),
+                message: vio.message,
+                location: vio.location.map(location_to_proto),
+                severity: vio.severity.as_str().to_string(),
+            });
+        }
+
+        Ok(Response::new(proto::GuardAfterResponse {
+            new_relations: res.new_relations,
+            violations,
+            proposed_fixes: res.proposed_fixes,
+        }))
+    }
+
+    async fn get_context_pack(
+        &self,
+        request: Request<proto::GetContextPackRequest>,
+    ) -> Result<Response<proto::GetContextPackResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::GetContextPack {
+                goal: req.goal,
+                for_ai: req.for_ai,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let res = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian"))?
+            .map_err(|e| Status::internal(format!("get_context_pack fallito: {e}")))?;
+
+        Ok(Response::new(proto::GetContextPackResponse {
+            goal_interpretation: res.goal_interpretation,
+            files_to_read: res.files_to_read,
+            relevant_entities: res.relevant_entities,
+            key_dependencies: res.key_dependencies,
+            boundaries_to_preserve: res.boundaries_to_preserve,
+            local_patterns: res.local_patterns,
+            suggested_tests: res.suggested_tests,
+            estimated_risk: res.estimated_risk,
+            formatted_markdown: res.formatted_markdown,
+            decisions: res.decisions,
+        }))
+    }
+
+    async fn pr_mri(
+        &self,
+        request: Request<proto::PrMriRequest>,
+    ) -> Result<Response<proto::PrMriResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::PrMri {
+                base: req.base,
+                head: req.head,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let res = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian"))?
+            .map_err(|e| Status::internal(format!("pr_mri fallito: {e}")))?;
+
+        Ok(Response::new(proto::PrMriResponse {
+            new_dependencies: res.new_dependencies,
+            violated_boundaries: res.violated_boundaries,
+            blast_radius_change: res.blast_radius_change,
+            historical_hotspots: res.historical_hotspots,
+            new_external_dependencies: res.new_external_dependencies,
+            impacted_tests: res.impacted_tests,
+            risk_score: res.risk_score,
+            summary: res.summary,
+        }))
+    }
+
+    async fn simulate(
+        &self,
+        request: Request<proto::SimulateRequest>,
+    ) -> Result<Response<proto::SimulateResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::Simulate {
+                expr: req.expr,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let res = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian"))?
+            .map_err(|e| Status::internal(format!("simulate fallito: {e}")))?;
+
+        Ok(Response::new(proto::SimulateResponse {
+            dependencies_to_rewrite: res.dependencies_to_rewrite,
+            changed_boundaries: res.changed_boundaries,
+            risks: res.risks,
+            suggested_tests: res.suggested_tests,
+            recommendation_plan: res.recommendation_plan,
+        }))
+    }
+
+    async fn licenses(
+        &self,
+        _request: Request<proto::LicensesRequest>,
+    ) -> Result<Response<proto::LicensesResponse>, Status> {
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::LicenseReport { reply_to })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+        let res = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian actor"))?
+            .map_err(|e| Status::internal(format!("license_report fallita: {e}")))?;
+        Ok(Response::new(proto::LicensesResponse {
+            dependencies: res
+                .dependencies
+                .into_iter()
+                .map(|d| proto::DependencyLicense {
+                    name: d.name,
+                    ecosystem: d.ecosystem,
+                    license: d.license,
+                    source: d.source,
+                })
+                .collect(),
+            violations: res
+                .violations
+                .into_iter()
+                .map(|v| proto::LicenseViolation {
+                    dependency: v.dependency,
+                    license: v.license,
+                    denied: v.denied,
+                    decision_title: v.decision_title,
+                })
+                .collect(),
+            denied_count: res.denied_count,
+            source_notices: res
+                .source_notices
+                .into_iter()
+                .map(|n| proto::SourceNotice {
+                    path: n.path,
+                    line: n.line,
+                    kind: n.kind,
+                    text: n.text,
+                })
+                .collect(),
+            notices_truncated: res.notices_truncated,
+        }))
+    }
+
+    async fn why(
+        &self,
+        request: Request<proto::WhyRequest>,
+    ) -> Result<Response<proto::WhyResponse>, Status> {
+        let req = request.into_inner();
+        let (reply_to, mut reply_rx) = mpsc::channel(1);
+        self.dispatcher
+            .commands
+            .send(Command::Why {
+                expr: req.expr,
+                reply_to,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatcher non raggiungibile"))?;
+
+        let res = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| Status::internal("nessuna risposta dal guardian"))?
+            .map_err(|e| Status::internal(format!("why fallito: {e}")))?;
+
+        Ok(Response::new(proto::WhyResponse {
+            born_commit: res.born_commit,
+            born_date: res.born_date,
+            intent: res.intent,
+            co_changed_files: res.co_changed_files,
+            markdown_decisions: res.markdown_decisions,
+            explanation: res.explanation,
+            history_insufficient: res.history_insufficient,
+            boundary_story: res.boundary_story,
+        }))
+    }
+
+    /// Lo stream di `WatchEvents`: una pipe boxata che inoltra ogni evento del bus
+    /// tradotto in [`proto::EventMessage`].
+    type WatchEventsStream =
+        Pin<Box<dyn Stream<Item = Result<proto::EventMessage, Status>> + Send + 'static>>;
+
+    async fn watch_events(
+        &self,
+        _request: Request<proto::WatchEventsRequest>,
+    ) -> Result<Response<Self::WatchEventsStream>, Status> {
+        // Sottoscrivi PRIMA di restituire, così il client riceve ogni evento
+        // pubblicato dopo l'apertura dello stream. Un task ponte travasa dal
+        // canale `broadcast` (che può "laggare") a un `mpsc` ordinato verso il client.
+        let mut bus = self.dispatcher.events.subscribe();
+        let (tx, out_rx) = mpsc::channel(64);
+
+        tokio::spawn(async move {
+            loop {
+                match bus.recv().await {
+                    Ok(event) => {
+                        // Alcuni eventi (es. GraphUpdateFailed) non hanno un
+                        // EventMessage nel proto: `event_to_proto` li scarta con None.
+                        let Some(msg) = event_to_proto(event) else {
+                            continue;
+                        };
+                        if tx.send(Ok(msg)).await.is_err() {
+                            break; // il client ha chiuso lo stream
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "WatchEvents in ritardo: alcuni eventi persi");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conversioni tipi del bus → tipi proto (confine del sistema).
+// ---------------------------------------------------------------------------
+
+fn parse_entity_id(raw: &str) -> Result<EntityId, Status> {
+    Uuid::parse_str(raw)
+        .map(EntityId)
+        .map_err(|e| Status::invalid_argument(format!("EntityId '{raw}' non valido: {e}")))
+}
+
+fn entity_to_proto(entity: Entity) -> proto::Entity {
+    proto::Entity {
+        id: entity.id.to_string(),
+        kind: entity_kind_name(entity.kind).to_string(),
+        qualified_name: entity.qualified_name,
+        location: Some(location_to_proto(entity.location)),
+        metadata: entity.metadata,
+    }
+}
+
+/// Nome stabile dello stato del cammino di chiamata per il filo gRPC. La CLI e
+/// gli agent lo leggono come stringa (`found`/`no_path`/`unknown`/`ambiguous`):
+/// un contratto esplicito che non collassa i quattro esiti onesti in un booleano.
+fn call_path_status_name(status: CallPathStatus) -> &'static str {
+    match status {
+        CallPathStatus::Found => "found",
+        CallPathStatus::NoPath => "no_path",
+        CallPathStatus::Unknown => "unknown",
+        CallPathStatus::Ambiguous => "ambiguous",
+    }
+}
+
+/// Nome stabile dello stato dell'analisi d'impatto per il filo gRPC. La CLI e gli
+/// agent lo leggono come stringa (`found`/`unknown`/`ambiguous`). Non c'è un
+/// `no_path`: un'entità che esiste ma che nessuno chiama è comunque `found`, con
+/// liste di chiamanti vuote — la verità «esiste, nessun chiamante noto» non si
+/// collassa con «non esiste».
+fn impact_status_name(status: ImpactStatus) -> &'static str {
+    match status {
+        ImpactStatus::Found => "found",
+        ImpactStatus::Unknown => "unknown",
+        ImpactStatus::Ambiguous => "ambiguous",
+    }
+}
+
+/// Converte un chiamante possibile dal bus al suo specchio proto, preservando il
+/// riferimento grezzo dal sorgente (il PERCHÉ del sospetto, mai inventato).
+fn possible_caller_to_proto(pc: PossibleCallerInfo) -> proto::PossibleCaller {
+    proto::PossibleCaller {
+        source: Some(entity_to_proto(pc.source)),
+        reference: pc.reference,
+    }
+}
+
+/// Converte un chiamante transitivo dal bus al suo specchio proto, preservando la
+/// distanza in hop (quanto è lontano il chiamante dall'entità d'impatto).
+fn transitive_caller_to_proto(tc: TransitiveCallerInfo) -> proto::TransitiveCaller {
+    proto::TransitiveCaller {
+        source: Some(entity_to_proto(tc.source)),
+        hops: tc.hops,
+    }
+}
+
+fn relation_to_proto(relation: Relation) -> proto::Relation {
+    proto::Relation {
+        id: relation.id.to_string(),
+        kind: relation_kind_name(relation.kind).to_string(),
+        source_id: relation.source_id.to_string(),
+        target_id: relation.target_id.to_string(),
+        metadata: relation.metadata,
+    }
+}
+
+fn location_to_proto(location: SourceLocation) -> proto::SourceLocation {
+    proto::SourceLocation {
+        file_path: location.file_path,
+        start_line: location.start_line,
+        start_column: location.start_column,
+        end_line: location.end_line,
+        end_column: location.end_column,
+    }
+}
+
+fn layering_invariant_to_proto(info: LayeringInvariantInfo) -> proto::LayeringInvariant {
+    proto::LayeringInvariant {
+        upstream: info.upstream,
+        downstream: info.downstream,
+        support: info.support,
+        confidence: info.confidence,
+        calibrated: info.calibrated,
+        severity: info.severity.as_str().to_string(),
+        origin: info.origin.as_str().to_string(),
+        staleness_secs: info.staleness_secs,
+    }
+}
+
+fn layering_candidate_to_proto(info: LayeringCandidateInfo) -> proto::LayeringCandidate {
+    proto::LayeringCandidate {
+        upstream: info.upstream,
+        downstream: info.downstream,
+        support: info.support,
+        needed: info.needed,
+    }
+}
+
+fn decision_fossil_to_proto(info: DecisionFossilInfo) -> proto::DecisionFossil {
+    proto::DecisionFossil {
+        upstream: info.upstream,
+        downstream: info.downstream,
+        born_at: info.born_at,
+        born_at_unix: info.born_at_unix,
+        intent: info.intent,
+        born_structure: info.born_structure,
+    }
+}
+
+fn architectural_gap_to_proto(info: ArchitecturalGapInfo) -> proto::ArchitecturalGap {
+    proto::ArchitecturalGap {
+        upstream: info.upstream,
+        downstream: info.downstream,
+        foundation_support: info.foundation_support,
+        severity: info.severity.as_str().to_string(),
+    }
+}
+
+fn graph_quality_to_proto(info: GraphQualityInfo) -> proto::GraphQuality {
+    proto::GraphQuality {
+        total_entities: info.total_entities,
+        external_entities: info.external_entities,
+        total_relations: info.total_relations,
+        resolved_relations: info.resolved_relations,
+        unresolved_relations: info.unresolved_relations,
+        low_confidence_relations: info.low_confidence_relations,
+    }
+}
+
+fn event_to_proto(event: CodeOsEvent) -> Option<proto::EventMessage> {
+    use proto::event_message::Event;
+    let inner = match event {
+        CodeOsEvent::FilesIndexed { results } => Event::FilesIndexed(proto::FilesIndexedEvent {
+            file_paths: results.into_iter().map(|r| r.file_path).collect(),
+        }),
+        CodeOsEvent::GraphUpdated { delta } => Event::GraphUpdated(proto::GraphUpdatedEvent {
+            added_entities: delta.added_entities.len() as u32,
+            removed_entities: delta.removed_entity_ids.len() as u32,
+            added_relations: delta.added_relations.len() as u32,
+            removed_relations: delta.removed_relation_ids.len() as u32,
+        }),
+        CodeOsEvent::ArchitectureViolationDetected { violation } => {
+            Event::Violation(proto::ArchitectureViolationEvent {
+                rule_id: violation.rule_id.to_string(),
+                relation_id: violation.relation_id.to_string(),
+                source_id: violation.source_id.to_string(),
+                target_id: violation.target_id.to_string(),
+                message: violation.message,
+                location: violation.location.map(location_to_proto),
+                severity: violation.severity.as_str().to_string(),
+            })
+        }
+        CodeOsEvent::IndexProgress {
+            total_files,
+            processed_files,
+            current_file,
+            skipped_files,
+            parse_errors,
+        } => Event::IndexProgress(proto::IndexProgressEvent {
+            total_files,
+            processed_files,
+            current_file,
+            skipped_files,
+            parse_errors,
+        }),
+        // `GraphUpdateFailed` è un segnale interno di onestà: lo consumano i ponti
+        // IndexProject/IndexFiles (che restituiscono un errore gRPC al chiamante).
+        // Non esiste un EventMessage corrispondente nel proto, quindi non lo
+        // inoltriamo allo stream WatchEvents.
+        CodeOsEvent::GraphUpdateFailed { .. } => return None,
+    };
+    Some(proto::EventMessage { event: Some(inner) })
+}
+
+/// Nome stabile e leggibile della variante (indipendente dall'ordinale enum).
+fn entity_kind_name(kind: EntityKind) -> &'static str {
+    match kind {
+        EntityKind::Project => "Project",
+        EntityKind::Module => "Module",
+        EntityKind::Class => "Class",
+        EntityKind::Struct => "Struct",
+        EntityKind::Interface => "Interface",
+        EntityKind::Function => "Function",
+        EntityKind::Method => "Method",
+        EntityKind::Variable => "Variable",
+        EntityKind::Parameter => "Parameter",
+        EntityKind::Test => "Test",
+        EntityKind::ExternalDependency => "ExternalDependency",
+    }
+}
+
+fn relation_kind_name(kind: RelationKind) -> &'static str {
+    match kind {
+        RelationKind::Calls => "Calls",
+        RelationKind::Imports => "Imports",
+        RelationKind::Implements => "Implements",
+        RelationKind::Extends => "Extends",
+        RelationKind::Tests => "Tests",
+        RelationKind::Uses => "Uses",
+        RelationKind::Creates => "Creates",
+        RelationKind::Modifies => "Modifies",
+        RelationKind::BelongsTo => "BelongsTo",
+        RelationKind::Unresolved => "Unresolved",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proto::code_os_client::CodeOsClient;
+
+    /// Avvia un sistema effimero + il server gRPC su una porta libera; restituisce
+    /// un client connesso e l'[`EventBus`] del sistema (per pubblicare eventi nei
+    /// test dello stream). Il server vive finché vive il runtime del test.
+    async fn start_server() -> (
+        CodeOsClient<tonic::transport::Channel>,
+        codeos_core::EventBus,
+    ) {
+        let system = codeos_core::spawn();
+        let events = system.events.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let service = CodeOsService::new(system).into_server();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(service)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        // Riprova la connessione finché il server non è in ascolto.
+        let endpoint = format!("http://{addr}");
+        for _ in 0..50 {
+            if let Ok(client) = CodeOsClient::connect(endpoint.clone()).await {
+                return (client, events);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("impossibile connettersi al server gRPC su {endpoint}");
+    }
+
+    #[tokio::test]
+    async fn record_decision_over_the_wire_returns_a_uuid() {
+        let (mut client, _events) = start_server().await;
+
+        let response = client
+            .record_decision(proto::RecordDecisionRequest {
+                author: "human:test".to_string(),
+                title: "Scelta via gRPC".to_string(),
+                context: "ctx".to_string(),
+                rationale: "perché sì".to_string(),
+                related_entity_ids: vec![],
+                related_decision_ids: vec![],
+                supersedes: vec![],
+                deprecates: vec![],
+                tags: vec!["test".to_string()],
+            })
+            .await
+            .expect("RPC RecordDecision fallita")
+            .into_inner();
+
+        // L'id restituito deve essere un UUID valido.
+        Uuid::parse_str(&response.decision_id).expect("decision_id non è un UUID");
+    }
+
+    #[tokio::test]
+    async fn query_graph_over_the_wire_succeeds_on_empty_graph() {
+        let (mut client, _events) = start_server().await;
+
+        let response = client
+            .query_graph(proto::QueryGraphRequest {
+                natural_language: "login oauth".to_string(),
+            })
+            .await
+            .expect("RPC QueryGraph fallita")
+            .into_inner();
+
+        // Grafo vuoto: nessuna entità, ma il contesto formattato è sempre prodotto.
+        assert!(response.entities.is_empty());
+        assert!(!response.formatted_context.is_empty());
+    }
+
+    #[tokio::test]
+    async fn call_path_over_the_wire_is_unknown_on_empty_graph() {
+        let (mut client, _events) = start_server().await;
+
+        let response = client
+            .call_path(proto::CallPathRequest {
+                from: "handler".to_string(),
+                to: "repo".to_string(),
+            })
+            .await
+            .expect("RPC CallPath fallita")
+            .into_inner();
+
+        // Grafo vuoto: entrambi i nomi sono ignoti ⇒ stato "unknown" esplicito,
+        // nessun passo, ma un messaggio onesto è sempre prodotto. Mai un cammino
+        // inventato per un'entità che non esiste.
+        assert_eq!(response.status, "unknown");
+        assert!(response.steps.is_empty());
+        assert!(!response.formatted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn impact_over_the_wire_is_unknown_on_empty_graph() {
+        let (mut client, _events) = start_server().await;
+
+        let response = client
+            .impact(proto::ImpactRequest {
+                name: "repo".to_string(),
+            })
+            .await
+            .expect("RPC Impact fallita")
+            .into_inner();
+
+        // Grafo vuoto: il nome è ignoto ⇒ stato "unknown" esplicito, nessun
+        // chiamante (né certo né possibile), ma un messaggio onesto è sempre
+        // prodotto. Mai un impatto inventato per un'entità che non esiste.
+        assert_eq!(response.status, "unknown");
+        assert!(response.confirmed_callers.is_empty());
+        assert!(response.possible_callers.is_empty());
+        assert!(!response.formatted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn impact_transitive_over_the_wire_is_unknown_on_empty_graph() {
+        let (mut client, _events) = start_server().await;
+
+        let response = client
+            .impact_transitive(proto::ImpactTransitiveRequest {
+                name: "repo".to_string(),
+            })
+            .await
+            .expect("RPC ImpactTransitive fallita")
+            .into_inner();
+
+        // Grafo vuoto: il nome è ignoto ⇒ stato "unknown" esplicito, nessun
+        // chiamante, `depth_capped` falso, ma un messaggio onesto è sempre prodotto.
+        // Mai un raggio d'impatto inventato per un'entità che non esiste.
+        assert_eq!(response.status, "unknown");
+        assert!(response.callers.is_empty());
+        assert!(!response.depth_capped);
+        assert!(!response.formatted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_decision_rejects_a_malformed_entity_id() {
+        let (mut client, _events) = start_server().await;
+
+        let status = client
+            .record_decision(proto::RecordDecisionRequest {
+                author: "human:test".to_string(),
+                title: "Decisione con id rotto".to_string(),
+                context: String::new(),
+                rationale: String::new(),
+                related_entity_ids: vec!["non-un-uuid".to_string()],
+                related_decision_ids: vec![],
+                supersedes: vec![],
+                deprecates: vec![],
+                tags: vec![],
+            })
+            .await
+            .expect_err("un EntityId malformato doveva essere rifiutato");
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn index_then_query_over_the_wire_finds_the_entity() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("codeos_rpc_{nanos}.py"));
+        tokio::fs::write(
+            &path,
+            "class PaymentService:\n    def charge(self):\n        pass\n",
+        )
+        .await
+        .unwrap();
+
+        let (mut client, _events) = start_server().await;
+
+        // IndexFiles risponde con `entity_ids` VUOTO per costruzione: il Parser non
+        // conia gli `EntityId` globali (invariante 1.4) — le entità reali nascono
+        // dal GraphActor e compaiono nella query successiva. Qui basta che l'RPC
+        // vada a buon fine.
+        client
+            .index_files(proto::IndexFilesRequest {
+                files: vec![path.to_string_lossy().to_string()],
+            })
+            .await
+            .expect("RPC IndexFiles fallita");
+
+        // Il GraphActor è asincrono: ritenta la query finché l'entità compare.
+        let mut found = false;
+        for _ in 0..50 {
+            let response = client
+                .query_graph(proto::QueryGraphRequest {
+                    natural_language: "voglio sistemare il payment".to_string(),
+                })
+                .await
+                .expect("RPC QueryGraph fallita")
+                .into_inner();
+            if response
+                .entities
+                .iter()
+                .any(|e| e.qualified_name.contains("PaymentService"))
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(found, "il contesto doveva includere PaymentService");
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn architecture_report_over_the_wire_succeeds_on_empty_graph() {
+        let (mut client, _events) = start_server().await;
+
+        let response = client
+            .get_architecture_report(proto::GetArchitectureReportRequest {})
+            .await
+            .expect("RPC GetArchitectureReport fallita")
+            .into_inner();
+
+        // Grafo vuoto: nessun invariante, nessun candidato, nessun fossile, nessuna
+        // lacuna — ma l'RPC attraversa tutta la pila (filo → Dispatcher → Guardian).
+        assert!(response.invariants.is_empty());
+        assert!(response.candidates.is_empty());
+        assert!(response.fossils.is_empty());
+        assert!(response.gaps.is_empty());
+
+        // La qualità del grafo (P2-7) viaggia sempre sul filo, anche a vuoto: tutti
+        // i contatori a zero, ma il messaggio è presente (wiring end-to-end ok).
+        let quality = response
+            .quality
+            .expect("la qualità del grafo deve essere presente");
+        assert_eq!(quality.total_entities, 0);
+        assert_eq!(quality.total_relations, 0);
+        assert_eq!(quality.resolved_relations, 0);
+        assert_eq!(quality.unresolved_relations, 0);
+    }
+
+    #[tokio::test]
+    async fn watch_events_streams_violation_with_location() {
+        use codeos_types::bus::ArchitectureViolation;
+
+        let (mut client, events) = start_server().await;
+
+        // Apri lo stream PRIMA di pubblicare: così la sottoscrizione del server è
+        // già attiva quando l'evento arriva sul bus.
+        let mut stream = client
+            .watch_events(proto::WatchEventsRequest {})
+            .await
+            .expect("RPC WatchEvents fallita")
+            .into_inner();
+
+        // La violazione da consegnare, completa di posizione (la riga esatta che
+        // l'editor evidenzierà nel pannello "Problemi").
+        let violation = ArchitectureViolation {
+            rule_id: EntityId::new(),
+            relation_id: EntityId::new(),
+            source_id: EntityId::new(),
+            target_id: EntityId::new(),
+            message: "app::core non deve dipendere da app::api".to_string(),
+            location: Some(SourceLocation {
+                file_path: "app/core/service.py".to_string(),
+                start_line: 42,
+                start_column: 4,
+                end_line: 42,
+                end_column: 30,
+            }),
+            severity: codeos_types::bus::Severity::for_violation(),
+        };
+
+        // C'è una piccola corsa fra l'apertura dello stream e l'attivazione della
+        // sottoscrizione lato server (un task spawnato). Ripubblichiamo finché il
+        // primo messaggio non arriva; il broadcast scarta i duplicati non ricevuti.
+        let publisher = {
+            let events = events.clone();
+            let violation = violation.clone();
+            tokio::spawn(async move {
+                for _ in 0..100 {
+                    events.publish(CodeOsEvent::ArchitectureViolationDetected {
+                        violation: violation.clone(),
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+        };
+
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), stream.message())
+            .await
+            .expect("nessun EventMessage entro il timeout")
+            .expect("errore di trasporto sullo stream")
+            .expect("lo stream si è chiuso senza eventi");
+        publisher.abort();
+
+        // Il messaggio deve essere la violazione, con la posizione preservata
+        // end-to-end (bus → server → proto → filo gRPC).
+        match message.event {
+            Some(proto::event_message::Event::Violation(v)) => {
+                assert_eq!(v.message, violation.message);
+                let loc = v.location.expect("violazione sul filo senza posizione");
+                assert_eq!(loc.file_path, "app/core/service.py");
+                assert_eq!(loc.start_line, 42);
+                assert_eq!(loc.start_column, 4);
+                assert_eq!(
+                    v.severity, "high_risk",
+                    "una violazione attiva è alto rischio"
+                );
+            }
+            other => panic!("atteso un evento Violation, ricevuto {other:?}"),
+        }
+    }
+
+    /// Il cuore di onestà del ponte di indicizzazione (P0): solo un aggiornamento
+    /// *osservato* autorizza a dichiarare successo. Un fallimento o un esito non
+    /// confermato DEVONO diventare errori gRPC — mai un falso «completata con
+    /// successo». Questo blinda il bug in cui la CLI stampava il successo mentre il
+    /// GraphActor aveva fallito (o il server era andato in timeout «tornando
+    /// comunque»).
+    #[test]
+    fn ensure_graph_updated_only_blesses_an_observed_update() {
+        // Updated → successo onesto.
+        assert!(ensure_graph_updated(GraphWaitOutcome::Updated, "Op").is_ok());
+
+        // Failed → errore interno, con la causa propagata.
+        let err = ensure_graph_updated(
+            GraphWaitOutcome::Failed("persistenza ko".to_string()),
+            "IndexProject",
+        )
+        .expect_err("un fallimento del grafo non deve diventare successo");
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("persistenza ko"));
+        assert!(err.message().contains("IndexProject"));
+
+        // Unconfirmed (timeout o bus chiuso) → deadline_exceeded, mai successo.
+        let err = ensure_graph_updated(GraphWaitOutcome::Unconfirmed, "IndexFiles")
+            .expect_err("un esito non confermato non deve diventare successo");
+        assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
+        assert!(err.message().contains("IndexFiles"));
+    }
+}

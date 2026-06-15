@@ -1,0 +1,12 @@
+[package]
+name = "codeos-paleo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Il Paleontologo: legge il negativo del TEMPO (la storia git) per misurare quanto un invariante sia stato rispettato avendo l'occasione di violarlo — il Campo di Astensione."
+
+[dependencies]
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

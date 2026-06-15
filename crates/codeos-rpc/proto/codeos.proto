@@ -1,0 +1,459 @@
+syntax = "proto3";
+
+// La facciata di trasporto di CodeOS. Ogni RPC è un sottile ponte verso un
+// `Command` del Dispatcher di `codeos-core`: il server non contiene business
+// logic, traduce soltanto messaggi gRPC ↔ tipi del bus.
+package codeos.v1;
+
+// ---------------------------------------------------------------------------
+// Tipi base del grafo (riflettono `codeos_types::{Entity, Relation, ...}`).
+//
+// `id`/`source_id`/`target_id` sono UUID serializzati come stringa: il filo
+// gRPC non conosce `EntityId`. `kind` è il nome della variante dell'enum
+// (es. "Class", "Calls"): stabile, leggibile e indipendente dall'ordinale.
+// ---------------------------------------------------------------------------
+
+message SourceLocation {
+  string file_path = 1;
+  uint32 start_line = 2;
+  uint32 start_column = 3;
+  uint32 end_line = 4;
+  uint32 end_column = 5;
+}
+
+message Entity {
+  string id = 1;
+  string kind = 2;
+  string qualified_name = 3;
+  SourceLocation location = 4;
+  map<string, string> metadata = 5;
+}
+
+message Relation {
+  string id = 1;
+  string kind = 2;
+  string source_id = 3;
+  string target_id = 4;
+  map<string, string> metadata = 5;
+}
+
+// ---------------------------------------------------------------------------
+// QueryGraph — "cosa cambia se tocco X?" / costruzione del contesto per l'LLM.
+// ---------------------------------------------------------------------------
+
+message QueryGraphRequest {
+  // Query in linguaggio naturale (es. "voglio aggiungere il login OAuth").
+  string natural_language = 1;
+}
+
+message QueryGraphResponse {
+  // Prompt strutturato pronto da passare a un LLM.
+  string formatted_context = 1;
+  repeated Entity entities = 2;
+  repeated Relation relations = 3;
+}
+
+// ---------------------------------------------------------------------------
+// CallPath — livello L2: il cammino di chiamata onesto tra due entità nominate.
+// ---------------------------------------------------------------------------
+
+message CallPathRequest {
+  // Nome dell'entità di partenza (qualificato o solo il segmento finale).
+  string from = 1;
+  // Nome dell'entità di arrivo (qualificato o solo il segmento finale).
+  string to = 2;
+}
+
+message CallPathResponse {
+  // Testo già formattato, pronto per il terminale o per un LLM.
+  string formatted = 1;
+  // Stato esplicito dell'esito: "found" | "no_path" | "unknown" | "ambiguous".
+  string status = 2;
+  // Il cammino, dalla sorgente alla destinazione, valorizzato solo se "found".
+  repeated Entity steps = 3;
+  // Candidati da disambiguare ("ambiguous") o suggerimenti ("unknown").
+  repeated Entity candidates = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Impact — livello L2: "cosa dipende da X?" — chi chiama un'entità nominata.
+// Tiene separati i chiamanti CONFERMATI (archi `Calls` risolti) dai POSSIBILI
+// (riferimenti non risolti il cui nome combacia): il confine certo/possibile
+// resta esplicito sul filo, mai collassato in un numero o in un sì/no.
+// ---------------------------------------------------------------------------
+
+message ImpactRequest {
+  // Nome dell'entità di cui misurare l'impatto (qualificato o solo il segmento finale).
+  string name = 1;
+}
+
+// Un chiamante POSSIBILE: una sorgente con un riferimento non risolto il cui
+// nome combacia col nome semplice dell'entità. Non confermato, ma nemmeno nascosto.
+message PossibleCaller {
+  Entity source = 1;
+  // Il riferimento testuale grezzo dal sorgente (es. "schema.validate").
+  string reference = 2;
+}
+
+message ImpactResponse {
+  // Testo già formattato, pronto per il terminale o per un LLM.
+  string formatted = 1;
+  // Stato esplicito dell'esito: "found" | "unknown" | "ambiguous".
+  string status = 2;
+  // Chiamanti CERTI: per ciascuno esiste un arco `Calls` risolto verso l'entità.
+  repeated Entity confirmed_callers = 3;
+  // Chiamanti POSSIBILI: un riferimento non risolto ne combacia il nome.
+  repeated PossibleCaller possible_callers = 4;
+  // Candidati da disambiguare ("ambiguous") o suggerimenti ("unknown").
+  repeated Entity candidates = 5;
+}
+
+// ---------------------------------------------------------------------------
+// ImpactTransitive — livello L2: l'impatto TRANSITIVO. Chi raggiunge X a ritroso
+// a QUALUNQUE distanza, non solo i chiamanti diretti, seguendo solo archi `Calls`
+// risolti (mai un ponte su un buco). Ogni chiamante porta la distanza in hop.
+// ---------------------------------------------------------------------------
+
+message ImpactTransitiveRequest {
+  // Nome dell'entità (qualificato o solo il segmento finale).
+  string name = 1;
+}
+
+// Un chiamante TRANSITIVO confermato e la sua distanza minima in hop di chiamata
+// (1 = chiama l'entità direttamente, 2 = chiama qualcosa che la chiama, …).
+message TransitiveCaller {
+  Entity source = 1;
+  uint32 hops = 2;
+}
+
+message ImpactTransitiveResponse {
+  // Testo già formattato, pronto per il terminale o per un LLM.
+  string formatted = 1;
+  // Stato esplicito dell'esito: "found" | "unknown" | "ambiguous".
+  string status = 2;
+  // I chiamanti transitivi confermati, ordinati per distanza crescente poi nome.
+  repeated TransitiveCaller callers = 3;
+  // `true` se un chiamante reale oltre il tetto di profondità è stato troncato:
+  // il raggio mostrato è parziale, e lo si dichiara invece di fingere completezza.
+  bool depth_capped = 4;
+  // Candidati da disambiguare ("ambiguous") o suggerimenti ("unknown").
+  repeated Entity candidates = 5;
+}
+
+// ---------------------------------------------------------------------------
+// RecordDecision — "perché è scritto così?": registra una decisione storica.
+// ---------------------------------------------------------------------------
+
+message RecordDecisionRequest {
+  string author = 1;
+  string title = 2;
+  string context = 3;
+  string rationale = 4;
+  repeated string related_entity_ids = 5;   // UUID stringa
+  repeated string related_decision_ids = 6;  // UUID stringa
+  repeated string tags = 7;
+  repeated string supersedes = 8;   // UUID stringa: decisioni rimpiazzate
+  repeated string deprecates = 9;   // UUID stringa: decisioni ritirate
+}
+
+message RecordDecisionResponse {
+  string decision_id = 1;  // UUID stringa
+}
+
+// ---------------------------------------------------------------------------
+// IndexProject / IndexFiles — alimentano il grafo.
+// ---------------------------------------------------------------------------
+
+message IndexProjectRequest {
+  string project_root = 1;
+}
+
+message IndexProjectResponse {}
+
+message IndexFilesRequest {
+  repeated string files = 1;
+}
+
+message IndexFilesResponse {
+  // Gli `EntityId` radice creati/aggiornati (UUID stringa).
+  repeated string entity_ids = 1;
+}
+
+// ---------------------------------------------------------------------------
+// GetArchitectureReport — il referto dello *spazio negativo*. Espone, in lettura
+// pura, gli invarianti impliciti che il Guardian scopre lungo i quattro assi:
+// struttura (layering), tempo (Campo di Astensione), intento (Fossili di
+// Decisione) e meta (lacune del secondo ordine). Nessuna mutazione del grafo.
+// ---------------------------------------------------------------------------
+
+message GetArchitectureReportRequest {}
+
+// Un invariante di layering: `downstream` dipende da `upstream` a senso unico.
+message LayeringInvariant {
+  string upstream = 1;
+  string downstream = 2;
+  uint32 support = 3;
+  // Confidenza in [0,1]. Se `calibrated` è true viene dal Campo di Astensione
+  // (lower bound di Wilson sul tasso di astensione), altrimenti è strutturale.
+  double confidence = 4;
+  bool calibrated = 5;
+  // Priorità di difesa derivata dalla confidenza: "info" | "warning" | "high_risk".
+  string severity = 6;
+  // Provenienza della regola: "discovered" (dedotta dal grafo) | "declared"
+  // (imposta a mano in .codeos/config.yaml).
+  string origin = 7;
+  // Rischio TEMPORALE: secondi dall'ultimo esercizio del confine (ultima
+  // co-occorrenza dei due layer in un commit) rispetto a HEAD. Assente se non c'è
+  // storia git o il confine non si è mai co-toccato. Alto ⇒ "confidente ma stantio".
+  optional int64 staleness_secs = 8;
+}
+
+// Un invariante *in formazione*: la stessa asimmetria pura di un LayeringInvariant,
+// ma con supporto ancora sotto la soglia. È lo stadio 1 del flusso (candidato →
+// proposta → decisione). Derivato e mai persistito: un segnale, non una verità —
+// niente confidenza/severità, un confine non ancora formato non si stima.
+message LayeringCandidate {
+  string upstream = 1;
+  string downstream = 2;
+  uint32 support = 3;
+  // Quanti archi ancora mancano perché diventi un invariante (min_support - support).
+  uint32 needed = 4;
+}
+
+// La nascita storica di un confine (Fossile di Decisione).
+message DecisionFossil {
+  string upstream = 1;
+  string downstream = 2;
+  string born_at = 3;        // hash del commit di nascita
+  int64 born_at_unix = 4;    // timestamp Unix del commit
+  string intent = 5;         // il subject del commit: l'intento dichiarato
+  repeated string born_structure = 6;  // i file dei due layer toccati alla nascita
+}
+
+// Una lacuna del secondo ordine: l'invariante che MANCA dove dovrebbe esserci.
+message ArchitecturalGap {
+  string upstream = 1;
+  string downstream = 2;
+  uint32 foundation_support = 3;
+  // Gravità dell'anomalia: "info" | "warning" | "high_risk".
+  string severity = 4;
+}
+
+// La qualità del grafo: quanto fidarsi del referto (roadmap P2-7). I contatori
+// distinguono le relazioni saldamente risolte dai riferimenti lasciati
+// Unresolved e dagli archi a bassa confidenza, e isolano le entità esterne.
+message GraphQuality {
+  uint64 total_entities = 1;
+  uint64 external_entities = 2;
+  uint64 total_relations = 3;
+  uint64 resolved_relations = 4;
+  uint64 unresolved_relations = 5;
+  uint64 low_confidence_relations = 6;
+}
+
+message GetArchitectureReportResponse {
+  repeated LayeringInvariant invariants = 1;
+  repeated DecisionFossil fossils = 2;
+  repeated ArchitecturalGap gaps = 3;
+  // La misura di affidabilità del referto qui sopra.
+  GraphQuality quality = 4;
+  bool history_insufficient = 5;
+  // Gli invarianti IN FORMAZIONE: asimmetrie pure ancora sotto soglia, derivate e
+  // mai persistite. Stadio 1 del flusso candidato → proposta → decisione.
+  repeated LayeringCandidate candidates = 6;
+}
+
+// ---------------------------------------------------------------------------
+// WatchEvents — stream live del sistema. Il plugin VS Code vi si aggancia per
+// reagire in tempo reale: in particolare alle violazioni del sistema immunitario.
+// ---------------------------------------------------------------------------
+
+message WatchEventsRequest {}
+
+message FilesIndexedEvent {
+  repeated string file_paths = 1;
+}
+
+message GraphUpdatedEvent {
+  uint32 added_entities = 1;
+  uint32 removed_entities = 2;
+  uint32 added_relations = 3;
+  uint32 removed_relations = 4;
+}
+
+message ArchitectureViolationEvent {
+  string rule_id = 1;
+  string relation_id = 2;
+  string source_id = 3;
+  string target_id = 4;
+  string message = 5;
+  // Posizione dell'entità sorgente: dove vive la dipendenza proibita. Assente se
+  // non ricostruibile. Permette al client (plugin VS Code) di piazzare una
+  // diagnostica sulla riga esatta.
+  SourceLocation location = 6;
+  // Gravità della violazione: "info" | "warning" | "high_risk" (sempre high_risk).
+  string severity = 7;
+}
+
+message IndexProgressEvent {
+  uint32 total_files = 1;
+  uint32 processed_files = 2;
+  string current_file = 3;
+  uint32 skipped_files = 4;
+  uint32 parse_errors = 5;
+}
+
+message EventMessage {
+  oneof event {
+    FilesIndexedEvent files_indexed = 1;
+    GraphUpdatedEvent graph_updated = 2;
+    ArchitectureViolationEvent violation = 3;
+    IndexProgressEvent index_progress = 4;
+  }
+}
+
+// --- MESSAGGI DI SERVIZIO P3 ---
+
+message GuardBeforeRequest {
+  string goal = 1;
+}
+
+message GuardBeforeResponse {
+  repeated string target_files = 1;
+  repeated string boundaries = 2;
+  uint32 blast_radius = 3;
+  string safe_path = 4;
+  string context_pack = 5;
+}
+
+message GuardAfterRequest {}
+
+message GuardAfterResponse {
+  repeated string new_relations = 1;
+  repeated ArchitectureViolationEvent violations = 2;
+  repeated string proposed_fixes = 3;
+}
+
+message GetContextPackRequest {
+  string goal = 1;
+  bool for_ai = 2;
+}
+
+message GetContextPackResponse {
+  string goal_interpretation = 1;
+  repeated string files_to_read = 2;
+  repeated string relevant_entities = 3;
+  repeated string key_dependencies = 4;
+  repeated string boundaries_to_preserve = 5;
+  repeated string local_patterns = 6;
+  repeated string suggested_tests = 7;
+  string estimated_risk = 8;
+  string formatted_markdown = 9;
+  // Il "perche'" dal ledger di intento, agganciato al goal (umane prime, cap).
+  repeated string decisions = 10;
+}
+
+message PrMriRequest {
+  string base = 1;
+  string head = 2;
+}
+
+message PrMriResponse {
+  repeated string new_dependencies = 1;
+  repeated string violated_boundaries = 2;
+  int32 blast_radius_change = 3;
+  repeated string historical_hotspots = 4;
+  repeated string new_external_dependencies = 5;
+  repeated string impacted_tests = 6;
+  string risk_score = 7;
+  string summary = 8;
+}
+
+message SimulateRequest {
+  string expr = 1;
+}
+
+message SimulateResponse {
+  repeated string dependencies_to_rewrite = 1;
+  repeated string changed_boundaries = 2;
+  repeated string risks = 3;
+  repeated string suggested_tests = 4;
+  repeated string recommendation_plan = 5;
+}
+
+// Licenses — scansione licenze delle dipendenze + policy dal ledger.
+message LicensesRequest {}
+
+message DependencyLicense {
+  string name = 1;
+  string ecosystem = 2;
+  string license = 3;  // vuota = sconosciuta (astensione)
+  string source = 4;
+}
+
+message LicenseViolation {
+  string dependency = 1;
+  string license = 2;
+  string denied = 3;
+  string decision_title = 4;
+}
+
+// Avviso trovato NEI SORGENTI (v2): tag SPDX, intestazione di copyright,
+// o file LICENSE/COPYING. text vuota su license-file = non classificata
+// (astensione, mai indovinata).
+message SourceNotice {
+  string path = 1;
+  uint32 line = 2;  // 1-based; 0 = avviso a livello di file
+  string kind = 3;  // "spdx" | "copyright" | "license-file"
+  string text = 4;
+}
+
+message LicensesResponse {
+  repeated DependencyLicense dependencies = 1;
+  repeated LicenseViolation violations = 2;
+  uint32 denied_count = 3;
+  repeated SourceNotice source_notices = 4;
+  uint32 notices_truncated = 5;  // avvisi tagliati dal tetto server-side
+}
+
+message WhyRequest {
+  string expr = 1;
+}
+
+message WhyResponse {
+  string born_commit = 1;
+  string born_date = 2;
+  string intent = 3;
+  repeated string co_changed_files = 4;
+  repeated string markdown_decisions = 5;
+  string explanation = 6;
+  bool history_insufficient = 7;
+  // La STORIA del confine (Crono-Semantic Mining): i commit piu recenti che lo
+  // hanno esercitato, righe formattate "hash - data - soggetto". Mai inventata.
+  repeated string boundary_story = 8;
+}
+
+// ---------------------------------------------------------------------------
+// Il servizio.
+// ---------------------------------------------------------------------------
+
+service CodeOs {
+  rpc QueryGraph(QueryGraphRequest) returns (QueryGraphResponse);
+  rpc CallPath(CallPathRequest) returns (CallPathResponse);
+  rpc Impact(ImpactRequest) returns (ImpactResponse);
+  rpc ImpactTransitive(ImpactTransitiveRequest) returns (ImpactTransitiveResponse);
+  rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
+  rpc IndexProject(IndexProjectRequest) returns (IndexProjectResponse);
+  rpc IndexFiles(IndexFilesRequest) returns (IndexFilesResponse);
+  rpc GetArchitectureReport(GetArchitectureReportRequest) returns (GetArchitectureReportResponse);
+  rpc WatchEvents(WatchEventsRequest) returns (stream EventMessage);
+
+  // --- RPC P3 WOW FEATURES ---
+  rpc GuardBefore(GuardBeforeRequest) returns (GuardBeforeResponse);
+  rpc GuardAfter(GuardAfterRequest) returns (GuardAfterResponse);
+  rpc GetContextPack(GetContextPackRequest) returns (GetContextPackResponse);
+  rpc PrMri(PrMriRequest) returns (PrMriResponse);
+  rpc Simulate(SimulateRequest) returns (SimulateResponse);
+  rpc Licenses(LicensesRequest) returns (LicensesResponse);
+  rpc Why(WhyRequest) returns (WhyResponse);
+}

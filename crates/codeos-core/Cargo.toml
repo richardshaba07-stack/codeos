@@ -1,0 +1,29 @@
+[package]
+name = "codeos-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Il sistema nervoso: EventBus broadcast, Dispatcher e orchestrazione degli attori."
+
+[dependencies]
+codeos-types = { workspace = true }
+codeos-parser = { workspace = true }
+codeos-storage = { workspace = true }
+codeos-graph = { workspace = true }
+codeos-guardian = { workspace = true }
+codeos-paleo = { workspace = true }
+codeos-memory = { workspace = true }
+codeos-query = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# I test d'integrazione in `tests/` sono un crate a parte: gli servono
+# esplicitamente i crate del workspace che usano dall'esterno (lo storage per
+# ispezionare il grafo, i tipi del bus per i comandi, lo store decisioni).
+codeos-types = { workspace = true }
+codeos-storage = { workspace = true }
+codeos-memory = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }

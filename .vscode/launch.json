@@ -1,0 +1,20 @@
+{
+  // F5 → compila l'estensione e apre un Extension Development Host con CodeOS
+  // già caricato. Avvia prima il server con il task "codeos: run server"
+  // (Terminale → Esegui task) oppure a mano.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Esegui estensione CodeOS",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/vscode-extension"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/vscode-extension/out/**/*.js"
+      ],
+      "preLaunchTask": "codeos: build extension"
+    }
+  ]
+}

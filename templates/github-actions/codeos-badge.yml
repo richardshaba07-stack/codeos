@@ -1,0 +1,56 @@
+# CodeOS Badge — pubblica il badge «CodeOS Certified» che riflette lo stato REALE
+# del branch di default (verde = nessuna regressione architetturale rilevata).
+#
+# Copia in `.github/workflows/`. Genera un JSON (formato endpoint shields.io) con
+# `codeos certify --badge` e lo pubblica su gh-pages. Poi, nel README del tuo repo:
+#
+#   ![CodeOS](https://img.shields.io/endpoint?url=https://UTENTE.github.io/REPO/badge.json)
+#
+# Onestà: «certified» = «nessuna regressione architetturale RILEVATA rispetto agli
+# invarianti noti», NON «provato sicuro». Il badge è un segnale di igiene, non una
+# garanzia di assenza di bug.
+
+name: CodeOS Badge
+on:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write   # per pubblicare il badge su gh-pages
+
+jobs:
+  badge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # la storia git completa serve agli invarianti calibrati
+
+      - name: Build CodeOS
+        run: cargo build --release -p codeos-rpc
+
+      - name: Avvia il server e indicizza
+        run: |
+          CODEOS_REPO="$GITHUB_WORKSPACE" CODEOS_DB=/tmp/codeos.db \
+            ./target/release/codeos-server &
+          for i in $(seq 1 30); do
+            ./target/release/codeos doctor >/dev/null 2>&1 && break || sleep 1
+          done
+          ./target/release/codeos index "$GITHUB_WORKSPACE"
+
+      - name: Genera il badge (stato del branch di default)
+        run: |
+          mkdir -p public
+          # --badge è INFORMATIVO: non fa fallire il job. Se qualcosa va storto,
+          # un badge «unknown» onesto invece di nessun badge.
+          ./target/release/codeos certify --badge --base "HEAD~1" --head HEAD \
+            > public/badge.json \
+            || echo '{"schemaVersion":1,"label":"CodeOS","message":"unknown","color":"lightgrey"}' > public/badge.json
+          cat public/badge.json
+
+      - name: Pubblica su gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          keep_files: true
