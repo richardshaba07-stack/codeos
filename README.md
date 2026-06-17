@@ -5,6 +5,11 @@
 
 **Architectural intelligence layer for codebases.**
 
+A **local, deterministic guardrail** that catches the moment an AI coding agent breaks
+your architecture — with a citation, and exiting non-zero — and never guesses to do it:
+
+![CodeOS stops an AI agent from introducing a forbidden dependency, with a cited verdict](docs/demo.gif)
+
 CodeOS builds a **living semantic graph** of a codebase to answer two questions no
 linter can ask:
 
