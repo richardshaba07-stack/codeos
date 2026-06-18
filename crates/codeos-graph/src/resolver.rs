@@ -1751,7 +1751,8 @@ fn external_dependency_root(
     match language {
         "rust" => external_root_rust(target, is_import),
         "python" => external_root_python(target, namespace, is_import)
-            .or_else(|| python_builtin_root(target)),
+            .or_else(|| python_builtin_root(target))
+            .or_else(|| python_str_method_root(target)),
         // Per il web trattiamo come esterni solo gli import di pacchetti (bare
         // specifier); le call non risolte restano Unresolved.
         "typescript" | "javascript" if is_import => external_root_web(target),
@@ -1798,6 +1799,36 @@ fn is_python_builtin(name: &str) -> bool {
             | "SystemError" | "SystemExit" | "TypeError" | "UnboundLocalError"
             | "UnicodeError" | "ValueError" | "ZeroDivisionError" | "FileNotFoundError"
             | "PermissionError" | "NotImplemented" | "Ellipsis"
+    )
+}
+
+/// Metodi ESCLUSIVI dei tipi builtin str/bytes (`.encode`, `.strip`, `.lower`…):
+/// chiamati su un receiver di tipo ignoto sono operazioni sul runtime, non sul
+/// progetto — stesso rumore dei builtin-funzione. Li riconosciamo SOLO per nomi che
+/// un progetto non definisce mai come metodo proprio (niente `.get`/`.split`/`.items`,
+/// troppo ambigui): così zero shadow check e zero rischio di nascondere un metodo
+/// reale. Esterni → `builtins`, fuori dall'astensione. Solo forma `receiver.metodo`
+/// pulita (niente call/indici annidati nel testo del target).
+fn python_str_method_root(target: &str) -> Option<String> {
+    if target.contains(['(', '[', ' ', ':']) || !target.contains('.') {
+        return None;
+    }
+    let method = target.rsplit('.').next()?;
+    is_str_exclusive_method(method).then(|| "builtins".to_string())
+}
+
+/// Nomi di metodo che appartengono SOLO a str/bytes nello stdlib Python: un progetto
+/// non li definisce praticamente mai. Conservativa di proposito — esclusi i nomi
+/// ambigui (`split`/`replace`/`get`/`items`…) che potrebbero essere metodi reali.
+fn is_str_exclusive_method(name: &str) -> bool {
+    matches!(
+        name,
+        "encode" | "decode" | "strip" | "lstrip" | "rstrip" | "lower" | "upper"
+            | "casefold" | "swapcase" | "title" | "capitalize" | "startswith"
+            | "endswith" | "splitlines" | "zfill" | "ljust" | "rjust" | "center"
+            | "expandtabs" | "isalpha" | "isalnum" | "isdigit" | "isdecimal"
+            | "isnumeric" | "isspace" | "isupper" | "islower" | "istitle"
+            | "isidentifier" | "isprintable" | "isascii"
     )
 }
 
