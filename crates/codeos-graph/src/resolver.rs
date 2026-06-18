@@ -307,7 +307,14 @@ impl GraphResolver {
                     continue;
                 };
 
-                let mut resolved = resolve_target(&rctx, &target, parsed.kind).await?;
+                let source_qname = ctx.local_qname.get(&parsed.source_local_id);
+                let mut resolved = resolve_target(
+                    &rctx,
+                    &target,
+                    parsed.kind,
+                    source_qname.map(String::as_str),
+                )
+                .await?;
 
                 // Una chiamata con receiver PUNTATO (`x.foo()`) non può mai essere la
                 // ricorsione dell'entità chiamante: la ricorsione vera si scrive
@@ -1079,6 +1086,7 @@ async fn resolve_target(
     ctx: &ResolutionContext<'_>,
     target: &str,
     kind: RelationKind,
+    source_qname: Option<&str>,
 ) -> anyhow::Result<Option<(EntityId, ResolutionStrategy)>> {
     // 0 — Import path normalisation. I parser mantengono i target come li scrive
     // il linguaggio (`crate::x`, `codeos_types::x`, `./client`); qui li traduciamo
@@ -1180,6 +1188,37 @@ async fn resolve_target(
             let colon = target.replace('.', "::");
             if let Some(id) = unique_internal_match(&caller_prefix, &colon, ctx).await? {
                 return Ok(Some((id, ResolutionStrategy::SameModule)));
+            }
+        }
+    }
+
+    // 2.6 — `self.<method>` / `this.<method>` / `cls.<method>`: the receiver is the
+    // CLASS enclosing the call, known with CERTAINTY (it is the calling entity), not a
+    // variable of unknown type. We resolve to the EXACT entity `<class>::<method>`,
+    // deriving the class from the source's `qualified_name` (whose leaf is the calling
+    // method). It is a PROVEN type, not a guess: high-confidence, like an exact match.
+    // Anti-FP: ONLY if that entity actually exists — an INHERITED method (e.g.
+    // `self.update` in a dict subclass that doesn't override it) won't match and stays
+    // an honest hole, never an invented edge. `super` is EXCLUDED on purpose: it denotes
+    // the PARENT class, not the enclosing one (that would need the class hierarchy).
+    // Only the DIRECT 2-segment form: chains `self.attr.method` (≥3 segments) have the
+    // attribute as receiver, of unknown type, and stay abstained (guard below).
+    if matches!(ctx.language, "python" | "typescript" | "javascript") {
+        let segs: Vec<&str> = target.split('.').filter(|s| !s.is_empty()).collect();
+        if segs.len() == 2 && matches!(segs[0], "self" | "this" | "cls") {
+            if let Some(class) = source_qname.and_then(enclosing_scope) {
+                let candidate = format!("{class}::{}", segs[1]);
+                if let Some(id) = lookup_exact(
+                    &candidate,
+                    ctx.language,
+                    ctx.new_by_qname,
+                    ctx.new_by_id_lang,
+                    ctx.storage,
+                )
+                .await?
+                {
+                    return Ok(Some((id, ResolutionStrategy::Exact)));
+                }
             }
         }
     }
@@ -1644,6 +1683,14 @@ fn first_segment(target: &str) -> Option<&str> {
 
 fn last_segment(target: &str) -> Option<&str> {
     target.rsplit(['.', ':']).find(|s| !s.is_empty())
+}
+
+/// The scope (class/module) enclosing an entity = its `qualified_name` without the
+/// leaf: `src::requests::sessions::Session::send` → `…::Session`. `None` if there is no
+/// `::` (top-level entity, no enclosing scope). Used to resolve `self.<method>` to the
+/// caller's class.
+fn enclosing_scope(qname: &str) -> Option<&str> {
+    qname.rsplit_once("::").map(|(head, _)| head)
 }
 
 /// Receiver che denota il TIPO che racchiude la call — `this.foo()`, `super.bar()`
@@ -2368,6 +2415,68 @@ impl Display for Number {
             .find(|r| r.kind == RelationKind::Calls && r.source_id == top.id)
             .expect("la call risolta a 'helper' è assente");
         assert_eq!(call.target_id, helper.id);
+    }
+
+    #[tokio::test]
+    async fn self_method_resolves_to_the_enclosing_class_even_with_a_homonym() {
+        // `self.send()` in B.go must bind to B::send, NOT to A::send (a homonym in
+        // another class). The bare-name fallback abstains (two `send` homonyms), but
+        // stage 2.6 uses the caller's enclosing class to pick the right one. This is
+        // exactly the receiver-type case the bare-name match cannot disambiguate.
+        let src = "class A:\n    def send(self):\n        pass\n\n\
+class B:\n    def send(self):\n        pass\n\n    def go(self):\n        self.send()\n";
+        let parsed = parse("m.py", src).await;
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None);
+
+        let delta = resolver.resolve(&[parsed], &storage).await.unwrap();
+        let b_send = find(&delta, "m::B::send");
+        let a_send = find(&delta, "m::A::send");
+        let b_go = find(&delta, "m::B::go");
+
+        let call = delta
+            .added_relations
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls && r.source_id == b_go.id)
+            .expect("self.send() must resolve via the enclosing class");
+        assert_eq!(
+            call.target_id, b_send.id,
+            "self.send() must bind to B::send"
+        );
+        assert_ne!(call.target_id, a_send.id, "never to the homonym A::send");
+    }
+
+    #[tokio::test]
+    async fn self_method_not_defined_on_the_class_stays_unresolved() {
+        // Anti-FP: `self.update()` but the class does NOT define `update` (it would be
+        // inherited from a stdlib base). No `C::update` entity exists → the call must
+        // stay Unresolved, never an invented edge.
+        let src = "class C:\n    def go(self):\n        self.update()\n";
+        let parsed = parse("m.py", src).await;
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None);
+
+        let delta = resolver.resolve(&[parsed], &storage).await.unwrap();
+        let c_go = find(&delta, "m::C::go");
+
+        // Look only at dependency edges (ignore the structural BelongsTo of the method
+        // to its class). The single call `self.update()` must be the honest hole.
+        assert!(
+            !delta
+                .added_relations
+                .iter()
+                .any(|r| r.source_id == c_go.id && r.kind == RelationKind::Calls),
+            "self.update() must NOT resolve to any entity (method not on the class)"
+        );
+        assert!(
+            delta.added_relations.iter().any(|r| {
+                r.source_id == c_go.id
+                    && r.kind == RelationKind::Unresolved
+                    && r.metadata.get("unresolved_target").map(String::as_str)
+                        == Some("self.update")
+            }),
+            "the honest hole must record the original target `self.update`"
+        );
     }
 
     #[tokio::test]
