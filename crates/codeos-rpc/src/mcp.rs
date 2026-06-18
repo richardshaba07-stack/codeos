@@ -86,7 +86,20 @@ pub async fn handle(request: Value) -> Option<Value> {
                 "serverInfo": {
                     "name": "codeos",
                     "version": env!("CARGO_PKG_VERSION"),
-                }
+                },
+                // Guida globale letta dall'host all'handshake (Codex e altri la
+                // incorporano come istruzioni permanenti): COME e QUANDO usare CodeOS,
+                // con la semantica anti-FP resa esplicita all'agente.
+                "instructions": "CodeOS è il tuo guardrail architetturale, locale e \
+                    deterministico (non un altro LLM: un verificatore indipendente). \
+                    PRIMA di proporre una modifica o una PR chiama codeos_certify; DOPO \
+                    aver editato chiama codeos_guard per le violazioni introdotte. PRIMA \
+                    di toccare un'area, leggi le decisioni registrate con codeos_why e \
+                    codeos_context_pack (evita di contraddire scelte già prese). \
+                    Semantica NON negoziabile: ✅ o una risposta vuota significano «non \
+                    rilevato rispetto agli invarianti noti», MAI «provato sicuro»; ⚠️ \
+                    indica un confine governato attraversato, sempre con la citazione. \
+                    Sezioni assenti = il grafo non lo sa, mai inventate."
             }))
         }
         "ping" => Ok(json!({})),
@@ -208,6 +221,11 @@ fn tool_definitions() -> Value {
                     "head": {"type": "string", "description": "Ref git di head (default: HEAD)."}
                 }
             }
+        },
+        {
+            "name": "codeos_guard",
+            "description": "DOPO aver modificato il codice: rileva le violazioni architetturali INTRODOTTE dalle modifiche più recenti — una dipendenza che attraversa un confine governato o inverte un layer (il fallimento «boundary ignorance» degli agenti). Per ogni violazione: posizione (file:riga) e la regola citata. Risposta «nessuna violazione» = non rilevata rispetto agli invarianti noti, MAI «provato sicuro». Sola lettura, auto-approvabile: chiamalo prima di concludere/committare una modifica.",
+            "inputSchema": {"type": "object", "properties": {}}
         },
         {
             "name": "codeos_learn",
@@ -466,6 +484,41 @@ async fn dispatch_tool(name: &str, args: &Value) -> anyhow::Result<String> {
             ));
             Ok(out)
         }
+        "codeos_guard" => {
+            // Violazioni INTRODOTTE dall'ultima modifica (guard_after sul server):
+            // il guardrail del loop dell'agente, speculare a codeos_certify (che
+            // lavora su un diff base..head). Riusa lo stesso `check` di certify.
+            let mut client = connect_server().await?;
+            let res = client
+                .guard_after(proto::GuardAfterRequest {})
+                .await?
+                .into_inner();
+            if res.violations.is_empty() {
+                Ok("✅ Nessuna violazione architetturale introdotta (rispetto agli \
+                    invarianti noti; non è prova di assenza di bug)."
+                    .to_string())
+            } else {
+                let mut out = format!(
+                    "⚠️ {} violazione/i architetturale/i introdotta/e dalla modifica:\n",
+                    res.violations.len()
+                );
+                for vio in &res.violations {
+                    let loc = vio
+                        .location
+                        .as_ref()
+                        .map(|l| format!("{}:{}", l.file_path, l.start_line))
+                        .unwrap_or_else(|| "posizione sconosciuta".to_string());
+                    out.push_str(&format!("- [{}] {}\n", loc, vio.message));
+                }
+                if !res.proposed_fixes.is_empty() {
+                    out.push_str("Correzioni proposte:\n");
+                    for fix in &res.proposed_fixes {
+                        out.push_str(&format!("- {fix}\n"));
+                    }
+                }
+                Ok(out)
+            }
+        }
         "codeos_learn" => {
             // Sola lettura git+file, dry-run: NESSUNA scrittura del ledger (il gate
             // umano resta fuori dall'MCP) e nessun server. Riusa crate::mine_repo.
@@ -492,7 +545,7 @@ async fn dispatch_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         other => anyhow::bail!(
             "tool sconosciuto: '{other}' (disponibili: codeos_query, codeos_why, \
              codeos_impact, codeos_context_pack, codeos_decide, codeos_report, \
-             codeos_licenses, codeos_audit, codeos_learn, codeos_certify)"
+             codeos_licenses, codeos_audit, codeos_learn, codeos_certify, codeos_guard)"
         ),
     }
 }

@@ -122,7 +122,7 @@ CODEOS_REPO="$(pwd)" ./target/release/codeos-server &
 | `codeos certify [--base --head]` | **Non-regression verdict** on a PR (CI gate). |
 | `codeos mri` / `guard` / `simulate` | PR risk / firewall / refactoring what-if. |
 | `codeos licenses` | Dependency licenses + ledger policy (`license-deny:`). |
-| `codeos mcp` | MCP server over stdio: 10 native tools for AI agents. |
+| `codeos mcp` | MCP server over stdio: 11 native tools for AI agents (incl. `codeos_guard`). |
 | `codeos doctor` | Diagnose address / port / server liveness. |
 
 ### Environment variables
@@ -164,9 +164,10 @@ codeos certify --base origin/main --head HEAD   # ✅ NO REGRESSION / ⚠️ REG
 ```
 
 - **In CI:** `templates/github-actions/codeos-certify.yml` comments every PR with the verdict.
-- **For AI agents:** the MCP server (`codeos mcp`) exposes 10 tools, including
-  `codeos_learn`, `codeos_audit`, `codeos_certify` — an agent discovers the why,
-  verifies the ledger, and **self-certifies** *before* proposing code.
+- **For AI agents:** the MCP server (`codeos mcp`) exposes 11 tools, including
+  `codeos_learn`, `codeos_audit`, `codeos_certify` and `codeos_guard` — an agent
+  discovers the why, verifies the ledger, and **self-certifies** *before* proposing code.
+  See **[docs/agent-guardrail.md](docs/agent-guardrail.md)**.
 
 ### "CodeOS Certified" badge
 
@@ -182,6 +183,30 @@ Add the seal to your repo's README:
 
 `codeos certify --badge` produces the endpoint JSON that feeds it. **Honesty:**
 "certified" = "no architectural regression *detected*", not "proven safe".
+
+---
+
+## Plug it into your AI coding agent
+
+CodeOS is also a **guardrail for AI coding agents** (Claude Code, Cursor, Windsurf,
+Cline, Codex). Over MCP, the agent checks every change against your architecture and
+recorded decisions — a **local, deterministic, non-LLM** verifier that catches what
+tests miss (boundary violations, contradicted decisions, scope creep), *before* the
+change lands:
+
+- **after an edit** → `codeos_guard` flags any governed boundary the change just crossed
+  (`file:line` + the cited rule);
+- **before a PR** → `codeos_certify` gives a ✅ / ⚠️ verdict (also a CI gate, exit 1).
+
+All CodeOS tools are read-only, so they're safe to auto-approve. One-line setup for
+Claude Code:
+
+```bash
+claude mcp add codeos -e CODEOS_ADDR=127.0.0.1:50051 -- codeos mcp
+```
+
+Full recipe — Cursor / Windsurf / Cline / Codex config, declaring rules, and the failure
+modes it catches: **[docs/agent-guardrail.md](docs/agent-guardrail.md)**.
 
 ---
 
@@ -234,8 +259,8 @@ Non-negotiable principles:
 
 **9 languages** supported (7 validated against compiler oracles). The intent ledger
 **fills itself** (`learn`), **keeps itself true** (`audit`), and **enforces itself in
-CI** (`certify`), all anti-false-positive. MCP server with **10 tools** for AI agents.
-**364 tests** green across the workspace.
+CI** (`certify`), all anti-false-positive. MCP server with **11 tools** for AI agents
+(incl. `codeos_guard`). **364 tests** green across the workspace.
 
 Cost: **0** — fully open source, runs locally, no paid API.
 

@@ -379,6 +379,17 @@ pub fn boundary_entities(
 /// **L'anticorpo.** Date delle relazioni *candidate* (ipotetiche o appena
 /// aggiunte) e le regole scoperte, restituisce le violazioni: ogni candidata che
 /// va nel verso proibito `upstream → downstream`.
+/// Un layer è "dentro" lo scope di una regola se ne è il layer stesso o un suo
+/// discendente nella gerarchia dei namespace (`scope::…`). Permette a una regola
+/// dichiarata a grana grossa (`core`) di governare anche le relazioni a grana fine
+/// (`core::process → ui::show`): il confine vale per l'intero sottoalbero del
+/// layer, non solo per il nodo con nome esatto. Il separatore `::` evita i falsi
+/// prefissi (`core` non cattura `coreutils`). Per le regole minate, che vivono
+/// alla stessa granularità delle entità, degrada all'uguaglianza esatta.
+fn layer_within(layer: &LayerKey, scope: &LayerKey) -> bool {
+    layer.0 == scope.0 || layer.0.starts_with(&format!("{}::", scope.0))
+}
+
 pub fn violations_for(
     candidates: &[Relation],
     entity_layer: &HashMap<EntityId, LayerKey>,
@@ -389,11 +400,13 @@ pub fn violations_for(
         let Some((s, t)) = cross_layer(rel, entity_layer) else {
             continue;
         };
-        // Violazione se esiste una regola in cui `s` è l'upstream e `t` il
-        // downstream: la candidata `s → t` inverte la freccia stabilita.
+        // Violazione se esiste una regola il cui upstream contiene `s` e il cui
+        // downstream contiene `t` (match gerarchico): la candidata `s → t` inverte
+        // la freccia stabilita per quel confine, anche quando `s`/`t` sono più
+        // granulari della regola (es. una funzione dentro il layer governato).
         if let Some(rule) = rules
             .iter()
-            .find(|r| &r.upstream == s && &r.downstream == t)
+            .find(|r| layer_within(s, &r.upstream) && layer_within(t, &r.downstream))
         {
             out.push(ArchitectureViolation {
                 rule_id: rule.id,
