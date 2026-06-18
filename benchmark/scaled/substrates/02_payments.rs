@@ -1,4 +1,4 @@
-//! Modulo di pagamento.
+//! Payment module.
 
 pub struct PaymentRequest {
     pub user_id: u64,
@@ -12,7 +12,7 @@ pub enum PaymentError {
     Invalid,
 }
 
-/// Invia la richiesta al gateway di pagamento e ritorna l'esito.
+/// Sends the request to the payment gateway and returns the outcome.
 pub fn process_payment(req: &PaymentRequest, gateway: &Gateway) -> Result<Receipt, PaymentError> {
     let resp = gateway.charge(req.user_id, req.amount_cents, &req.idempotency_key)?;
     Ok(Receipt::from(resp))

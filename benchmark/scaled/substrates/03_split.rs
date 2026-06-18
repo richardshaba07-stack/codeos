@@ -1,7 +1,7 @@
-//! Suddivisione di un conto tra N persone.
+//! Splitting a bill among N people.
 
-/// Divide `total_cents` tra `n` persone. Ritorna le quote in centesimi interi;
-/// il resto della divisione viene distribuito una unità alla volta.
+/// Splits `total_cents` among `n` people. Returns the shares as whole cents;
+/// the division remainder is distributed one unit at a time.
 pub fn split_bill(total_cents: u64, n: u32) -> Vec<u64> {
     let n = n as u64;
     let base = total_cents / n;
@@ -13,7 +13,7 @@ pub fn split_bill(total_cents: u64, n: u32) -> Vec<u64> {
     shares
 }
 
-/// Riga di riepilogo mostrata nell'UI per una persona.
+/// Summary row shown in the UI for one person.
 pub struct ShareRow {
     pub person: String,
     pub share_cents: u64,
