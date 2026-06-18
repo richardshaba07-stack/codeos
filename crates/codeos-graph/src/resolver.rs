@@ -1130,7 +1130,16 @@ async fn resolve_target(
     if let Some(seg) = first_segment(target) {
         if let Some(full) = ctx.namespace.get(seg) {
             let remainder = &target[seg.len()..];
-            let candidate = format!("{full}{remainder}").replace('.', "::");
+            let raw = format!("{full}{remainder}");
+            // Relative import (Python: `.mod`, `..mod`): resolve it against the file's
+            // package, NOT treating the dots as `::` — otherwise `.sessions.Session`
+            // becomes `::sessions::Session`, which never matches the real entity.
+            let candidate = if raw.starts_with('.') {
+                relative_candidate(&raw, ctx.module_prefix)
+                    .unwrap_or_else(|| raw.replace('.', "::"))
+            } else {
+                raw.replace('.', "::")
+            };
             if let Some(id) = lookup_exact(
                 &candidate,
                 ctx.language,
@@ -1414,26 +1423,54 @@ fn target_candidates(target: &str, module_prefix: &str) -> Vec<String> {
 
 fn relative_candidate(target: &str, module_prefix: &str) -> Option<String> {
     let mut base: Vec<&str> = module_prefix.split("::").collect();
-    base.pop(); // file corrente
-    let mut tail = target;
-    while let Some(rest) = tail.strip_prefix("../") {
-        base.pop();
-        tail = rest;
+    base.pop(); // current file → keep the package that contains it
+
+    if target.contains('/') {
+        // JS/TS style: slash path — `./mod`, `../mod`, `../../a/b`.
+        let mut tail = target;
+        while let Some(rest) = tail.strip_prefix("../") {
+            base.pop();
+            tail = rest;
+        }
+        while let Some(rest) = tail.strip_prefix("./") {
+            tail = rest;
+        }
+        let tail = strip_known_extension(tail);
+        if tail.is_empty() {
+            return None;
+        }
+        let mut parts: Vec<String> = base.into_iter().map(str::to_string).collect();
+        parts.extend(
+            tail.split('/')
+                .filter(|seg| !seg.is_empty() && *seg != ".")
+                .map(str::to_string),
+        );
+        Some(parts.join("::"))
+    } else {
+        // Python style: DOTTED relative import — `.mod` (same package as the file),
+        // `..mod` (parent package). The first dot denotes the current package; each
+        // extra dot goes up one level. The rest is dot-separated. Without this
+        // branch, `.sessions` became `…::.sessions` (dot inside) and never matched:
+        // Python relative imports all stayed Unresolved.
+        let dots = target.chars().take_while(|&c| c == '.').count();
+        if dots == 0 {
+            return None;
+        }
+        for _ in 0..dots.saturating_sub(1) {
+            base.pop();
+        }
+        let mut parts: Vec<String> = base.into_iter().map(str::to_string).collect();
+        parts.extend(
+            target[dots..]
+                .split('.')
+                .filter(|seg| !seg.is_empty())
+                .map(str::to_string),
+        );
+        if parts.is_empty() {
+            return None;
+        }
+        Some(parts.join("::"))
     }
-    while let Some(rest) = tail.strip_prefix("./") {
-        tail = rest;
-    }
-    let tail = strip_known_extension(tail);
-    if tail.is_empty() {
-        return None;
-    }
-    let mut parts: Vec<String> = base.into_iter().map(str::to_string).collect();
-    parts.extend(
-        tail.split('/')
-            .filter(|seg| !seg.is_empty() && *seg != ".")
-            .map(str::to_string),
-    );
-    Some(parts.join("::"))
 }
 
 fn strip_known_extension(path: &str) -> &str {
@@ -1714,12 +1751,111 @@ fn external_dependency_root(
 ) -> Option<String> {
     match language {
         "rust" => external_root_rust(target, is_import),
-        "python" => external_root_python(target, namespace, is_import),
+        "python" => external_root_python(target, namespace, is_import)
+            .or_else(|| python_builtin_root(target))
+            .or_else(|| python_str_method_root(target)),
         // Per il web trattiamo come esterni solo gli import di pacchetti (bare
         // specifier); le call non risolte restano Unresolved.
         "typescript" | "javascript" if is_import => external_root_web(target),
         _ => None,
     }
+}
+
+/// A language's **builtins** are the runtime, not project code: an `isinstance(...)` /
+/// `len(...)` call is not an architectural dependency. We attach them to a synthetic
+/// external entity (`builtins`) instead of leaving them Unresolved, so abstention
+/// stays only where there is genuine uncertainty. It is a **fixed, known** set:
+/// resolving to a builtin is a fact, not an invention. Bare names only (a qualified
+/// name `x.foo` is never a builtin).
+fn python_builtin_root(target: &str) -> Option<String> {
+    if target.contains(['.', ':', '/', '(', '[', ' ']) {
+        return None;
+    }
+    is_python_builtin(target).then(|| "builtins".to_string())
+}
+
+/// Python's `builtins` namespace (standard functions, types and exceptions). Canonical,
+/// conservative list: only names the runtime always defines.
+fn is_python_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "abs" | "aiter" | "all" | "anext" | "any" | "ascii" | "bin" | "bool"
+            | "breakpoint" | "bytearray" | "bytes" | "callable" | "chr" | "classmethod"
+            | "compile" | "complex" | "delattr" | "dict" | "dir" | "divmod" | "enumerate"
+            | "eval" | "exec" | "filter" | "float" | "format" | "frozenset" | "getattr"
+            | "globals" | "hasattr" | "hash" | "help" | "hex" | "id" | "input" | "int"
+            | "isinstance" | "issubclass" | "iter" | "len" | "list" | "locals" | "map"
+            | "max" | "memoryview" | "min" | "next" | "object" | "oct" | "open" | "ord"
+            | "pow" | "print" | "property" | "range" | "repr" | "reversed" | "round"
+            | "set" | "setattr" | "slice" | "sorted" | "staticmethod" | "str" | "sum"
+            | "super" | "tuple" | "type" | "vars" | "zip"
+            // standard exceptions and constants
+            | "BaseException" | "Exception" | "ArithmeticError" | "AssertionError"
+            | "AttributeError" | "BufferError" | "EOFError" | "FloatingPointError"
+            | "GeneratorExit" | "ImportError" | "ModuleNotFoundError" | "IndexError"
+            | "KeyError" | "KeyboardInterrupt" | "LookupError" | "MemoryError"
+            | "NameError" | "NotImplementedError" | "OSError" | "OverflowError"
+            | "RecursionError" | "ReferenceError" | "RuntimeError" | "StopIteration"
+            | "StopAsyncIteration" | "SyntaxError" | "IndentationError" | "TabError"
+            | "SystemError" | "SystemExit" | "TypeError" | "UnboundLocalError"
+            | "UnicodeError" | "ValueError" | "ZeroDivisionError" | "FileNotFoundError"
+            | "PermissionError" | "NotImplemented" | "Ellipsis"
+    )
+}
+
+/// Methods EXCLUSIVE to the str/bytes builtin types (`.encode`, `.strip`, `.lower`…):
+/// called on a receiver of unknown type, they are operations on the runtime, not on
+/// the project — the same noise as builtin functions. We recognize them ONLY by names
+/// a project never defines as its own method (no `.get`/`.split`/`.items`, too
+/// ambiguous): so zero shadow check and zero risk of hiding a real method. External →
+/// `builtins`, outside abstention. Only the clean `receiver.method` shape (no nested
+/// calls/indexes in the target text).
+fn python_str_method_root(target: &str) -> Option<String> {
+    if target.contains(['(', '[', ' ', ':']) || !target.contains('.') {
+        return None;
+    }
+    let method = target.rsplit('.').next()?;
+    is_str_exclusive_method(method).then(|| "builtins".to_string())
+}
+
+/// Method names that belong ONLY to str/bytes in the Python stdlib: a project
+/// practically never defines them. Conservative on purpose — the ambiguous names
+/// (`split`/`replace`/`get`/`items`…) that could be real methods are excluded.
+fn is_str_exclusive_method(name: &str) -> bool {
+    matches!(
+        name,
+        "encode"
+            | "decode"
+            | "strip"
+            | "lstrip"
+            | "rstrip"
+            | "lower"
+            | "upper"
+            | "casefold"
+            | "swapcase"
+            | "title"
+            | "capitalize"
+            | "startswith"
+            | "endswith"
+            | "splitlines"
+            | "zfill"
+            | "ljust"
+            | "rjust"
+            | "center"
+            | "expandtabs"
+            | "isalpha"
+            | "isalnum"
+            | "isdigit"
+            | "isdecimal"
+            | "isnumeric"
+            | "isspace"
+            | "isupper"
+            | "islower"
+            | "istitle"
+            | "isidentifier"
+            | "isprintable"
+            | "isascii"
+    )
 }
 
 /// Rust: `tokio::sync::mpsc` → `tokio`. Esclude le keyword di path relative al

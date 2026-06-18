@@ -785,6 +785,11 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        "abstention" => {
+            // Profile of UNRESOLVED relations: where (and why) the graph abstains.
+            // Read-only on the DB (CODEOS_DB), never the server — like audit/learn.
+            abstention_report().await?;
+        }
         "help" | "--help" | "-h" => {
             print_usage();
         }
@@ -795,6 +800,100 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Classifies an abstention from the unresolved-target text alone — HONEST buckets
+/// (by syntactic shape), with an "unknown" bucket instead of guessing. They map onto
+/// the A/B/C taxonomy: they say WHERE it's worth closing the gap.
+fn classify_abstention(target: &str) -> &'static str {
+    if target.is_empty() {
+        "unknown (no target recorded)"
+    } else if target.starts_with('.') {
+        "A · relative import (alias/leftover)"
+    } else if target.contains("getattr")
+        || target.contains("setattr")
+        || target.contains("eval")
+        || target.contains('[')
+        || target.contains('(')
+    {
+        "C · dynamic/nested (often an HONEST abstention)"
+    } else if target.contains('.') || target.contains("::") {
+        "B · qualified call a.b (needs the receiver's type)"
+    } else {
+        "bare · plain name (scope/external)"
+    }
+}
+
+/// `abstention` command: reads the persisted graph (CODEOS_DB) and profiles the
+/// `Unresolved` relations by category + the most frequent targets. It measures, it
+/// doesn't guess: every abstention is a missing edge (never a lying one), and the
+/// category says where to act.
+async fn abstention_report() -> anyhow::Result<()> {
+    use codeos_storage::{GraphStorage, RelationFilter, SqliteStorage};
+    use std::collections::HashMap;
+
+    let db = std::env::var("CODEOS_DB").map_err(|_| {
+        anyhow::anyhow!(
+            "`abstention` reads the persisted graph: set CODEOS_DB=<file.db> (the same one \
+             used for `index`) and retry. (With an in-memory graph there is nothing to read.)"
+        )
+    })?;
+    let storage = SqliteStorage::open(&db)?;
+    let relations = storage.query_relations(RelationFilter::default()).await?;
+    let total = relations.len();
+    if total == 0 {
+        println!("Empty graph in {db}: index first with `codeos index <path>` (same CODEOS_DB).");
+        return Ok(());
+    }
+
+    let mut unresolved = 0usize;
+    let mut buckets: HashMap<&'static str, usize> = HashMap::new();
+    let mut targets: HashMap<String, usize> = HashMap::new();
+    for r in &relations {
+        if r.kind == codeos_types::RelationKind::Unresolved {
+            unresolved += 1;
+            let t = r
+                .metadata
+                .get("unresolved_target")
+                .cloned()
+                .unwrap_or_default();
+            *buckets.entry(classify_abstention(&t)).or_insert(0) += 1;
+            if !t.is_empty() {
+                *targets.entry(t).or_insert(0) += 1;
+            }
+        }
+    }
+    let resolved = total - unresolved;
+    let pct = resolved * 100 / total;
+
+    println!("🔎 CODEOS ABSTENTION — profile of unresolved relations");
+    println!("---------------------------------------------------------");
+    println!("Relations: {total} total · {resolved} resolved ({pct}%) · {unresolved} abstained");
+    if unresolved == 0 {
+        println!("\n✅ No abstention in this graph.");
+        return Ok(());
+    }
+
+    println!("\nAbstentions by category (where it's worth closing the gap):");
+    let mut by_cat: Vec<(&str, usize)> = buckets.into_iter().collect();
+    by_cat.sort_by_key(|b| std::cmp::Reverse(b.1));
+    for (cat, n) in &by_cat {
+        println!("  {n:>5}  ({:>2}%)  {cat}", n * 100 / unresolved);
+    }
+
+    println!("\nMost frequent unresolved targets:");
+    let mut top: Vec<(String, usize)> = targets.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (t, n) in top.into_iter().take(12) {
+        println!("  {n:>4}×  {t}");
+    }
+
+    println!(
+        "\n(Every abstention is a reference seen but not attached to a certain namesake:\n \
+         a missing edge, never a lying one. The category says where to act — B = types, \
+         A = imports, C = dynamic/honest.)"
+    );
     Ok(())
 }
 
@@ -1123,6 +1222,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "audit [path]",
         "Verifica l'integrità del ledger: segnala le decisioni la cui PROVENIENZA è sparita (commit riscritto/squashato, file ADR cancellato). Anti-FP: solo fatti verificati via git/filesystem, per-citazione; le decisioni umane senza evidenza non vengono mai segnalate. Exit 1 se trova provenienze rotte (gate CI). Sola lettura, mai il server.",
+    ),
+    (
+        "abstention",
+        "Profiles the UNRESOLVED relations of the persisted graph (CODEOS_DB) by category (B receiver-type / A import / C dynamic / bare) + the most frequent targets. Measures WHERE the graph abstains, so you know where to close the gap. Read-only, never the server.",
     ),
     (
         "simulate \"move <src> to <dst>\"",
@@ -2012,8 +2115,25 @@ mod tests {
     fn usage_documents_every_implemented_command() {
         let usage = usage_text();
         for cmd in [
-            "index", "report", "query", "path", "impact", "doctor", "guard", "context", "mri",
-            "why", "simulate", "help", "decide", "mcp", "licenses", "learn", "audit", "certify",
+            "index",
+            "report",
+            "query",
+            "path",
+            "impact",
+            "doctor",
+            "guard",
+            "context",
+            "mri",
+            "why",
+            "simulate",
+            "help",
+            "decide",
+            "mcp",
+            "licenses",
+            "learn",
+            "audit",
+            "certify",
+            "abstention",
         ] {
             assert!(
                 usage.contains(cmd),

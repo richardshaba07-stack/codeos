@@ -61,27 +61,32 @@ impl GuardianActor {
         decisions: Arc<dyn DecisionStore>,
         repo_root: PathBuf,
     ) -> Self {
-        // Regole dichiarate a mano: `<repo>/.codeos/config.yaml` (opzionale). Le
-        // carichiamo prima di consumare `repo_root` nel GitLog.
-        let declared =
-            crate::declared::load_declared_rules(&repo_root.join(".codeos").join("config.yaml"));
+        // Config opzionale `<repo>/.codeos/config.yaml`: regole dichiarate +
+        // `layer_depth`. Letta prima di consumare `repo_root` nel GitLog.
+        let config_path = repo_root.join(".codeos").join("config.yaml");
+        let declared = crate::declared::load_declared_rules(&config_path);
         if !declared.is_empty() {
             tracing::info!(
                 count = declared.len(),
                 "regole di layering dichiarate caricate da config"
             );
         }
-        Self {
-            guardian: Guardian::with_memory(storage, decisions)
-                // Cache della storia git invalidata su HEAD: una `report` interroga
-                // i commit molte volte, senza cache è un `git log` completo ogni volta.
-                .with_commit_history(Arc::new(CachedHistory::new(
-                    Arc::new(GitLog::new(repo_root.clone())),
-                    repo_root,
-                )))
-                .with_declared_rules(declared),
-            events,
+        let layer_depth = crate::declared::load_layer_depth(&config_path);
+        if let Some(d) = layer_depth {
+            tracing::info!(layer_depth = d, "layer_depth from config");
         }
+        let mut guardian = Guardian::with_memory(storage, decisions)
+            // Git-history cache invalidated on HEAD: a `report` queries the commits
+            // many times; without a cache it is a full `git log` every time.
+            .with_commit_history(Arc::new(CachedHistory::new(
+                Arc::new(GitLog::new(repo_root.clone())),
+                repo_root,
+            )))
+            .with_declared_rules(declared);
+        if let Some(d) = layer_depth {
+            guardian = guardian.with_layer_depth(d);
+        }
+        Self { guardian, events }
     }
 
     /// Consuma **solo** gli eventi del bus finché il canale resta aperto. È la
