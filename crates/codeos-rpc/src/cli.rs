@@ -785,6 +785,11 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        "abstention" => {
+            // Profilo delle relazioni NON risolte: dove (e perché) il grafo si astiene.
+            // Sola lettura del DB (CODEOS_DB), mai il server — come audit/learn.
+            abstention_report().await?;
+        }
         "help" | "--help" | "-h" => {
             print_usage();
         }
@@ -795,6 +800,99 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Classifica un'astensione dal solo testo del target non risolto — buckets ONESTI
+/// (per forma sintattica), con un secchio "ignoto" invece di indovinare. Mappano sulla
+/// tassonomia A/B/C: dicono DOVE vale la pena chiudere il buco.
+fn classify_abstention(target: &str) -> &'static str {
+    if target.is_empty() {
+        "ignoto (nessun target registrato)"
+    } else if target.starts_with('.') {
+        "A · import relativo (alias/residuo)"
+    } else if target.contains("getattr")
+        || target.contains("setattr")
+        || target.contains("eval")
+        || target.contains('[')
+        || target.contains('(')
+    {
+        "C · dinamico/annidato (spesso astensione ONESTA)"
+    } else if target.contains('.') || target.contains("::") {
+        "B · chiamata qualificata a.b (serve il tipo del receiver)"
+    } else {
+        "bare · nome semplice (scope/esterno)"
+    }
+}
+
+/// Comando `abstention`: legge il grafo persistito (CODEOS_DB) e profila le relazioni
+/// `Unresolved` per categoria + i target più frequenti. Misura, non indovina: ogni
+/// astensione è un arco mancante (mai uno che mente), e la categoria dice dove agire.
+async fn abstention_report() -> anyhow::Result<()> {
+    use codeos_storage::{GraphStorage, RelationFilter, SqliteStorage};
+    use std::collections::HashMap;
+
+    let db = std::env::var("CODEOS_DB").map_err(|_| {
+        anyhow::anyhow!(
+            "`abstention` legge il grafo persistito: imposta CODEOS_DB=<file.db> (lo stesso \
+             usato per `index`) e riprova. (Con grafo in memoria non c'è nulla da leggere.)"
+        )
+    })?;
+    let storage = SqliteStorage::open(&db)?;
+    let relations = storage.query_relations(RelationFilter::default()).await?;
+    let total = relations.len();
+    if total == 0 {
+        println!("Grafo vuoto in {db}: indicizza prima con `codeos index <path>` (stesso CODEOS_DB).");
+        return Ok(());
+    }
+
+    let mut unresolved = 0usize;
+    let mut buckets: HashMap<&'static str, usize> = HashMap::new();
+    let mut targets: HashMap<String, usize> = HashMap::new();
+    for r in &relations {
+        if r.kind == codeos_types::RelationKind::Unresolved {
+            unresolved += 1;
+            let t = r
+                .metadata
+                .get("unresolved_target")
+                .cloned()
+                .unwrap_or_default();
+            *buckets.entry(classify_abstention(&t)).or_insert(0) += 1;
+            if !t.is_empty() {
+                *targets.entry(t).or_insert(0) += 1;
+            }
+        }
+    }
+    let resolved = total - unresolved;
+    let pct = resolved * 100 / total;
+
+    println!("🔎 CODEOS ABSTENTION — profilo delle relazioni non risolte");
+    println!("---------------------------------------------------------");
+    println!("Relazioni: {total} totali · {resolved} risolte ({pct}%) · {unresolved} astenute");
+    if unresolved == 0 {
+        println!("\n✅ Nessuna astensione in questo grafo.");
+        return Ok(());
+    }
+
+    println!("\nAstensioni per categoria (dove vale la pena chiudere il buco):");
+    let mut by_cat: Vec<(&str, usize)> = buckets.into_iter().collect();
+    by_cat.sort_by(|a, b| b.1.cmp(&a.1));
+    for (cat, n) in &by_cat {
+        println!("  {n:>5}  ({:>2}%)  {cat}", n * 100 / unresolved);
+    }
+
+    println!("\nTarget non risolti più frequenti:");
+    let mut top: Vec<(String, usize)> = targets.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (t, n) in top.into_iter().take(12) {
+        println!("  {n:>4}×  {t}");
+    }
+
+    println!(
+        "\n(Ogni astensione è un riferimento visto ma non agganciato a un omonimo certo:\n \
+         un arco mancante, mai un arco che mente. La categoria dice dove agire — B = tipi, \
+         A = import, C = dinamico/onesto.)"
+    );
     Ok(())
 }
 
@@ -1123,6 +1221,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "audit [path]",
         "Verifica l'integrità del ledger: segnala le decisioni la cui PROVENIENZA è sparita (commit riscritto/squashato, file ADR cancellato). Anti-FP: solo fatti verificati via git/filesystem, per-citazione; le decisioni umane senza evidenza non vengono mai segnalate. Exit 1 se trova provenienze rotte (gate CI). Sola lettura, mai il server.",
+    ),
+    (
+        "abstention",
+        "Profila le relazioni NON risolte del grafo persistito (CODEOS_DB) per categoria (B tipo-receiver / A import / C dinamico / bare) + i target più frequenti. Misura DOVE il grafo si astiene, per sapere dove chiudere il buco. Sola lettura, mai il server.",
     ),
     (
         "simulate \"move <src> to <dst>\"",
@@ -2014,6 +2116,7 @@ mod tests {
         for cmd in [
             "index", "report", "query", "path", "impact", "doctor", "guard", "context", "mri",
             "why", "simulate", "help", "decide", "mcp", "licenses", "learn", "audit", "certify",
+            "abstention",
         ] {
             assert!(
                 usage.contains(cmd),
