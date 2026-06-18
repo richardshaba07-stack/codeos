@@ -121,3 +121,32 @@ actually writes (function/type/module/layer names): full recall, clean control. 
 "flaw" is a pathological-tag case, and its correct fix (common-root-prefix exclusion, in
 TWO sites, with a single-module edge case) is its own piece of work, to be measured — not
 the hasty quick-fix I wrote above. It stays as a precise item, not a rushed patch.
+
+---
+
+## ✅ RESOLVED — the fix that actually shipped (recorded after the fact)
+
+Both the "two sites" debt and the flood itself were later closed. This note exists so the
+doc stops describing an open item that the code has already handled.
+
+**1. The duplication is gone.** Decision selection now lives in **one** place,
+`codeos_memory::select_human_decisions` (`crates/codeos-memory/src/selection.rs`), used by
+both the query engine and the guardian context-pack. The two copies can no longer diverge.
+
+**2. The flood is fixed with a blocklist, not common-prefix exclusion.** Rather than the
+expensive global-common-prefix scan (with its single-module edge case), the shipped fix is
+a small, universal blocklist of **structural** path/build segments — `src`, `lib`, `tmp`,
+`tests`, `target`, `build`, `node_modules`, `vendor`, `mod`, `index`, `__init__`, … —
+checked case-insensitively in `is_structural_segment()`. A tag equal to one of these no
+longer anchors anything, so it cannot flood the pack; real domain/layer tags (`api`,
+`core`, `billing`) are untouched because they are not in the list.
+
+**3. Covered by tests** (`selection.rs`): the `src` flood no longer matches; a layer tag
+(`api`) still anchors (no regression of the intentional feature the revert was protecting);
+the filter is case-insensitive; and an explicit `related_entity_ids` anchor survives even a
+structural tag.
+
+**Honest residue (unchanged):** a tag that equals the *repository name* (not in the
+blocklist) would still match broadly. This is rare and an obvious misuse — nobody tags a
+decision with the repo name — so it is left as a known, documented edge rather than paying
+for the global-prefix machinery. Everything a human actually tags is handled.
