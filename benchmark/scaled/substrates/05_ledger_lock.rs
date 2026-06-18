@@ -1,4 +1,4 @@
-//! Trasferimenti tra conti con un lock per-conto.
+//! Transfers between accounts with a per-account lock.
 
 pub struct Bank;
 pub struct Guard;
@@ -9,7 +9,7 @@ pub enum TransferError {
 }
 
 impl Bank {
-    /// Acquisisce il lock del conto `id` (rilasciato col Drop del Guard).
+    /// Acquires the lock for account `id` (released when the Guard is dropped).
     pub fn lock(&self, id: u64) -> Guard {
         let _ = id;
         Guard
@@ -21,7 +21,7 @@ impl Bank {
     }
 }
 
-/// Sposta `amount` da `from` a `to`, prendendo entrambi i lock dei conti.
+/// Moves `amount` from `from` to `to`, taking both account locks.
 pub fn transfer(from: u64, to: u64, amount: u64, bank: &Bank) -> Result<(), TransferError> {
     let (first, second) = if from <= to { (from, to) } else { (to, from) };
     let _g1 = bank.lock(first);

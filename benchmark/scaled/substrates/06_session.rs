@@ -1,9 +1,9 @@
-//! Validazione delle sessioni utente.
+//! User session validation.
 
 pub struct Token {
     pub user_id: u64,
-    pub exp: u64,           // istante di scadenza (epoch secondi)
-    pub remember_me: bool,  // flag impostato al login se l'utente l'ha scelto
+    pub exp: u64,           // expiry instant (epoch seconds)
+    pub remember_me: bool,  // flag set at login if the user chose it
     pub sig: [u8; 32],
 }
 
@@ -19,7 +19,7 @@ fn verify_signature(token: &Token) -> Result<(), AuthError> {
     Ok(())
 }
 
-/// Valida un token di sessione al tempo `now` (epoch secondi).
+/// Validates a session token at time `now` (epoch seconds).
 pub fn validate_session(token: &Token, now: u64) -> Result<UserId, AuthError> {
     verify_signature(token)?;
     if token.exp < now {

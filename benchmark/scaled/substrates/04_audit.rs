@@ -1,4 +1,4 @@
-//! Registrazione (audit log) dei tentativi di login.
+//! Audit log of login attempts.
 
 pub struct LoginEvent {
     pub email: String,
@@ -11,7 +11,7 @@ pub trait LogSink {
 }
 
 fn opaque_session_id(ev: &LoginEvent) -> String {
-    // id di sessione opaco, non riconducibile all'utente
+    // opaque session id, not traceable back to the user
     format!("s{:08x}", fnv1a(ev.email.as_bytes()) ^ fnv1a(ev.ip.as_bytes()))
 }
 
@@ -24,7 +24,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Scrive una riga di audit per un tentativo di login.
+/// Writes an audit line for a login attempt.
 pub fn log_login_attempt(ev: &LoginEvent, sink: &mut dyn LogSink) {
     sink.write(&format!(
         "login success={} session={}",
