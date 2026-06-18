@@ -10,10 +10,13 @@ written **before** a single agent ran (commit `604497a`), the exact prompts are
 included, and the **raw agent responses and the blind judge's verdicts** are in
 [`scaled/risposte/`](scaled/risposte/).
 
-> The detailed protocol, criteria and results files are in Italian (the project's
-> working language). This README states the method, the result, and the limits
-> faithfully in English. The substrates are Rust; the responses are the agents'
-> verbatim output.
+> **Language.** The protocol, criteria, results and validation docs are in English.
+> The benchmark was originally **run in Italian** (the author's working language); the
+> exact prompts as run ([`scaled/PROMPT_DA_ESEGUIRE.md`](scaled/PROMPT_DA_ESEGUIRE.md))
+> and the agents' **verbatim responses** ([`scaled/risposte/`](scaled/risposte/)) are
+> kept in the original language as the authentic record — translating verbatim evidence
+> would falsify it, and the Rust diffs in them (the operative proof of each violation)
+> are language-neutral.
 
 ## What it actually tests
 
@@ -94,5 +97,5 @@ Separate from this efficacy benchmark, the intent-mining pipeline
 **96.5% abstention** on gin with rationale confirmed **verbatim** (character-for-character
 against the real commit body), **zero fabrication**, and `certify` working on a real diff.
 The run also surfaced a real improvement (write strong-signal decisions by default) that
-the synthetic micro-repos had masked. Full notes (Italian, the project's working
-language): [`REAL_WORLD_VALIDATION.it.md`](REAL_WORLD_VALIDATION.it.md).
+the synthetic micro-repos had masked. Full notes:
+[`REAL_WORLD_VALIDATION.md`](REAL_WORLD_VALIDATION.md).

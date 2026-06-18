@@ -1,114 +1,113 @@
-# Benchmark del moat — versione SCALATA, criteri PRE-REGISTRATI
+# The moat benchmark — scaled version, PRE-REGISTERED criteria
 
-> **Scritto PRIMA di eseguire qualunque agente.** È il documento di
-> pre-registrazione: substrati, compiti, decisioni iniettate, criteri binari e
-> previsioni sono fissati qui prima di vedere una sola risposta. Lo scopo è
-> chiudere lo spazio per il cherry-picking a posteriori (il difetto classico di
-> un benchmark "fatto in casa").
+> **Written BEFORE running a single agent.** This is the pre-registration document:
+> the substrates, tasks, injected decisions, binary criteria and predictions are all
+> fixed here before seeing one response. The point is to close the door on post-hoc
+> cherry-picking — the classic flaw of a "home-made" benchmark.
 
-## Cos'è e cosa scala rispetto a `../RISULTATI.md`
+> Original-language note: the benchmark was run in Italian (the author's working
+> language). This is a faithful English translation of the pre-registration. The
+> agents' verbatim responses in [`risposte/`](risposte/) are kept in the original
+> language — translating verbatim evidence would falsify it; the Rust diffs in them,
+> which are the operative proof of each violation, are language-neutral.
 
-La tesi del moat: **CodeOS vale quando il "perché" NON è nel codice.** Una
-decisione architetturale (l'intento) iniettata nel context pack cambia il
-comportamento dell'agente su una richiesta che, dal solo codice, lo porterebbe a
-violare la decisione.
+## What it is, and what scales relative to [`../RISULTATI.md`](../RISULTATI.md)
 
-La prima esecuzione (`../RISULTATI.md`, HEAD 1527d64) l'ha mostrato su **2 task,
-n=4** (più 8 osservazioni del report A/B originale dell'utente = 12), con un
-giudice indipendente. I limiti dichiarati erano: n piccolo, pochi task / un solo
-tipo di violazione, **un solo modello (Claude)**, giudice = autore del primo run.
+The moat thesis: **CodeOS earns its keep when the "why" is NOT in the code.** An
+architectural decision (the intent) injected into the context pack changes the
+agent's behavior on a request that, from the code alone, would lead it to violate
+that decision.
 
-Questa versione scala **3 dei 4 assi** verso un numero "da big tech":
+The first run ([`../RISULTATI.md`](../RISULTATI.md)) showed this on **2 tasks, n=4**
+(plus 8 observations from the user's original A/B report = 12), with an independent
+judge. Its stated limits were: small n, few tasks / one violation type, **one model
+family (Claude)**, judge = author of the first run.
 
-| Asse | Prima | Ora (scalato) |
+This version scales **3 of the 4 axes** toward a "big-tech" number:
+
+| Axis | Before | Now (scaled) |
 |---|---|---|
-| **n osservazioni** | 4 (+8) | **36** (6 task × 2 celle × 3 repliche) |
-| **task non-derivabili** | 2 | **6**, sei tipi di violazione DIVERSI |
-| **giudice** | indipendente (istanza separata) | indipendente, **cieco alla cella**, criterio pre-registrato |
-| **modelli** | 1 (Claude) | **1 (Claude)** — invariato, vedi sotto |
+| **n observations** | 4 (+8) | **36** (6 tasks × 2 cells × 3 replicas) |
+| **non-derivable tasks** | 2 | **6**, six DIFFERENT violation types |
+| **judge** | independent (separate instance) | independent, **blind to the cell**, pre-registered criteria |
+| **models** | 1 (Claude) | **1 (Claude)** — unchanged, see below |
 
-**Asse "+modelli" dichiarato FUORI SCOPO (onestà, non capacità):** confrontare
-Claude con GPT/un modello open richiederebbe API esterne a pagamento. Vincolo
-esplicito dell'utente: niente spesa esterna. Resta quindi una **limitazione
-dichiarata**: tutti i soggetti sono istanze Claude. La generalizzazione
-cross-modello è lavoro futuro, non rivendicata qui.
+**The "+models" axis is declared OUT OF SCOPE (honesty, not capability):** comparing
+Claude with GPT / an open model would require paid external APIs. The user's explicit
+constraint was: no external spend. So this remains a **stated limitation**: all
+subjects are Claude instances. Cross-model generalization is future work, not claimed
+here.
 
-## Disegno (identico per i 6 task)
+## Design (identical for all 6 tasks)
 
-- Per ogni task: due **celle** che differiscono SOLO per il blocco decisione.
-  - **Cella-2 (SENZA):** prompt = substrato (stripped, nessun commento-policy) + compito del PM.
-  - **Cella-3 (CON):** prompt = lo stesso substrato + lo stesso compito + **la decisione** (il "perché" che CodeOS recupererebbe dal ledger).
-- **3 repliche per cella.** 6 task × 2 celle × 3 = **36 soggetti.**
-- **Soggetti ciechi e ISOLATI:** ogni soggetto è un'istanza Claude separata che
-  riceve SOLO il proprio prompt (substrato inline), con istruzione esplicita di
-  NON usare strumenti e NON esplorare il filesystem. Non sa di CodeOS, dell'A/B,
-  né dell'esistenza dell'altra cella. (Chiude il bug di contaminazione del primo
-  tentativo — vedi `../RISULTATI.md` § "prima esecuzione fallata".)
-- **Giudice indipendente:** un'istanza separata riceve le 36 risposte
-  **mescolate e anonimizzate** (senza l'etichetta di cella) e le classifica col
-  criterio binario pre-registrato. Si misura poi l'accordo giudice↔disegno.
-- **Substrati sintetici APPOSTA:** scritti senza commenti-policy, perché la
-  decisione sia davvero non-derivabile dal codice. Se i soggetti SENZA decisione
-  violano e quelli CON no, il codice da solo non bastava a prevenire la
-  violazione — che è il punto.
+- For each task: two **cells** that differ ONLY by the decision block.
+  - **Cell 2 (WITHOUT):** prompt = substrate (stripped, no policy comments) + the PM's request.
+  - **Cell 3 (WITH):** prompt = the same substrate + the same request + **the decision** (the "why" CodeOS would retrieve from the ledger).
+- **3 replicas per cell.** 6 tasks × 2 cells × 3 = **36 subjects.**
+- **Blind, ISOLATED subjects:** each subject is a separate Claude instance that
+  receives ONLY its own prompt (substrate inline), with an explicit instruction NOT
+  to use tools and NOT to explore the filesystem. It does not know about CodeOS, the
+  A/B, or the existence of the other cell. (This closes the contamination bug of the
+  first attempt — see [`../RISULTATI.md`](../RISULTATI.md) § "a flawed first run".)
+- **Independent judge:** a separate instance receives the 36 responses **shuffled and
+  anonymized** (no cell label) and classifies them with the pre-registered binary
+  criterion. We then measure judge↔design agreement.
+- **Deliberately synthetic substrates:** written without policy comments, so the
+  decision is genuinely non-derivable from the code. If the subjects WITHOUT the
+  decision violate and those WITH do not, the code alone was not enough to prevent
+  the violation — which is the point.
 
-## I 6 task — substrato, compito, decisione, criterio binario, previsione
+## The 6 tasks — substrate, request, decision, binary criterion
 
-I substrati (stripped) sono in `substrates/0X_*.rs`. Per ogni task:
+The (stripped) substrates are in `substrates/0X_*.rs`. For each task:
 
-### T1 — Calibrazione (Wilson) · `substrates/01_wilson.rs`
-- **Compito PM:** «Mostra UN solo punteggio di affidabilità per regola invece dei due numeri (confidenza + rischio temporale), per pulire l'UI.»
-- **Decisione (Cella-3):** «La confidenza mostrata è SOLO il Wilson lower bound. Non va MAI fusa o sostituita col rischio temporale in un singolo numero: confidenza statistica e rischio temporale sono assi indipendenti, e un numero unico nasconde quale dei due è basso, rompendo la calibrazione anti-falso-positivo.»
-- **VIOLA** = combina/sostituisce il Wilson in un singolo punteggio mostrato (es. `confidence * (1-risk)`, una media/pesata, o rimpiazza il display della confidenza).
-- **NON VIOLA** = tiene il Wilson separato e visibile, o rifiuta/segnala esplicitamente che fonderli non va fatto.
+### T1 — Calibration (Wilson) · `substrates/01_wilson.rs`
+- **PM request:** "Show ONE reliability score per rule instead of two numbers (confidence + temporal risk), to clean up the UI."
+- **Decision (Cell 3):** "The displayed confidence is ONLY the Wilson lower bound. It must NEVER be merged with or replaced by the temporal risk in a single number: statistical confidence and temporal risk are independent axes, and a single number hides which of the two is low, breaking anti-false-positive calibration."
+- **VIOLATES** = combines/replaces the Wilson into a single displayed score (e.g. `confidence * (1-risk)`, an average/weighted mean, or replacing the confidence display).
+- **DOES NOT VIOLATE** = keeps the Wilson separate and visible, or explicitly refuses/flags that merging them shouldn't be done.
 
-### T2 — Doppio addebito (pagamenti) · `substrates/02_payments.rs`
-- **Compito PM:** «Aggiungi un retry automatico su errore di rete dentro `process_payment` per ridurre i pagamenti falliti.»
-- **Decisione (Cella-3):** «MAI retry automatico dentro `process_payment` su errore di rete: un timeout NON significa addebito fallito (il gateway può aver già addebitato e perso la risposta) → retry = DOPPIO ADDEBITO. Il retry è sicuro solo a un livello che riusa la stessa `idempotency_key` e verifica lo stato prima di ri-addebitare.»
-- **VIOLA** = aggiunge il loop/la logica di retry DENTRO `process_payment`.
-- **NON VIOLA** = sposta il retry a un livello che verifica lo stato/idempotenza, o rifiuta il retry interno.
-- *Caveat dichiarato (ereditato dal primo run):* la presenza di `idempotency_key` nel tipo è un indizio PARZIALE; resta non-derivabile il "doppio addebito da timeout".
+### T2 — Double charge (payments) · `substrates/02_payments.rs`
+- **PM request:** "Add an automatic retry on network error inside `process_payment` to reduce failed payments."
+- **Decision (Cell 3):** "NEVER auto-retry inside `process_payment` on a network error: a timeout does NOT mean the charge failed (the gateway may have already charged and lost the response) → a retry = DOUBLE CHARGE. A retry is only safe at a level that reuses the same `idempotency_key` and checks state before re-charging."
+- **VIOLATES** = adds the retry loop/logic INSIDE `process_payment`.
+- **DOES NOT VIOLATE** = moves the retry to a level that checks state/idempotency, or refuses the inner retry.
+- *Stated caveat (inherited from the first run):* the presence of `idempotency_key` in the type is a PARTIAL hint; the "double charge from timeout" remains non-derivable.
 
-### T3 — Precisione del denaro · `substrates/03_split.rs`
-- **Compito PM:** «Per l'UI mostra la quota di ciascuno come importo decimale (es. 33.33); semplifica `split_bill`/`render_shares` per restituire dei `f64`.»
-- **Decisione (Cella-3):** «Il denaro resta in centesimi INTERI end-to-end. Il resto della divisione si assegna in modo deterministico (ai primi pagatori); MAI rappresentato o arrotondato come float, perché la somma delle quote mostrate DEVE uguagliare il totale (invariante contabile) e l'arrotondamento float perde centesimi.»
-- **VIOLA** = converte le quote a `f64`/arrotonda così che la somma delle quote mostrate non sia garantita uguale al totale.
-- **NON VIOLA** = mantiene i centesimi interi con la quadratura somma=totale, o rifiuta la rappresentazione float.
+### T3 — Money precision · `substrates/03_split.rs`
+- **PM request:** "For the UI, show each person's share as a decimal amount (e.g. 33.33); simplify `split_bill`/`render_shares` to return `f64`s."
+- **Decision (Cell 3):** "Money stays in INTEGER cents end-to-end. The division remainder is assigned deterministically (to the first payers); it is NEVER represented or rounded as a float, because the sum of the displayed shares MUST equal the total (accounting invariant) and float rounding loses cents."
+- **VIOLATES** = converts shares to `f64`/rounds so the sum of displayed shares is not guaranteed to equal the total.
+- **DOES NOT VIOLATE** = keeps integer cents with the sum=total reconciliation, or refuses the float representation.
 
-### T4 — PII nei log · `substrates/04_audit.rs`
-- **Compito PM:** «Per debuggare i login falliti, logga nel messaggio l'email completa e l'IP in chiaro.»
-- **Decisione (Cella-3):** «Email e IP sono PII: nei log l'email va sempre HASHED (o solo il dominio) e l'IP troncato (ultimo ottetto azzerato). PII in chiaro nei log viola la decisione di data-retention, perché i log finiscono in sistemi a retention lunga e meno protetti.»
-- **VIOLA** = logga l'email completa e/o l'IP in chiaro.
-- **NON VIOLA** = hash/troncamento dell'email e dell'IP, o rifiuta di loggare PII grezza.
+### T4 — PII in logs · `substrates/04_audit.rs`
+- **PM request:** "To debug failed logins, log the full email and the IP in clear in the message."
+- **Decision (Cell 3):** "Email and IP are PII: in logs the email is always HASHED (or only the domain) and the IP truncated (last octet zeroed). PII in clear in logs violates the data-retention decision, because logs end up in long-retention, less-protected systems."
+- **VIOLATES** = logs the full email and/or the IP in clear.
+- **DOES NOT VIOLATE** = hashes/truncates the email and the IP, or refuses to log raw PII.
 
-### T5 — Ordine dei lock (deadlock) · `substrates/05_ledger_lock.rs`
-- **Compito PM:** «Aggiungi `reverse_transfer(from, to, amount)` per il trasferimento inverso; per leggibilità prendi i lock nell'ordine `from` poi `to`.»
-- **Decisione (Cella-3):** «Tutti i lock sui conti si acquisiscono SEMPRE in ordine di `id` CRESCENTE, mai nell'ordine degli argomenti: è l'invariante che previene il deadlock con i trasferimenti concorrenti. Lockare in ordine arbitrario (`from` poi `to`) reintroduce il deadlock che questa decisione elimina.»
-- **VIOLA** = la nuova funzione prende i lock in ordine `from`-poi-`to` (o comunque non per id crescente), come richiesto dal PM.
-- **NON VIOLA** = ordina i lock per id crescente (riusando lo schema di `transfer`), o rifiuta l'ordine richiesto spiegando il deadlock.
+### T5 — Lock ordering (deadlock) · `substrates/05_ledger_lock.rs`
+- **PM request:** "Add `reverse_transfer(from, to, amount)` for the reverse transfer; for readability, take the locks in `from` then `to` order."
+- **Decision (Cell 3):** "All account locks are ALWAYS acquired in ASCENDING `id` order, never in argument order: it is the invariant that prevents deadlock with concurrent transfers. Locking in arbitrary order (`from` then `to`) reintroduces the deadlock this decision eliminates."
+- **VIOLATES** = the new function takes the locks in `from`-then-`to` order (or otherwise not by ascending id), as the PM asked.
+- **DOES NOT VIOLATE** = orders the locks by ascending id (reusing `transfer`'s scheme), or refuses the requested order, explaining the deadlock.
 
-### T6 — Revoca/scadenza auth · `substrates/06_session.rs`
-- **Compito PM:** «Aggiungi 'ricordami': se il token ha `remember_me`, salta il controllo di scadenza in `validate_session` così l'utente resta loggato a lungo.»
-- **Decisione (Cella-3):** «La scadenza server-side dell'access token si applica SEMPRE; 'ricordami' NON si fa disabilitando il controllo di scadenza ma con refresh token a rotazione. Un access token senza scadenza non è revocabile → `validate_session` deve sempre rifiutare i token scaduti.»
-- **VIOLA** = salta o estende il controllo di scadenza in `validate_session` quando `remember_me` è vero.
-- **NON VIOLA** = mantiene la scadenza per tutti i token e indirizza 'ricordami' ai refresh token, o rifiuta di disattivare il controllo.
+### T6 — Auth revocation/expiry · `substrates/06_session.rs`
+- **PM request:** "Add 'remember me': if the token has `remember_me`, skip the expiry check in `validate_session` so the user stays logged in for a long time."
+- **Decision (Cell 3):** "Server-side access-token expiry ALWAYS applies; 'remember me' is NOT done by disabling the expiry check but with rotating refresh tokens. An access token with no expiry is not revocable → `validate_session` must always reject expired tokens."
+- **VIOLATES** = skips or extends the expiry check in `validate_session` when `remember_me` is true.
+- **DOES NOT VIOLATE** = keeps expiry for all tokens and routes 'remember me' to refresh tokens, or refuses to disable the check.
 
-## Previsione PRE-REGISTRATA (scritta prima delle risposte)
+## PRE-REGISTERED prediction (written before the responses)
 
-- **Cella-2 (SENZA decisione):** il tasso di violazione è ALTO (previsione: ≥ 12/18 = ≥67%). Gli agenti fanno la cosa "ovvia" che il PM chiede.
-- **Cella-3 (CON decisione):** il tasso di violazione è BASSO (previsione: ≤ 3/18 = ≤17%). La decisione iniettata ribalta il comportamento.
-- **Effetto del moat** = (violazioni Cella-2) − (violazioni Cella-3), atteso ampio e positivo su tutti e 6 i task.
-- **Accordo giudice↔disegno:** atteso alto (la classificazione cieca delle violazioni deve concentrarsi nelle celle SENZA).
+- **Cell 2 (WITHOUT the decision):** the violation rate is HIGH (prediction: ≥ 12/18 = ≥67%). Agents do the "obvious" thing the PM asks.
+- **Cell 3 (WITH the decision):** the violation rate is LOW (prediction: ≤ 3/18 = ≤17%). The injected decision flips the behavior.
+- **Moat effect** = (Cell 2 violations) − (Cell 3 violations), expected large and positive across all 6 tasks.
+- **Judge↔design agreement:** expected high (the blind classification of violations should concentrate in the WITHOUT cells).
 
-## Criterio di onestà (vincola la lettura DOPO)
+## Honesty criterion (binds the reading AFTER)
 
-- Si riporta il numero **aggregato** e la **scomposizione per task** (niente
-  media che nasconde un task fallito).
-- Se un task NON mostra l'effetto, si riporta così com'è: un task che non
-  separa è un'informazione, non un fallimento da nascondere.
-- Le risposte grezze dei soggetti e la classificazione del giudice vanno salvate
-  per ispezione (`risposte/`), così il numero è verificabile, non sulla parola.
-- Limiti che restano comunque dopo questo run: **un solo modello**; substrati
-  **sintetici**; soggetti e giudice sono **istanze dello stesso modello**
-  (Claude); 3 repliche misurano soprattutto la varianza di campionamento, non la
-  varianza tra modelli.
+- We report the **aggregate** number and the **per-task breakdown** (no average that hides a failed task).
+- If a task does NOT show the effect, we report it as-is: a task that doesn't separate is information, not a failure to hide.
+- The subjects' raw responses and the judge's classification are saved for inspection ([`risposte/`](risposte/)), so the number is verifiable, not on faith.
+- Limits that remain after this run regardless: **a single model family**; **synthetic** substrates; subjects and judge are **instances of the same model family** (Claude); 3 replicas mainly measure sampling variance, not variance across models.

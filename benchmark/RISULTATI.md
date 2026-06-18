@@ -1,109 +1,81 @@
-# Benchmark del moat — 2 task, giudice indipendente (2026-06-13, HEAD 1527d64)
+# The moat benchmark — 2 tasks, independent judge (2026-06-13)
 
-## RISULTATO AGGREGATO (2 task non-derivabili, giudice cieco al disegno)
+> This is the **first, smaller run**. It is superseded by the scaled run
+> ([`scaled/RISULTATI_SCALED.md`](scaled/RISULTATI_SCALED.md), 6 tasks, n=36, blind LLM
+> judge). It is kept as the record of how the result was first established.
 
-| Condizione | Task A (Wilson) | Task B (pagamenti) | TOTALE |
+## AGGREGATE RESULT (2 non-derivable tasks, judge blind to the design)
+
+| Condition | Task A (Wilson) | Task B (payments) | TOTAL |
 |---|---|---|---|
-| **SENZA decisione** | 2/2 violano | 2/2 violano | **4/4 = 100%** |
-| **CON decisione** | 0/2 | 0/2 | **0/4 = 0%** |
+| **WITHOUT the decision** | 2/2 violate | 2/2 violate | **4/4 = 100%** |
+| **WITH the decision** | 0/2 | 0/2 | **0/4 = 0%** |
 
-Due task indipendenti (reporting Wilson + retry di pagamento), stessa struttura:
-stesso codice e stesso task nelle due celle, unica differenza la decisione
-iniettata. Un GIUDICE indipendente (istanza separata, cieca a quale cella fosse
-con/senza decisione) ha classificato tutte e 8 le risposte col criterio binario:
-**la sua classificazione coincide al 100% col disegno** — le 4 violazioni sono
-TUTTE nelle celle senza decisione, le 4 non-violazioni TUTTE in quelle con.
+Two independent tasks (Wilson reporting + payment retry), same structure: same code and
+same task in the two cells, the only difference being the injected decision. An
+independent JUDGE (a separate instance, blind to which cell was with/without the
+decision) classified all 8 responses with the binary criterion: **its classification
+matches the design 100%** — the 4 violations are ALL in the without-decision cells, the
+4 non-violations ALL in the with cells.
 
-→ Su 2 policy non-derivabili diverse, il «perché» iniettato ribalta il
-comportamento da 100% a 0% di violazioni. Con i 8 agenti del report originale
-dell'utente (§T): 16 osservazioni totali sull'asse del moat.
+→ Across 2 different non-derivable policies, the injected "why" flips behavior from 100%
+to 0% violations. With the 8 agents from the user's original report: 16 total
+observations on the moat axis.
 
-## Task B — retry di pagamento (il secondo task)
+## Task B — payment retry
 
-Substrato `payments.rs`: `process_payment` chiama il gateway una volta. Il PM
-chiede retry automatico su errore di rete. La decisione vieta il retry DENTRO
-process_payment (un timeout ≠ addebito fallito → doppio addebito; i retry sono
-sicuri solo a un livello che verifica lo stato via idempotency_key).
-- SENZA decisione: 2/2 aggiungono il loop di retry dentro process_payment.
-- CON decisione: 2/2 rifiutano, spostano il retry a un livello con verifica stato.
-Caveat onesto: questo task ha un indizio PARZIALMENTE derivabile (la presenza di
-`idempotency_key` nel tipo) — gli agenti senza decisione l'hanno notato e hanno
-aggiunto un caveat, MA hanno comunque IMPLEMENTATO il retry vietato (violazione);
-con la decisione hanno rifiutato. La decisione sposta «implementa con riserva» →
-«rifiuta». Meno «puro» del task Wilson, dichiarato.
+Substrate `payments.rs`: `process_payment` calls the gateway once. The PM asks for an
+automatic retry on network error. The decision forbids the retry INSIDE process_payment
+(a timeout ≠ a failed charge → double charge; retries are only safe at a level that
+checks state via idempotency_key).
+- WITHOUT the decision: 2/2 add the retry loop inside process_payment.
+- WITH the decision: 2/2 refuse, move the retry to a level with state checking.
+Honest caveat: this task has a PARTIALLY derivable hint (the presence of
+`idempotency_key` in the type) — the agents without the decision noticed it and added a
+caveat, BUT still IMPLEMENTED the forbidden retry (a violation); with the decision they
+refused. The decision moves "implement with a caveat" → "refuse". Less "pure" than the
+Wilson task, stated.
 
----
+## Task A — Wilson
 
-# Task A — Wilson (il primo task)
+An ISOLATED replica of Cells 2-3 that the user's original A/B report did not run "due to
+a credits constraint". It closes the loop: the injected decision (the "why" that is
+non-derivable from the code) changes the agent's behavior.
 
-Replica ISOLATA delle Celle 2-3 che il report A/B dell'utente
-(`CodeOS_AB_moat_report.pdf`) non aveva eseguito «per vincolo di crediti». Chiude
-il loop: dimostra che la decisione iniettata (il «perché» non-derivabile dal
-codice) cambia il comportamento dell'agente.
+- **Task** (identical in the two cells): a PM asks to show ONE reliability score instead
+  of two separate numbers (Wilson confidence + temporal risk) — see `reliability.rs`.
+- **Cell 2** (WITHOUT): prompt = code + task. **Cell 3** (WITH): + the Wilson decision.
+- 2 replicas per cell. Agents blind to the A/B, ISOLATED from the filesystem
+  (`tool_uses` = 0 verified → no contamination).
+- **Pre-registered BINARY criterion**: VIOLATES = the change combines/replaces the
+  Wilson into a single displayed score.
 
-## Disegno
-
-- **Task** (identico nelle due celle): un PM chiede di mostrare UN solo punteggio
-  di affidabilità invece di due numeri separati (confidenza Wilson + rischio
-  temporale) — vedi `reliability.rs`.
-- **Cella-2** (SENZA decisione): prompt = codice + task.
-- **Cella-3** (CON decisione): prompt = codice + task + la decisione Wilson
-  («la confidenza è SOLO il Wilson lower bound, mai sostituita né fusa»).
-- **Unica differenza**: il blocco decisione. Codice e task byte-identici.
-- 2 repliche per cella. Agenti ciechi all'A/B, ISOLATI dal filesystem
-  (istruiti a non esplorare; `tool_uses` = 0 verificato → nessuna contaminazione).
-- **Criterio BINARIO pre-registrato** (scritto PRIMA delle risposte): VIOLA = la
-  modifica combina/sostituisce il Wilson in un singolo punteggio mostrato.
-
-## Risultato
-
-| Cella | Condizione | Violazioni | Cosa hanno prodotto |
+| Cell | Condition | Violations | What they produced |
 |---|---|---|---|
-| 2 rep 1 | senza decisione | VIOLA | `confidence * (1.0 - risk)` |
-| 2 rep 2 | senza decisione | VIOLA | `(confidence - risk).clamp(0,1)` |
-| 3 rep 1 | con decisione | non viola | `affidabilità = Wilson`, risk come etichetta accanto, cita la decisione |
-| 3 rep 2 | con decisione | non viola | `affidabilità = Wilson`, risk come «contesto» separato, cita la decisione |
+| 2 rep 1 | without | VIOLATES | `confidence * (1.0 - risk)` |
+| 2 rep 2 | without | VIOLATES | `(confidence - risk).clamp(0,1)` |
+| 3 rep 1 | with | does not violate | `reliability = Wilson`, risk as a label, cites the decision |
+| 3 rep 2 | with | does not violate | `reliability = Wilson`, risk as separate context, cites the decision |
 
-**Cella-2 (senza): 2/2 violano. Cella-3 (con): 0/2 violano.**
+On the SAME request and the SAME code, the only difference — the injected decision —
+flips behavior. **This is the non-derivable value of the ledger, measured under isolated
+conditions.**
 
-Sulla STESSA richiesta e lo STESSO codice, l'unica differenza — la decisione
-iniettata — ribalta il comportamento: senza, l'agente fonde i segnali (rompendo
-la calibrazione anti-falso-positivo); con, li tiene separati citando la policy.
-**Questo è il valore non-derivabile del ledger, misurato in condizioni isolate.**
+## A flawed first attempt (stated, not hidden)
 
-## Una prima esecuzione fallata (dichiarata, non nascosta)
+The FIRST attempt was contaminated: the agents ran inside the project folder and 3/4
+READ the real ledger and memory on disk — including Cell 2, which was NOT supposed to
+have them. Invalid result. Redone with explicit isolation (no filesystem),
+`tool_uses`=0. A harness bug — not a product bug — found and stated, not spun as a win.
 
-Il PRIMO tentativo era contaminato: gli agenti `general-purpose` giravano nella
-cartella del progetto e 3/4 hanno LETTO il ledger e la memoria reali su disco —
-anche la Cella-2, che NON doveva averli. Risultato invalido (la variabile non era
-isolata). Rifatto con isolamento esplicito (no filesystem), `tool_uses`=0. È lo
-stesso tipo di bug d'harness — non di prodotto — già visto nel form-feed di
-Python e nel binario stantio: trovato e dichiarato, non spacciato per vittoria.
+## Honest limits
 
-## Limiti onesti
+- **Small n** (4 agents; with the 8 from the original report: 12 total).
+- The agents are **Claude** instances (same model).
+- **A single task** (Wilson), one violation type.
+- **Judge = the benchmark author**, but with a criterion pre-registered before the
+  responses.
+- **Synthetic** substrate, chosen so the decision is genuinely non-derivable.
 
-- **n piccolo** (4 agenti; con i 8 del report originale dell'utente: 12 totali).
-- Gli agenti sono istanze **Claude** (stesso modello) — un modello diverso può
-  comportarsi diversamente.
-- **Un solo task** (la policy Wilson), un solo tipo di violazione.
-- **Giudice = autore del benchmark**, ma criterio pre-registrato prima delle
-  risposte.
-- Substrato **sintetico** (`reliability.rs` costruito senza commenti-policy):
-  scelto APPOSTA perché la decisione sia davvero non-derivabile dal codice — gli
-  agenti senza ledger hanno infatti fuso, confermando che il codice da solo non
-  bastava a prevenire la violazione.
-
-## Perché conta (la frase del report)
-
-«CodeOS vale quando il perché NON è nel codice.» Qui il perché non c'era nel
-codice (nessun commento-policy), e senza il ledger l'agente ha violato 2/2; con
-il ledger ancorato (commit 1527d64) la decisione raggiunge il pack e l'agente
-rifiuta 0/2. È il differenziatore vs un copilota che allucina perché non ha la
-memoria dell'intento.
-
-## Riproducibilità
-
-Substrato in `reliability.rs`; criterio in `CRITERIO_PRE_REGISTRATO.md`; i quattro
-prompt (2 senza decisione, 2 con) sono nel report. Per un benchmark «da big tech»
-servirebbe: più task non-derivabili, modelli multipli, giudice indipendente, n≥30.
-Questo è il seme riproducibile, non il benchmark finale.
+For a "big-tech" benchmark you would need: more non-derivable tasks, multiple models, an
+independent judge, n≥30 — which is exactly what `scaled/` does.

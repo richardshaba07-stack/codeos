@@ -1,3 +1,7 @@
+> **Note (English).** These are the **exact prompts as they were run**, in the original language (Italian, the author's working language). They are kept verbatim because the agents' responses in `risposte/` were generated from *these* prompts — editing them would break the chain of evidence. The English methodology (tasks, decisions, binary criteria) is in [`PROTOCOLLO.md`](PROTOCOLLO.md); each prompt below is just that task's substrate + request (+ decision, for Cell 3) assembled for running. The Rust substrates are language-neutral.
+
+---
+
 # Prompt pronti da eseguire — T2…T6 (T1 già fatto)
 
 > **Come si usa.** Per ogni task ci sono due prompt: **Cella-2** (senza decisione)
