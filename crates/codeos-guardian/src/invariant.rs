@@ -379,13 +379,13 @@ pub fn boundary_entities(
 /// **L'anticorpo.** Date delle relazioni *candidate* (ipotetiche o appena
 /// aggiunte) e le regole scoperte, restituisce le violazioni: ogni candidata che
 /// va nel verso proibito `upstream → downstream`.
-/// Un layer è "dentro" lo scope di una regola se ne è il layer stesso o un suo
-/// discendente nella gerarchia dei namespace (`scope::…`). Permette a una regola
-/// dichiarata a grana grossa (`core`) di governare anche le relazioni a grana fine
-/// (`core::process → ui::show`): il confine vale per l'intero sottoalbero del
-/// layer, non solo per il nodo con nome esatto. Il separatore `::` evita i falsi
-/// prefissi (`core` non cattura `coreutils`). Per le regole minate, che vivono
-/// alla stessa granularità delle entità, degrada all'uguaglianza esatta.
+/// A layer is "within" a rule's scope if it is the layer itself or a descendant of
+/// it in the namespace hierarchy (`scope::…`). This lets a coarse-grained declared
+/// rule (`core`) govern fine-grained relations too (`core::process → ui::show`): the
+/// boundary holds for the layer's entire subtree, not just the exact-name node. The
+/// `::` separator avoids false prefixes (`core` does not capture `coreutils`). For
+/// mined rules, which live at the same granularity as entities, it degrades to exact
+/// equality.
 fn layer_within(layer: &LayerKey, scope: &LayerKey) -> bool {
     layer.0 == scope.0 || layer.0.starts_with(&format!("{}::", scope.0))
 }
@@ -400,10 +400,10 @@ pub fn violations_for(
         let Some((s, t)) = cross_layer(rel, entity_layer) else {
             continue;
         };
-        // Violazione se esiste una regola il cui upstream contiene `s` e il cui
-        // downstream contiene `t` (match gerarchico): la candidata `s → t` inverte
-        // la freccia stabilita per quel confine, anche quando `s`/`t` sono più
-        // granulari della regola (es. una funzione dentro il layer governato).
+        // A violation if there is a rule whose upstream contains `s` and whose
+        // downstream contains `t` (hierarchical match): the candidate `s → t` reverses
+        // the arrow established for that boundary, even when `s`/`t` are more granular
+        // than the rule (e.g. a function inside the governed layer).
         if let Some(rule) = rules
             .iter()
             .find(|r| layer_within(s, &r.upstream) && layer_within(t, &r.downstream))

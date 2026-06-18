@@ -1131,11 +1131,12 @@ async fn resolve_target(
         if let Some(full) = ctx.namespace.get(seg) {
             let remainder = &target[seg.len()..];
             let raw = format!("{full}{remainder}");
-            // Import relativo (Python: `.mod`, `..mod`): risolvilo rispetto al package
-            // del file, NON trattando i punti come `::` — altrimenti `.sessions.Session`
-            // diventa `::sessions::Session`, che non combacia mai con l'entità reale.
+            // Relative import (Python: `.mod`, `..mod`): resolve it against the file's
+            // package, NOT treating the dots as `::` — otherwise `.sessions.Session`
+            // becomes `::sessions::Session`, which never matches the real entity.
             let candidate = if raw.starts_with('.') {
-                relative_candidate(&raw, ctx.module_prefix).unwrap_or_else(|| raw.replace('.', "::"))
+                relative_candidate(&raw, ctx.module_prefix)
+                    .unwrap_or_else(|| raw.replace('.', "::"))
             } else {
                 raw.replace('.', "::")
             };
@@ -1422,10 +1423,10 @@ fn target_candidates(target: &str, module_prefix: &str) -> Vec<String> {
 
 fn relative_candidate(target: &str, module_prefix: &str) -> Option<String> {
     let mut base: Vec<&str> = module_prefix.split("::").collect();
-    base.pop(); // file corrente → resta il package che lo contiene
+    base.pop(); // current file → keep the package that contains it
 
     if target.contains('/') {
-        // Stile JS/TS: path con slash — `./mod`, `../mod`, `../../a/b`.
+        // JS/TS style: slash path — `./mod`, `../mod`, `../../a/b`.
         let mut tail = target;
         while let Some(rest) = tail.strip_prefix("../") {
             base.pop();
@@ -1446,11 +1447,11 @@ fn relative_candidate(target: &str, module_prefix: &str) -> Option<String> {
         );
         Some(parts.join("::"))
     } else {
-        // Stile Python: import relativo a PUNTI — `.mod` (stesso package del file),
-        // `..mod` (package genitore). Il primo punto denota il package corrente; ogni
-        // punto in più sale di un livello. Il resto è separato da punti. Senza questo
-        // ramo, `.sessions` diventava `…::.sessions` (col punto dentro) e non combaciava
-        // mai: gli import relativi Python restavano tutti Unresolved.
+        // Python style: DOTTED relative import — `.mod` (same package as the file),
+        // `..mod` (parent package). The first dot denotes the current package; each
+        // extra dot goes up one level. The rest is dot-separated. Without this
+        // branch, `.sessions` became `…::.sessions` (dot inside) and never matched:
+        // Python relative imports all stayed Unresolved.
         let dots = target.chars().take_while(|&c| c == '.').count();
         if dots == 0 {
             return None;
@@ -1760,12 +1761,12 @@ fn external_dependency_root(
     }
 }
 
-/// I **builtin** del linguaggio sono il runtime, non codice del progetto: una call
-/// `isinstance(...)`/`len(...)` non è una dipendenza architetturale. Li agganciamo a
-/// un'entità esterna sintetica (`builtins`) invece di lasciarli Unresolved, così
-/// l'astensione resta solo dove c'è davvero incertezza. È un insieme **fisso e noto**:
-/// risolvere a un builtin è un fatto, non un'invenzione. Solo nomi NUDI (un nome
-/// qualificato `x.foo` non è mai un builtin).
+/// A language's **builtins** are the runtime, not project code: an `isinstance(...)` /
+/// `len(...)` call is not an architectural dependency. We attach them to a synthetic
+/// external entity (`builtins`) instead of leaving them Unresolved, so abstention
+/// stays only where there is genuine uncertainty. It is a **fixed, known** set:
+/// resolving to a builtin is a fact, not an invention. Bare names only (a qualified
+/// name `x.foo` is never a builtin).
 fn python_builtin_root(target: &str) -> Option<String> {
     if target.contains(['.', ':', '/', '(', '[', ' ']) {
         return None;
@@ -1773,8 +1774,8 @@ fn python_builtin_root(target: &str) -> Option<String> {
     is_python_builtin(target).then(|| "builtins".to_string())
 }
 
-/// Il namespace `builtins` di Python (funzioni, tipi ed eccezioni standard). Lista
-/// canonica, conservativa: solo nomi che il runtime definisce sempre.
+/// Python's `builtins` namespace (standard functions, types and exceptions). Canonical,
+/// conservative list: only names the runtime always defines.
 fn is_python_builtin(name: &str) -> bool {
     matches!(
         name,
@@ -1788,7 +1789,7 @@ fn is_python_builtin(name: &str) -> bool {
             | "pow" | "print" | "property" | "range" | "repr" | "reversed" | "round"
             | "set" | "setattr" | "slice" | "sorted" | "staticmethod" | "str" | "sum"
             | "super" | "tuple" | "type" | "vars" | "zip"
-            // eccezioni e costanti standard
+            // standard exceptions and constants
             | "BaseException" | "Exception" | "ArithmeticError" | "AssertionError"
             | "AttributeError" | "BufferError" | "EOFError" | "FloatingPointError"
             | "GeneratorExit" | "ImportError" | "ModuleNotFoundError" | "IndexError"
@@ -1802,13 +1803,13 @@ fn is_python_builtin(name: &str) -> bool {
     )
 }
 
-/// Metodi ESCLUSIVI dei tipi builtin str/bytes (`.encode`, `.strip`, `.lower`…):
-/// chiamati su un receiver di tipo ignoto sono operazioni sul runtime, non sul
-/// progetto — stesso rumore dei builtin-funzione. Li riconosciamo SOLO per nomi che
-/// un progetto non definisce mai come metodo proprio (niente `.get`/`.split`/`.items`,
-/// troppo ambigui): così zero shadow check e zero rischio di nascondere un metodo
-/// reale. Esterni → `builtins`, fuori dall'astensione. Solo forma `receiver.metodo`
-/// pulita (niente call/indici annidati nel testo del target).
+/// Methods EXCLUSIVE to the str/bytes builtin types (`.encode`, `.strip`, `.lower`…):
+/// called on a receiver of unknown type, they are operations on the runtime, not on
+/// the project — the same noise as builtin functions. We recognize them ONLY by names
+/// a project never defines as its own method (no `.get`/`.split`/`.items`, too
+/// ambiguous): so zero shadow check and zero risk of hiding a real method. External →
+/// `builtins`, outside abstention. Only the clean `receiver.method` shape (no nested
+/// calls/indexes in the target text).
 fn python_str_method_root(target: &str) -> Option<String> {
     if target.contains(['(', '[', ' ', ':']) || !target.contains('.') {
         return None;
@@ -1817,18 +1818,43 @@ fn python_str_method_root(target: &str) -> Option<String> {
     is_str_exclusive_method(method).then(|| "builtins".to_string())
 }
 
-/// Nomi di metodo che appartengono SOLO a str/bytes nello stdlib Python: un progetto
-/// non li definisce praticamente mai. Conservativa di proposito — esclusi i nomi
-/// ambigui (`split`/`replace`/`get`/`items`…) che potrebbero essere metodi reali.
+/// Method names that belong ONLY to str/bytes in the Python stdlib: a project
+/// practically never defines them. Conservative on purpose — the ambiguous names
+/// (`split`/`replace`/`get`/`items`…) that could be real methods are excluded.
 fn is_str_exclusive_method(name: &str) -> bool {
     matches!(
         name,
-        "encode" | "decode" | "strip" | "lstrip" | "rstrip" | "lower" | "upper"
-            | "casefold" | "swapcase" | "title" | "capitalize" | "startswith"
-            | "endswith" | "splitlines" | "zfill" | "ljust" | "rjust" | "center"
-            | "expandtabs" | "isalpha" | "isalnum" | "isdigit" | "isdecimal"
-            | "isnumeric" | "isspace" | "isupper" | "islower" | "istitle"
-            | "isidentifier" | "isprintable" | "isascii"
+        "encode"
+            | "decode"
+            | "strip"
+            | "lstrip"
+            | "rstrip"
+            | "lower"
+            | "upper"
+            | "casefold"
+            | "swapcase"
+            | "title"
+            | "capitalize"
+            | "startswith"
+            | "endswith"
+            | "splitlines"
+            | "zfill"
+            | "ljust"
+            | "rjust"
+            | "center"
+            | "expandtabs"
+            | "isalpha"
+            | "isalnum"
+            | "isdigit"
+            | "isdecimal"
+            | "isnumeric"
+            | "isspace"
+            | "isupper"
+            | "islower"
+            | "istitle"
+            | "isidentifier"
+            | "isprintable"
+            | "isascii"
     )
 }
 

@@ -52,12 +52,12 @@ pub fn load_declared_rules(config_path: &Path) -> Vec<LayeringRule> {
     }
 }
 
-/// Legge un eventuale `layer_depth: N` dalla config: la profondità con cui i
-/// `qualified_name` vengono raggruppati in layer. Serve quando il default non si
-/// adatta all'annidamento del progetto — es. un layout `src/pkg/` collassa l'intero
-/// package in un solo layer (`src::pkg`), rendendo invisibili i confini fra moduli.
-/// `None` se assente/non valido ⇒ si usa il default. Parser minimale e indipendente
-/// dalle regole (cerca la chiave ovunque, indentata o no), coerente con lo stile.
+/// Reads an optional `layer_depth: N` from the config: the depth at which
+/// `qualified_name`s are grouped into layers. Needed when the default doesn't fit
+/// the project's nesting — e.g. a `src/pkg/` layout collapses the whole package into
+/// a single layer (`src::pkg`), making the boundaries between modules invisible.
+/// `None` if absent/invalid ⇒ the default is used. Minimal parser, independent of
+/// the rules (looks for the key anywhere, indented or not), consistent with the style.
 pub fn declared_layer_depth(yaml: &str) -> Option<usize> {
     yaml.lines().find_map(|line| {
         line.trim()

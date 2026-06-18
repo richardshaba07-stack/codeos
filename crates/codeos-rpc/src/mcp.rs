@@ -87,19 +87,19 @@ pub async fn handle(request: Value) -> Option<Value> {
                     "name": "codeos",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
-                // Guida globale letta dall'host all'handshake (Codex e altri la
-                // incorporano come istruzioni permanenti): COME e QUANDO usare CodeOS,
-                // con la semantica anti-FP resa esplicita all'agente.
-                "instructions": "CodeOS è il tuo guardrail architetturale, locale e \
-                    deterministico (non un altro LLM: un verificatore indipendente). \
-                    PRIMA di proporre una modifica o una PR chiama codeos_certify; DOPO \
-                    aver editato chiama codeos_guard per le violazioni introdotte. PRIMA \
-                    di toccare un'area, leggi le decisioni registrate con codeos_why e \
-                    codeos_context_pack (evita di contraddire scelte già prese). \
-                    Semantica NON negoziabile: ✅ o una risposta vuota significano «non \
-                    rilevato rispetto agli invarianti noti», MAI «provato sicuro»; ⚠️ \
-                    indica un confine governato attraversato, sempre con la citazione. \
-                    Sezioni assenti = il grafo non lo sa, mai inventate."
+                // Global guidance read by the host at handshake (Codex and others
+                // embed it as permanent instructions): HOW and WHEN to use CodeOS,
+                // with the anti-FP semantics made explicit to the agent.
+                "instructions": "CodeOS is your architectural guardrail: local and \
+                    deterministic (not another LLM, but an independent verifier). \
+                    BEFORE proposing a change or a PR, call codeos_certify; AFTER \
+                    editing, call codeos_guard for the violations you introduced. BEFORE \
+                    touching an area, read the recorded decisions with codeos_why and \
+                    codeos_context_pack (avoid contradicting choices already made). \
+                    NON-NEGOTIABLE semantics: ✅ or an empty answer mean «not detected \
+                    against the known invariants», NEVER «proven safe»; ⚠️ marks a \
+                    governed boundary that was crossed, always with the citation. \
+                    Missing sections = the graph doesn't know it, never invented."
             }))
         }
         "ping" => Ok(json!({})),
@@ -224,7 +224,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "codeos_guard",
-            "description": "DOPO aver modificato il codice: rileva le violazioni architetturali INTRODOTTE dalle modifiche più recenti — una dipendenza che attraversa un confine governato o inverte un layer (il fallimento «boundary ignorance» degli agenti). Per ogni violazione: posizione (file:riga) e la regola citata. Risposta «nessuna violazione» = non rilevata rispetto agli invarianti noti, MAI «provato sicuro». Sola lettura, auto-approvabile: chiamalo prima di concludere/committare una modifica.",
+            "description": "AFTER editing code: detects the architectural violations INTRODUCED by the most recent changes — a dependency that crosses a governed boundary or inverts a layer (the agents' «boundary ignorance» failure). For each violation: location (file:line) and the cited rule. A «no violations» answer = not detected against the known invariants, NEVER «proven safe». Read-only, safe to auto-approve: call it before concluding/committing a change.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
@@ -485,21 +485,23 @@ async fn dispatch_tool(name: &str, args: &Value) -> anyhow::Result<String> {
             Ok(out)
         }
         "codeos_guard" => {
-            // Violazioni INTRODOTTE dall'ultima modifica (guard_after sul server):
-            // il guardrail del loop dell'agente, speculare a codeos_certify (che
-            // lavora su un diff base..head). Riusa lo stesso `check` di certify.
+            // Violations INTRODUCED by the latest change (guard_after on the server):
+            // the agent-loop guardrail, mirror of codeos_certify (which works on a
+            // base..head diff). Reuses certify's same `check`.
             let mut client = connect_server().await?;
             let res = client
                 .guard_after(proto::GuardAfterRequest {})
                 .await?
                 .into_inner();
             if res.violations.is_empty() {
-                Ok("✅ Nessuna violazione architetturale introdotta (rispetto agli \
-                    invarianti noti; non è prova di assenza di bug)."
-                    .to_string())
+                Ok(
+                    "✅ No architectural violation introduced (against the known \
+                    invariants; not proof of the absence of bugs)."
+                        .to_string(),
+                )
             } else {
                 let mut out = format!(
-                    "⚠️ {} violazione/i architetturale/i introdotta/e dalla modifica:\n",
+                    "⚠️ {} architectural violation(s) introduced by the change:\n",
                     res.violations.len()
                 );
                 for vio in &res.violations {
@@ -507,11 +509,11 @@ async fn dispatch_tool(name: &str, args: &Value) -> anyhow::Result<String> {
                         .location
                         .as_ref()
                         .map(|l| format!("{}:{}", l.file_path, l.start_line))
-                        .unwrap_or_else(|| "posizione sconosciuta".to_string());
+                        .unwrap_or_else(|| "unknown location".to_string());
                     out.push_str(&format!("- [{}] {}\n", loc, vio.message));
                 }
                 if !res.proposed_fixes.is_empty() {
-                    out.push_str("Correzioni proposte:\n");
+                    out.push_str("Proposed fixes:\n");
                     for fix in &res.proposed_fixes {
                         out.push_str(&format!("- {fix}\n"));
                     }

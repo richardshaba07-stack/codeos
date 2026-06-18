@@ -786,8 +786,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         "abstention" => {
-            // Profilo delle relazioni NON risolte: dove (e perché) il grafo si astiene.
-            // Sola lettura del DB (CODEOS_DB), mai il server — come audit/learn.
+            // Profile of UNRESOLVED relations: where (and why) the graph abstains.
+            // Read-only on the DB (CODEOS_DB), never the server — like audit/learn.
             abstention_report().await?;
         }
         "help" | "--help" | "-h" => {
@@ -803,46 +803,47 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Classifica un'astensione dal solo testo del target non risolto — buckets ONESTI
-/// (per forma sintattica), con un secchio "ignoto" invece di indovinare. Mappano sulla
-/// tassonomia A/B/C: dicono DOVE vale la pena chiudere il buco.
+/// Classifies an abstention from the unresolved-target text alone — HONEST buckets
+/// (by syntactic shape), with an "unknown" bucket instead of guessing. They map onto
+/// the A/B/C taxonomy: they say WHERE it's worth closing the gap.
 fn classify_abstention(target: &str) -> &'static str {
     if target.is_empty() {
-        "ignoto (nessun target registrato)"
+        "unknown (no target recorded)"
     } else if target.starts_with('.') {
-        "A · import relativo (alias/residuo)"
+        "A · relative import (alias/leftover)"
     } else if target.contains("getattr")
         || target.contains("setattr")
         || target.contains("eval")
         || target.contains('[')
         || target.contains('(')
     {
-        "C · dinamico/annidato (spesso astensione ONESTA)"
+        "C · dynamic/nested (often an HONEST abstention)"
     } else if target.contains('.') || target.contains("::") {
-        "B · chiamata qualificata a.b (serve il tipo del receiver)"
+        "B · qualified call a.b (needs the receiver's type)"
     } else {
-        "bare · nome semplice (scope/esterno)"
+        "bare · plain name (scope/external)"
     }
 }
 
-/// Comando `abstention`: legge il grafo persistito (CODEOS_DB) e profila le relazioni
-/// `Unresolved` per categoria + i target più frequenti. Misura, non indovina: ogni
-/// astensione è un arco mancante (mai uno che mente), e la categoria dice dove agire.
+/// `abstention` command: reads the persisted graph (CODEOS_DB) and profiles the
+/// `Unresolved` relations by category + the most frequent targets. It measures, it
+/// doesn't guess: every abstention is a missing edge (never a lying one), and the
+/// category says where to act.
 async fn abstention_report() -> anyhow::Result<()> {
     use codeos_storage::{GraphStorage, RelationFilter, SqliteStorage};
     use std::collections::HashMap;
 
     let db = std::env::var("CODEOS_DB").map_err(|_| {
         anyhow::anyhow!(
-            "`abstention` legge il grafo persistito: imposta CODEOS_DB=<file.db> (lo stesso \
-             usato per `index`) e riprova. (Con grafo in memoria non c'è nulla da leggere.)"
+            "`abstention` reads the persisted graph: set CODEOS_DB=<file.db> (the same one \
+             used for `index`) and retry. (With an in-memory graph there is nothing to read.)"
         )
     })?;
     let storage = SqliteStorage::open(&db)?;
     let relations = storage.query_relations(RelationFilter::default()).await?;
     let total = relations.len();
     if total == 0 {
-        println!("Grafo vuoto in {db}: indicizza prima con `codeos index <path>` (stesso CODEOS_DB).");
+        println!("Empty graph in {db}: index first with `codeos index <path>` (same CODEOS_DB).");
         return Ok(());
     }
 
@@ -866,22 +867,22 @@ async fn abstention_report() -> anyhow::Result<()> {
     let resolved = total - unresolved;
     let pct = resolved * 100 / total;
 
-    println!("🔎 CODEOS ABSTENTION — profilo delle relazioni non risolte");
+    println!("🔎 CODEOS ABSTENTION — profile of unresolved relations");
     println!("---------------------------------------------------------");
-    println!("Relazioni: {total} totali · {resolved} risolte ({pct}%) · {unresolved} astenute");
+    println!("Relations: {total} total · {resolved} resolved ({pct}%) · {unresolved} abstained");
     if unresolved == 0 {
-        println!("\n✅ Nessuna astensione in questo grafo.");
+        println!("\n✅ No abstention in this graph.");
         return Ok(());
     }
 
-    println!("\nAstensioni per categoria (dove vale la pena chiudere il buco):");
+    println!("\nAbstentions by category (where it's worth closing the gap):");
     let mut by_cat: Vec<(&str, usize)> = buckets.into_iter().collect();
-    by_cat.sort_by(|a, b| b.1.cmp(&a.1));
+    by_cat.sort_by_key(|b| std::cmp::Reverse(b.1));
     for (cat, n) in &by_cat {
         println!("  {n:>5}  ({:>2}%)  {cat}", n * 100 / unresolved);
     }
 
-    println!("\nTarget non risolti più frequenti:");
+    println!("\nMost frequent unresolved targets:");
     let mut top: Vec<(String, usize)> = targets.into_iter().collect();
     top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     for (t, n) in top.into_iter().take(12) {
@@ -889,9 +890,9 @@ async fn abstention_report() -> anyhow::Result<()> {
     }
 
     println!(
-        "\n(Ogni astensione è un riferimento visto ma non agganciato a un omonimo certo:\n \
-         un arco mancante, mai un arco che mente. La categoria dice dove agire — B = tipi, \
-         A = import, C = dinamico/onesto.)"
+        "\n(Every abstention is a reference seen but not attached to a certain namesake:\n \
+         a missing edge, never a lying one. The category says where to act — B = types, \
+         A = imports, C = dynamic/honest.)"
     );
     Ok(())
 }
@@ -1224,7 +1225,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "abstention",
-        "Profila le relazioni NON risolte del grafo persistito (CODEOS_DB) per categoria (B tipo-receiver / A import / C dinamico / bare) + i target più frequenti. Misura DOVE il grafo si astiene, per sapere dove chiudere il buco. Sola lettura, mai il server.",
+        "Profiles the UNRESOLVED relations of the persisted graph (CODEOS_DB) by category (B receiver-type / A import / C dynamic / bare) + the most frequent targets. Measures WHERE the graph abstains, so you know where to close the gap. Read-only, never the server.",
     ),
     (
         "simulate \"move <src> to <dst>\"",
@@ -2114,8 +2115,24 @@ mod tests {
     fn usage_documents_every_implemented_command() {
         let usage = usage_text();
         for cmd in [
-            "index", "report", "query", "path", "impact", "doctor", "guard", "context", "mri",
-            "why", "simulate", "help", "decide", "mcp", "licenses", "learn", "audit", "certify",
+            "index",
+            "report",
+            "query",
+            "path",
+            "impact",
+            "doctor",
+            "guard",
+            "context",
+            "mri",
+            "why",
+            "simulate",
+            "help",
+            "decide",
+            "mcp",
+            "licenses",
+            "learn",
+            "audit",
+            "certify",
             "abstention",
         ] {
             assert!(
