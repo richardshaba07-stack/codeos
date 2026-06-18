@@ -1750,12 +1750,55 @@ fn external_dependency_root(
 ) -> Option<String> {
     match language {
         "rust" => external_root_rust(target, is_import),
-        "python" => external_root_python(target, namespace, is_import),
+        "python" => external_root_python(target, namespace, is_import)
+            .or_else(|| python_builtin_root(target)),
         // Per il web trattiamo come esterni solo gli import di pacchetti (bare
         // specifier); le call non risolte restano Unresolved.
         "typescript" | "javascript" if is_import => external_root_web(target),
         _ => None,
     }
+}
+
+/// I **builtin** del linguaggio sono il runtime, non codice del progetto: una call
+/// `isinstance(...)`/`len(...)` non è una dipendenza architetturale. Li agganciamo a
+/// un'entità esterna sintetica (`builtins`) invece di lasciarli Unresolved, così
+/// l'astensione resta solo dove c'è davvero incertezza. È un insieme **fisso e noto**:
+/// risolvere a un builtin è un fatto, non un'invenzione. Solo nomi NUDI (un nome
+/// qualificato `x.foo` non è mai un builtin).
+fn python_builtin_root(target: &str) -> Option<String> {
+    if target.contains(['.', ':', '/', '(', '[', ' ']) {
+        return None;
+    }
+    is_python_builtin(target).then(|| "builtins".to_string())
+}
+
+/// Il namespace `builtins` di Python (funzioni, tipi ed eccezioni standard). Lista
+/// canonica, conservativa: solo nomi che il runtime definisce sempre.
+fn is_python_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "abs" | "aiter" | "all" | "anext" | "any" | "ascii" | "bin" | "bool"
+            | "breakpoint" | "bytearray" | "bytes" | "callable" | "chr" | "classmethod"
+            | "compile" | "complex" | "delattr" | "dict" | "dir" | "divmod" | "enumerate"
+            | "eval" | "exec" | "filter" | "float" | "format" | "frozenset" | "getattr"
+            | "globals" | "hasattr" | "hash" | "help" | "hex" | "id" | "input" | "int"
+            | "isinstance" | "issubclass" | "iter" | "len" | "list" | "locals" | "map"
+            | "max" | "memoryview" | "min" | "next" | "object" | "oct" | "open" | "ord"
+            | "pow" | "print" | "property" | "range" | "repr" | "reversed" | "round"
+            | "set" | "setattr" | "slice" | "sorted" | "staticmethod" | "str" | "sum"
+            | "super" | "tuple" | "type" | "vars" | "zip"
+            // eccezioni e costanti standard
+            | "BaseException" | "Exception" | "ArithmeticError" | "AssertionError"
+            | "AttributeError" | "BufferError" | "EOFError" | "FloatingPointError"
+            | "GeneratorExit" | "ImportError" | "ModuleNotFoundError" | "IndexError"
+            | "KeyError" | "KeyboardInterrupt" | "LookupError" | "MemoryError"
+            | "NameError" | "NotImplementedError" | "OSError" | "OverflowError"
+            | "RecursionError" | "ReferenceError" | "RuntimeError" | "StopIteration"
+            | "StopAsyncIteration" | "SyntaxError" | "IndentationError" | "TabError"
+            | "SystemError" | "SystemExit" | "TypeError" | "UnboundLocalError"
+            | "UnicodeError" | "ValueError" | "ZeroDivisionError" | "FileNotFoundError"
+            | "PermissionError" | "NotImplemented" | "Ellipsis"
+    )
 }
 
 /// Rust: `tokio::sync::mpsc` → `tokio`. Esclude le keyword di path relative al
