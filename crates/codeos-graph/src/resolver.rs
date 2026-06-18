@@ -1130,7 +1130,15 @@ async fn resolve_target(
     if let Some(seg) = first_segment(target) {
         if let Some(full) = ctx.namespace.get(seg) {
             let remainder = &target[seg.len()..];
-            let candidate = format!("{full}{remainder}").replace('.', "::");
+            let raw = format!("{full}{remainder}");
+            // Import relativo (Python: `.mod`, `..mod`): risolvilo rispetto al package
+            // del file, NON trattando i punti come `::` — altrimenti `.sessions.Session`
+            // diventa `::sessions::Session`, che non combacia mai con l'entità reale.
+            let candidate = if raw.starts_with('.') {
+                relative_candidate(&raw, ctx.module_prefix).unwrap_or_else(|| raw.replace('.', "::"))
+            } else {
+                raw.replace('.', "::")
+            };
             if let Some(id) = lookup_exact(
                 &candidate,
                 ctx.language,
@@ -1414,26 +1422,54 @@ fn target_candidates(target: &str, module_prefix: &str) -> Vec<String> {
 
 fn relative_candidate(target: &str, module_prefix: &str) -> Option<String> {
     let mut base: Vec<&str> = module_prefix.split("::").collect();
-    base.pop(); // file corrente
-    let mut tail = target;
-    while let Some(rest) = tail.strip_prefix("../") {
-        base.pop();
-        tail = rest;
+    base.pop(); // file corrente → resta il package che lo contiene
+
+    if target.contains('/') {
+        // Stile JS/TS: path con slash — `./mod`, `../mod`, `../../a/b`.
+        let mut tail = target;
+        while let Some(rest) = tail.strip_prefix("../") {
+            base.pop();
+            tail = rest;
+        }
+        while let Some(rest) = tail.strip_prefix("./") {
+            tail = rest;
+        }
+        let tail = strip_known_extension(tail);
+        if tail.is_empty() {
+            return None;
+        }
+        let mut parts: Vec<String> = base.into_iter().map(str::to_string).collect();
+        parts.extend(
+            tail.split('/')
+                .filter(|seg| !seg.is_empty() && *seg != ".")
+                .map(str::to_string),
+        );
+        Some(parts.join("::"))
+    } else {
+        // Stile Python: import relativo a PUNTI — `.mod` (stesso package del file),
+        // `..mod` (package genitore). Il primo punto denota il package corrente; ogni
+        // punto in più sale di un livello. Il resto è separato da punti. Senza questo
+        // ramo, `.sessions` diventava `…::.sessions` (col punto dentro) e non combaciava
+        // mai: gli import relativi Python restavano tutti Unresolved.
+        let dots = target.chars().take_while(|&c| c == '.').count();
+        if dots == 0 {
+            return None;
+        }
+        for _ in 0..dots.saturating_sub(1) {
+            base.pop();
+        }
+        let mut parts: Vec<String> = base.into_iter().map(str::to_string).collect();
+        parts.extend(
+            target[dots..]
+                .split('.')
+                .filter(|seg| !seg.is_empty())
+                .map(str::to_string),
+        );
+        if parts.is_empty() {
+            return None;
+        }
+        Some(parts.join("::"))
     }
-    while let Some(rest) = tail.strip_prefix("./") {
-        tail = rest;
-    }
-    let tail = strip_known_extension(tail);
-    if tail.is_empty() {
-        return None;
-    }
-    let mut parts: Vec<String> = base.into_iter().map(str::to_string).collect();
-    parts.extend(
-        tail.split('/')
-            .filter(|seg| !seg.is_empty() && *seg != ".")
-            .map(str::to_string),
-    );
-    Some(parts.join("::"))
 }
 
 fn strip_known_extension(path: &str) -> &str {
