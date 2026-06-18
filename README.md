@@ -1,5 +1,6 @@
 # CodeOS
 
+[![CI](https://github.com/richardshaba07-stack/codeos/actions/workflows/ci.yml/badge.svg)](https://github.com/richardshaba07-stack/codeos/actions/workflows/ci.yml)
 [![CodeOS](https://img.shields.io/endpoint?url=https://richardshaba07-stack.github.io/codeos/badge.json)](https://github.com/richardshaba07-stack/codeos/actions)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 
@@ -9,6 +10,15 @@ A **local, deterministic guardrail** that catches the moment an AI coding agent 
 your architecture — with a citation, and exiting non-zero — and never guesses to do it:
 
 ![CodeOS stops an AI agent from introducing a forbidden dependency, with a cited verdict](docs/demo.gif)
+
+> [!NOTE]
+> **Does the recorded "why" actually change what an agent does? Measured, not claimed.**
+> In a **pre-registered, blind-judged** benchmark (n=36), an AI agent violated a
+> non-derivable policy **18/18 times without** CodeOS's recorded intent — and **0/18
+> with it.** The protocol, the exact prompts, the synthetic substrates, and the **raw
+> agent responses + the blind judge's verdicts** are all in **[`benchmark/`](benchmark/)**
+> — verifiable, not on faith. (Honest scope: one model family, synthetic substrates;
+> cross-model generalization is future work.)
 
 CodeOS builds a **living semantic graph** of a codebase to answer two questions no
 linter can ask:
