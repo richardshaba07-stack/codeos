@@ -1800,7 +1800,8 @@ fn external_dependency_root(
         "rust" => external_root_rust(target, is_import),
         "python" => external_root_python(target, namespace, is_import)
             .or_else(|| python_builtin_root(target))
-            .or_else(|| python_str_method_root(target)),
+            .or_else(|| python_str_method_root(target))
+            .or_else(|| python_literal_receiver_root(target)),
         // Per il web trattiamo come esterni solo gli import di pacchetti (bare
         // specifier); le call non risolte restano Unresolved.
         "typescript" | "javascript" if is_import => external_root_web(target),
@@ -1863,6 +1864,36 @@ fn python_str_method_root(target: &str) -> Option<String> {
     }
     let method = target.rsplit('.').next()?;
     is_str_exclusive_method(method).then(|| "builtins".to_string())
+}
+
+/// A method called on a **literal** receiver has a PROVEN type: you cannot define a
+/// method on a `""`/`b""` string or a `[]`/`{}`/`()` container literal, so `"".join`,
+/// `[].append`, `{}.get` are runtime (stdlib) operations, never project code. Unlike
+/// [`python_str_method_root`] — which must stay conservative because the receiver type
+/// is UNKNOWN — here the literal removes all ambiguity, so ANY method resolves to
+/// `builtins`, including the otherwise-ambiguous `.get`/`.split`/`.items`. Only the
+/// clean `<literal>.<method>` shape: the method must be a single segment (no further
+/// chain/call/index), and a string with an embedded `.` (`"a.b".split`) fails the
+/// literal check on the split fragment ⇒ we abstain rather than mis-split it.
+fn python_literal_receiver_root(target: &str) -> Option<String> {
+    let (receiver, method) = target.split_once('.')?;
+    if method.is_empty() || method.contains(['.', '(', '[', ':', ' ']) {
+        return None;
+    }
+    is_python_literal(receiver).then(|| "builtins".to_string())
+}
+
+/// `true` if `s` is a Python literal whose type is CERTAIN: a string/bytes literal
+/// (optionally prefixed `r`/`b`/`f`/`u`, any case) or an empty container literal
+/// (`[]`/`{}`/`()`). Numbers are excluded on purpose: `1.5` would split on the dot and
+/// is too rare a call receiver to be worth the ambiguity.
+fn is_python_literal(s: &str) -> bool {
+    if matches!(s, "[]" | "{}" | "()") {
+        return true;
+    }
+    let body = s.trim_start_matches(['r', 'R', 'b', 'B', 'f', 'F', 'u', 'U']);
+    let quoted = |q: char| body.len() >= 2 && body.starts_with(q) && body.ends_with(q);
+    quoted('"') || quoted('\'')
 }
 
 /// Method names that belong ONLY to str/bytes in the Python stdlib: a project
@@ -2754,6 +2785,78 @@ class B:\n    def send(self):\n        pass\n\n    def go(self):\n        self.s
                 .iter()
                 .any(|r| r.kind == RelationKind::Calls && r.source_id == go.id),
             "HashMap::new non deve risolvere a un'entità interna"
+        );
+    }
+
+    #[test]
+    fn literal_receiver_methods_resolve_to_builtins_for_any_method() {
+        // Type proven by the literal ⇒ even the otherwise-ambiguous methods
+        // (.get/.split/.items) are safe to externalize.
+        for t in [
+            "\"\".join",
+            "''.split",
+            "b\"\".decode",
+            "[].append",
+            "{}.get",
+            "{}.items",
+            "().count",
+            "r\"\".strip",
+        ] {
+            assert_eq!(
+                python_literal_receiver_root(t).as_deref(),
+                Some("builtins"),
+                "literal receiver `{t}` must externalize"
+            );
+        }
+        // NOT a literal receiver: a plain variable (unknown type), an embedded-dot string
+        // (mis-split ⇒ abstain), or a chained/call form.
+        for t in [
+            "x.get",
+            "kwargs.setdefault",
+            "\"a.b\".split",
+            "\"\".join.strip",
+            "\"\".join(",
+            "self.send",
+        ] {
+            assert_eq!(
+                python_literal_receiver_root(t),
+                None,
+                "`{t}` must NOT be treated as a literal receiver"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn string_literal_method_call_resolves_to_external_builtins() {
+        // `"".join(parts)` — the receiver is a str literal, so `join` is a stdlib method,
+        // never project code. It must resolve to the synthetic external `builtins`, not
+        // stay Unresolved (and never bind to a project entity).
+        let parsed = vec![parse("m.py", "def go(parts):\n    \"\".join(parts)\n").await];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+        let go = find(&delta, "m::go");
+
+        let join_call = delta
+            .added_relations
+            .iter()
+            .find(|r| r.source_id == go.id && r.kind == RelationKind::Calls)
+            .expect("\"\".join must resolve to external builtins, not stay Unresolved");
+        assert_eq!(
+            join_call
+                .metadata
+                .get("external_target")
+                .map(String::as_str),
+            Some("\"\".join"),
+            "the external edge must record the literal call target"
+        );
+        assert!(
+            !delta
+                .added_relations
+                .iter()
+                .any(|r| r.source_id == go.id && r.kind == RelationKind::Unresolved),
+            "no honest hole left for a proven-type literal call"
         );
     }
 
