@@ -281,6 +281,18 @@ impl Guardian {
         self
     }
 
+    /// Imposta la profondità di raggruppamento dei `qualified_name` in layer
+    /// (tipicamente da `layer_depth` in `.codeos/config.yaml`). Chainable. Serve ad
+    /// adattare la granularità all'annidamento del progetto: un layout `src/pkg/`
+    /// richiede una profondità maggiore per distinguere i moduli invece di
+    /// collassarli tutti in `src::pkg`. Ignora valori 0 (un layer vuoto non ha senso).
+    pub fn with_layer_depth(mut self, depth: usize) -> Self {
+        if depth >= 1 {
+            self.config.layer_depth = depth;
+        }
+        self
+    }
+
     /// Fonde le regole **dichiarate** con quelle passate (scoperte), senza duplicare
     /// una coppia `(upstream, downstream)` già presente: se l'umano dichiara un
     /// confine che il grafo ha già dissotterrato, vince la versione scoperta (porta

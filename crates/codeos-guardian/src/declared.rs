@@ -52,6 +52,28 @@ pub fn load_declared_rules(config_path: &Path) -> Vec<LayeringRule> {
     }
 }
 
+/// Legge un eventuale `layer_depth: N` dalla config: la profondità con cui i
+/// `qualified_name` vengono raggruppati in layer. Serve quando il default non si
+/// adatta all'annidamento del progetto — es. un layout `src/pkg/` collassa l'intero
+/// package in un solo layer (`src::pkg`), rendendo invisibili i confini fra moduli.
+/// `None` se assente/non valido ⇒ si usa il default. Parser minimale e indipendente
+/// dalle regole (cerca la chiave ovunque, indentata o no), coerente con lo stile.
+pub fn declared_layer_depth(yaml: &str) -> Option<usize> {
+    yaml.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("layer_depth:")
+            .and_then(|rest| rest.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+    })
+}
+
+/// Carica `layer_depth` da `<repo>/.codeos/config.yaml`. `None` se assente/illeggibile.
+pub fn load_layer_depth(config_path: &Path) -> Option<usize> {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|t| declared_layer_depth(&t))
+}
+
 /// Converte il testo YAML della config nelle [`LayeringRule`] dichiarate, pronte da
 /// fondere con quelle scoperte. Confidenza 1.0 (decreto umano), origine `Declared`.
 pub fn declared_layering_rules(yaml: &str) -> Vec<LayeringRule> {
