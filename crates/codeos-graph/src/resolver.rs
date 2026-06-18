@@ -111,8 +111,21 @@ impl GraphResolver {
             // Passo 1 — Creazione entità + costruzione della mappa local_id→EntityId.
             let mut local_map: HashMap<String, EntityId> = HashMap::new();
             let mut local_qname: HashMap<String, String> = HashMap::new();
+            let mut local_varargs: HashMap<String, (Option<String>, Option<String>)> =
+                HashMap::new();
             for parsed in &file.entities {
                 let qname = self.qualified_name(parsed, &module_prefix, &local_qname);
+
+                // Splat params of this function (if any): the parser stamped `*args`/
+                // `**kwargs` names, whose receiver type is guaranteed. Keyed by the
+                // parser's local_id so Passo 3 can look them up by the call's source.
+                let varargs = (
+                    parsed.metadata.get("args_param").cloned(),
+                    parsed.metadata.get("kwargs_param").cloned(),
+                );
+                if varargs.0.is_some() || varargs.1.is_some() {
+                    local_varargs.insert(parsed.local_id.clone(), varargs);
+                }
 
                 // Anti-collisione di identità: due entità con lo STESSO
                 // qualified_name nascono quando il sorgente ha varianti cfg
@@ -237,6 +250,7 @@ impl GraphResolver {
                 language: detect_language(&file.file_path),
                 local_map,
                 local_qname,
+                local_varargs,
                 namespace,
                 relations: file.relations.clone(),
             });
@@ -307,7 +321,14 @@ impl GraphResolver {
                     continue;
                 };
 
-                let mut resolved = resolve_target(&rctx, &target, parsed.kind).await?;
+                let source_qname = ctx.local_qname.get(&parsed.source_local_id);
+                let mut resolved = resolve_target(
+                    &rctx,
+                    &target,
+                    parsed.kind,
+                    source_qname.map(String::as_str),
+                )
+                .await?;
 
                 // Una chiamata con receiver PUNTATO (`x.foo()`) non può mai essere la
                 // ricorsione dell'entità chiamante: la ricorsione vera si scrive
@@ -425,12 +446,21 @@ impl GraphResolver {
                         let ext = if root_is_local_module {
                             None
                         } else {
-                            external_dependency_root(
-                                &target,
+                            // Passo 3.4-bis — receiver `**kwargs`/`*args` del chiamante:
+                            // tipo provato dalla firma → metodo-container su `builtins`.
+                            kwargs_args_method_root(
                                 &ctx.language,
-                                &ctx.namespace,
-                                parsed.kind == RelationKind::Imports,
+                                &target,
+                                ctx.local_varargs.get(&parsed.source_local_id),
                             )
+                            .or_else(|| {
+                                external_dependency_root(
+                                    &target,
+                                    &ctx.language,
+                                    &ctx.namespace,
+                                    parsed.kind == RelationKind::Imports,
+                                )
+                            })
                         };
                         match ext {
                             Some(root) => {
@@ -818,6 +848,10 @@ struct FileContext {
     /// `local_id → qualified_name` delle entità del file: nel Passo 3 dà il
     /// `source_qname` dell'arco (identità stabile lato sorgente) senza ricostruirlo.
     local_qname: HashMap<String, String>,
+    /// `local_id → (args_param, kwargs_param)` per le funzioni con parametri splat
+    /// (`*args` tuple / `**kwargs` dict): tipo del receiver noto dalla firma, usato nel
+    /// Passo 3.4 per esternalizzare i metodi-container chiamati su di essi.
+    local_varargs: HashMap<String, (Option<String>, Option<String>)>,
     namespace: HashMap<String, String>,
     relations: Vec<codeos_types::ParsedRelation>,
 }
@@ -1079,6 +1113,7 @@ async fn resolve_target(
     ctx: &ResolutionContext<'_>,
     target: &str,
     kind: RelationKind,
+    source_qname: Option<&str>,
 ) -> anyhow::Result<Option<(EntityId, ResolutionStrategy)>> {
     // 0 — Import path normalisation. I parser mantengono i target come li scrive
     // il linguaggio (`crate::x`, `codeos_types::x`, `./client`); qui li traduciamo
@@ -1180,6 +1215,37 @@ async fn resolve_target(
             let colon = target.replace('.', "::");
             if let Some(id) = unique_internal_match(&caller_prefix, &colon, ctx).await? {
                 return Ok(Some((id, ResolutionStrategy::SameModule)));
+            }
+        }
+    }
+
+    // 2.6 — `self.<method>` / `this.<method>` / `cls.<method>`: the receiver is the
+    // CLASS enclosing the call, known with CERTAINTY (it is the calling entity), not a
+    // variable of unknown type. We resolve to the EXACT entity `<class>::<method>`,
+    // deriving the class from the source's `qualified_name` (whose leaf is the calling
+    // method). It is a PROVEN type, not a guess: high-confidence, like an exact match.
+    // Anti-FP: ONLY if that entity actually exists — an INHERITED method (e.g.
+    // `self.update` in a dict subclass that doesn't override it) won't match and stays
+    // an honest hole, never an invented edge. `super` is EXCLUDED on purpose: it denotes
+    // the PARENT class, not the enclosing one (that would need the class hierarchy).
+    // Only the DIRECT 2-segment form: chains `self.attr.method` (≥3 segments) have the
+    // attribute as receiver, of unknown type, and stay abstained (guard below).
+    if matches!(ctx.language, "python" | "typescript" | "javascript") {
+        let segs: Vec<&str> = target.split('.').filter(|s| !s.is_empty()).collect();
+        if segs.len() == 2 && matches!(segs[0], "self" | "this" | "cls") {
+            if let Some(class) = source_qname.and_then(enclosing_scope) {
+                let candidate = format!("{class}::{}", segs[1]);
+                if let Some(id) = lookup_exact(
+                    &candidate,
+                    ctx.language,
+                    ctx.new_by_qname,
+                    ctx.new_by_id_lang,
+                    ctx.storage,
+                )
+                .await?
+                {
+                    return Ok(Some((id, ResolutionStrategy::Exact)));
+                }
             }
         }
     }
@@ -1646,6 +1712,14 @@ fn last_segment(target: &str) -> Option<&str> {
     target.rsplit(['.', ':']).find(|s| !s.is_empty())
 }
 
+/// The scope (class/module) enclosing an entity = its `qualified_name` without the
+/// leaf: `src::requests::sessions::Session::send` → `…::Session`. `None` if there is no
+/// `::` (top-level entity, no enclosing scope). Used to resolve `self.<method>` to the
+/// caller's class.
+fn enclosing_scope(qname: &str) -> Option<&str> {
+    qname.rsplit_once("::").map(|(head, _)| head)
+}
+
 /// Receiver che denota il TIPO che racchiude la call — `this.foo()`, `super.bar()`
 /// e gli equivalenti `self`/`Self`/`cls` di altri linguaggi: il tipo del receiver è
 /// noto (è l'entità chiamante), quindi il guard anti-membro del Fix #10 NON si
@@ -1753,7 +1827,8 @@ fn external_dependency_root(
         "rust" => external_root_rust(target, is_import),
         "python" => external_root_python(target, namespace, is_import)
             .or_else(|| python_builtin_root(target))
-            .or_else(|| python_str_method_root(target)),
+            .or_else(|| python_str_method_root(target))
+            .or_else(|| python_literal_receiver_root(target)),
         // Per il web trattiamo come esterni solo gli import di pacchetti (bare
         // specifier); le call non risolte restano Unresolved.
         "typescript" | "javascript" if is_import => external_root_web(target),
@@ -1816,6 +1891,85 @@ fn python_str_method_root(target: &str) -> Option<String> {
     }
     let method = target.rsplit('.').next()?;
     is_str_exclusive_method(method).then(|| "builtins".to_string())
+}
+
+/// A method called on a **literal** receiver has a PROVEN type: you cannot define a
+/// method on a `""`/`b""` string or a `[]`/`{}`/`()` container literal, so `"".join`,
+/// `[].append`, `{}.get` are runtime (stdlib) operations, never project code. Unlike
+/// [`python_str_method_root`] — which must stay conservative because the receiver type
+/// is UNKNOWN — here the literal removes all ambiguity, so ANY method resolves to
+/// `builtins`, including the otherwise-ambiguous `.get`/`.split`/`.items`. Only the
+/// clean `<literal>.<method>` shape: the method must be a single segment (no further
+/// chain/call/index), and a string with an embedded `.` (`"a.b".split`) fails the
+/// literal check on the split fragment ⇒ we abstain rather than mis-split it.
+fn python_literal_receiver_root(target: &str) -> Option<String> {
+    let (receiver, method) = target.split_once('.')?;
+    if method.is_empty() || method.contains(['.', '(', '[', ':', ' ']) {
+        return None;
+    }
+    is_python_literal(receiver).then(|| "builtins".to_string())
+}
+
+/// Receiver = a `**kwargs` (dict) or `*args` (tuple) parameter of the CALLING function
+/// (names stamped by the parser, passed here as `(args_param, kwargs_param)`): the type
+/// is GUARANTEED by the signature, so a standard container method on it (`kwargs.get`,
+/// `args.index`) is a stdlib op, not project code → `builtins`. Like the literal case,
+/// the proven type removes the ambiguity that keeps [`python_str_method_root`]
+/// conservative — but we still only accept the KNOWN container methods (a call to a
+/// non-container method on the param would be a source bug, so we abstain on it).
+/// Python only; clean `param.method` shape (2 segments, no nested call/index).
+fn kwargs_args_method_root(
+    language: &str,
+    target: &str,
+    varargs: Option<&(Option<String>, Option<String>)>,
+) -> Option<String> {
+    if language != "python" {
+        return None;
+    }
+    let (args_param, kwargs_param) = varargs?;
+    let (receiver, method) = target.split_once('.')?;
+    if method.is_empty() || method.contains(['.', '(', '[', ':', ' ']) {
+        return None;
+    }
+    let is_kwargs = kwargs_param.as_deref() == Some(receiver) && is_dict_method(method);
+    let is_args = args_param.as_deref() == Some(receiver) && is_tuple_method(method);
+    (is_kwargs || is_args).then(|| "builtins".to_string())
+}
+
+/// Standard `dict` methods. A `**kwargs` receiver is provably a dict, so these are stdlib.
+fn is_dict_method(name: &str) -> bool {
+    matches!(
+        name,
+        "get"
+            | "setdefault"
+            | "pop"
+            | "popitem"
+            | "update"
+            | "keys"
+            | "values"
+            | "items"
+            | "clear"
+            | "copy"
+            | "fromkeys"
+    )
+}
+
+/// Standard `tuple` methods. A `*args` receiver is provably a tuple, so these are stdlib.
+fn is_tuple_method(name: &str) -> bool {
+    matches!(name, "count" | "index")
+}
+
+/// `true` if `s` is a Python literal whose type is CERTAIN: a string/bytes literal
+/// (optionally prefixed `r`/`b`/`f`/`u`, any case) or an empty container literal
+/// (`[]`/`{}`/`()`). Numbers are excluded on purpose: `1.5` would split on the dot and
+/// is too rare a call receiver to be worth the ambiguity.
+fn is_python_literal(s: &str) -> bool {
+    if matches!(s, "[]" | "{}" | "()") {
+        return true;
+    }
+    let body = s.trim_start_matches(['r', 'R', 'b', 'B', 'f', 'F', 'u', 'U']);
+    let quoted = |q: char| body.len() >= 2 && body.starts_with(q) && body.ends_with(q);
+    quoted('"') || quoted('\'')
 }
 
 /// Method names that belong ONLY to str/bytes in the Python stdlib: a project
@@ -2371,6 +2525,68 @@ impl Display for Number {
     }
 
     #[tokio::test]
+    async fn self_method_resolves_to_the_enclosing_class_even_with_a_homonym() {
+        // `self.send()` in B.go must bind to B::send, NOT to A::send (a homonym in
+        // another class). The bare-name fallback abstains (two `send` homonyms), but
+        // stage 2.6 uses the caller's enclosing class to pick the right one. This is
+        // exactly the receiver-type case the bare-name match cannot disambiguate.
+        let src = "class A:\n    def send(self):\n        pass\n\n\
+class B:\n    def send(self):\n        pass\n\n    def go(self):\n        self.send()\n";
+        let parsed = parse("m.py", src).await;
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None);
+
+        let delta = resolver.resolve(&[parsed], &storage).await.unwrap();
+        let b_send = find(&delta, "m::B::send");
+        let a_send = find(&delta, "m::A::send");
+        let b_go = find(&delta, "m::B::go");
+
+        let call = delta
+            .added_relations
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls && r.source_id == b_go.id)
+            .expect("self.send() must resolve via the enclosing class");
+        assert_eq!(
+            call.target_id, b_send.id,
+            "self.send() must bind to B::send"
+        );
+        assert_ne!(call.target_id, a_send.id, "never to the homonym A::send");
+    }
+
+    #[tokio::test]
+    async fn self_method_not_defined_on_the_class_stays_unresolved() {
+        // Anti-FP: `self.update()` but the class does NOT define `update` (it would be
+        // inherited from a stdlib base). No `C::update` entity exists → the call must
+        // stay Unresolved, never an invented edge.
+        let src = "class C:\n    def go(self):\n        self.update()\n";
+        let parsed = parse("m.py", src).await;
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(None);
+
+        let delta = resolver.resolve(&[parsed], &storage).await.unwrap();
+        let c_go = find(&delta, "m::C::go");
+
+        // Look only at dependency edges (ignore the structural BelongsTo of the method
+        // to its class). The single call `self.update()` must be the honest hole.
+        assert!(
+            !delta
+                .added_relations
+                .iter()
+                .any(|r| r.source_id == c_go.id && r.kind == RelationKind::Calls),
+            "self.update() must NOT resolve to any entity (method not on the class)"
+        );
+        assert!(
+            delta.added_relations.iter().any(|r| {
+                r.source_id == c_go.id
+                    && r.kind == RelationKind::Unresolved
+                    && r.metadata.get("unresolved_target").map(String::as_str)
+                        == Some("self.update")
+            }),
+            "the honest hole must record the original target `self.update`"
+        );
+    }
+
+    #[tokio::test]
     async fn foreign_member_call_does_not_bind_to_free_function() {
         // Fix #10 (anti-FP, web): `schema.validate(data)` è una call su un receiver
         // foreign (parametro `schema`, tipo ignoto). Il suo leaf `validate` coincide
@@ -2645,6 +2861,187 @@ impl Display for Number {
                 .iter()
                 .any(|r| r.kind == RelationKind::Calls && r.source_id == go.id),
             "HashMap::new non deve risolvere a un'entità interna"
+        );
+    }
+
+    #[test]
+    fn literal_receiver_methods_resolve_to_builtins_for_any_method() {
+        // Type proven by the literal ⇒ even the otherwise-ambiguous methods
+        // (.get/.split/.items) are safe to externalize.
+        for t in [
+            "\"\".join",
+            "''.split",
+            "b\"\".decode",
+            "[].append",
+            "{}.get",
+            "{}.items",
+            "().count",
+            "r\"\".strip",
+        ] {
+            assert_eq!(
+                python_literal_receiver_root(t).as_deref(),
+                Some("builtins"),
+                "literal receiver `{t}` must externalize"
+            );
+        }
+        // NOT a literal receiver: a plain variable (unknown type), an embedded-dot string
+        // (mis-split ⇒ abstain), or a chained/call form.
+        for t in [
+            "x.get",
+            "kwargs.setdefault",
+            "\"a.b\".split",
+            "\"\".join.strip",
+            "\"\".join(",
+            "self.send",
+        ] {
+            assert_eq!(
+                python_literal_receiver_root(t),
+                None,
+                "`{t}` must NOT be treated as a literal receiver"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn string_literal_method_call_resolves_to_external_builtins() {
+        // `"".join(parts)` — the receiver is a str literal, so `join` is a stdlib method,
+        // never project code. It must resolve to the synthetic external `builtins`, not
+        // stay Unresolved (and never bind to a project entity).
+        let parsed = vec![parse("m.py", "def go(parts):\n    \"\".join(parts)\n").await];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+        let go = find(&delta, "m::go");
+
+        let join_call = delta
+            .added_relations
+            .iter()
+            .find(|r| r.source_id == go.id && r.kind == RelationKind::Calls)
+            .expect("\"\".join must resolve to external builtins, not stay Unresolved");
+        assert_eq!(
+            join_call
+                .metadata
+                .get("external_target")
+                .map(String::as_str),
+            Some("\"\".join"),
+            "the external edge must record the literal call target"
+        );
+        assert!(
+            !delta
+                .added_relations
+                .iter()
+                .any(|r| r.source_id == go.id && r.kind == RelationKind::Unresolved),
+            "no honest hole left for a proven-type literal call"
+        );
+    }
+
+    #[test]
+    fn kwargs_args_method_root_only_fires_on_the_caller_splat_params() {
+        let va = (Some("args".to_string()), Some("kwargs".to_string()));
+        // dict method on the **kwargs param ⇒ builtins; tuple method on *args ⇒ builtins.
+        assert_eq!(
+            kwargs_args_method_root("python", "kwargs.setdefault", Some(&va)).as_deref(),
+            Some("builtins")
+        );
+        assert_eq!(
+            kwargs_args_method_root("python", "args.index", Some(&va)).as_deref(),
+            Some("builtins")
+        );
+        // A NON-container method on the param, a different receiver, no varargs info, or a
+        // non-Python language ⇒ abstain (we never invent).
+        assert_eq!(
+            kwargs_args_method_root("python", "kwargs.send", Some(&va)),
+            None
+        );
+        assert_eq!(
+            kwargs_args_method_root("python", "args.get", Some(&va)),
+            None
+        );
+        assert_eq!(
+            kwargs_args_method_root("python", "other.get", Some(&va)),
+            None
+        );
+        assert_eq!(kwargs_args_method_root("python", "kwargs.get", None), None);
+        assert_eq!(
+            kwargs_args_method_root("typescript", "kwargs.get", Some(&va)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn kwargs_dict_method_call_resolves_to_external_builtins() {
+        // `**kwargs` is provably a dict → `kwargs.setdefault(...)` is a stdlib op, not
+        // project code → external builtins. A plain param of unknown type does NOT.
+        let parsed = vec![
+            parse(
+                "m.py",
+                "def f(**kwargs):\n    kwargs.setdefault('a', 1)\n\ndef g(opts):\n    opts.setdefault('a', 1)\n",
+            )
+            .await,
+        ];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+
+        let f = find(&delta, "m::f");
+        let kwargs_call = delta
+            .added_relations
+            .iter()
+            .find(|r| r.source_id == f.id && r.kind == RelationKind::Calls)
+            .expect("kwargs.setdefault must externalize (proven dict)");
+        assert_eq!(
+            kwargs_call
+                .metadata
+                .get("external_target")
+                .map(String::as_str),
+            Some("kwargs.setdefault")
+        );
+
+        // `g`'s receiver `opts` is a plain param of unknown type → honest hole, never invented.
+        let g = find(&delta, "m::g");
+        assert!(
+            !delta
+                .added_relations
+                .iter()
+                .any(|r| r.source_id == g.id && r.kind == RelationKind::Calls),
+            "a plain param of unknown type must NOT resolve (no proof it is a dict)"
+        );
+        assert!(
+            delta.added_relations.iter().any(|r| {
+                r.source_id == g.id
+                    && r.kind == RelationKind::Unresolved
+                    && r.metadata.get("unresolved_target").map(String::as_str)
+                        == Some("opts.setdefault")
+            }),
+            "opts.setdefault stays the honest hole"
+        );
+    }
+
+    #[tokio::test]
+    async fn kwargs_method_call_resolves_inside_a_class_method() {
+        // The real-world shape (requests `Session.get`): a class method with
+        // `def m(self, url, **kwargs)` calling `kwargs.setdefault(...)`.
+        let parsed = vec![
+            parse(
+                "m.py",
+                "class S:\n    def get(self, url, **kwargs):\n        kwargs.setdefault('a', 1)\n",
+            )
+            .await,
+        ];
+        let storage = SqliteStorage::in_memory().unwrap();
+        let resolver = GraphResolver::new(Some("/repo".to_string()));
+        let delta = resolver.resolve(&parsed, &storage).await.unwrap();
+
+        let get = find(&delta, "m::S::get");
+        let call = delta
+            .added_relations
+            .iter()
+            .find(|r| r.source_id == get.id && r.kind == RelationKind::Calls)
+            .expect("kwargs.setdefault in a method must externalize too");
+        assert_eq!(
+            call.metadata.get("external_target").map(String::as_str),
+            Some("kwargs.setdefault")
         );
     }
 

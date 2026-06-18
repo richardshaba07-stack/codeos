@@ -230,16 +230,66 @@ impl<'src> FileWalk<'src> {
         };
         let id = self.fresh_id();
         let location = self.loc(node);
+        // Splat parameters carry a PROVEN type: `**kwargs` is a dict, `*args` a tuple.
+        // We stamp their names so the resolver can externalize stdlib container-method
+        // calls on them (`kwargs.setdefault`, `args.index`) — a receiver type known for
+        // free from the signature, no inference.
+        let mut metadata = python_metadata();
+        let (args_param, kwargs_param) = self.splat_param_names(node);
+        if let Some(a) = args_param {
+            metadata.insert("args_param".to_string(), a);
+        }
+        if let Some(k) = kwargs_param {
+            metadata.insert("kwargs_param".to_string(), k);
+        }
         self.entities.push(ParsedEntity {
             local_id: id.clone(),
             kind,
             name,
             parent_local_id: Some(scope.local_id.clone()),
             location,
-            metadata: python_metadata(),
+            metadata,
         });
         let child_scope = Scope { local_id: id, kind };
         self.walk_children(node, &child_scope);
+    }
+
+    /// Names of the `*args` (tuple) and `**kwargs` (dict) parameters of a function, if
+    /// present. Their type is GUARANTEED by the language, so the resolver can attach
+    /// stdlib container-method calls on them to `builtins` without any inference.
+    ///
+    /// Handles BOTH the bare form (`*args`/`**kwargs` ⇒ a `list_splat_pattern` /
+    /// `dictionary_splat_pattern` child) AND the annotated form used by modern typed
+    /// code (`**kwargs: Unpack[...]` ⇒ the splat pattern wrapped in a `typed_parameter`).
+    /// Missing the annotated case is why real codebases (e.g. requests) saw no gain.
+    fn splat_param_names(&self, node: Node) -> (Option<String>, Option<String>) {
+        let (mut args, mut kwargs) = (None, None);
+        let Some(params) = node.child_by_field_name("parameters") else {
+            return (args, kwargs);
+        };
+        let mut cursor = params.walk();
+        for child in params.children(&mut cursor) {
+            // Unwrap an annotation: `**kwargs: T` is a `typed_parameter` around the splat.
+            let splat = match child.kind() {
+                "list_splat_pattern" | "dictionary_splat_pattern" => Some(child),
+                "typed_parameter" => {
+                    let mut c = child.walk();
+                    let kids: Vec<Node> = child.children(&mut c).collect();
+                    kids.into_iter().find(|n| {
+                        matches!(n.kind(), "list_splat_pattern" | "dictionary_splat_pattern")
+                    })
+                }
+                _ => None,
+            };
+            let Some(splat) = splat else { continue };
+            let name = splat.named_child(0).map(|n| self.text(n));
+            match splat.kind() {
+                "list_splat_pattern" => args = name,
+                "dictionary_splat_pattern" => kwargs = name,
+                _ => {}
+            }
+        }
+        (args, kwargs)
     }
 
     /// `import os`, `import a.b.c`, `import x as y`.
@@ -347,6 +397,49 @@ def top_level():
             .iter()
             .find(|e| e.name == name)
             .unwrap_or_else(|| panic!("entità '{name}' assente"))
+    }
+
+    #[tokio::test]
+    async fn splat_parameters_are_stamped_on_the_function() {
+        // `*args` (tuple) and `**kwargs` (dict) names are captured for the resolver.
+        let result = parse("def f(a, *args, **kwargs):\n    pass\n").await;
+        let f = find(&result, "f");
+        assert_eq!(
+            f.metadata.get("args_param").map(String::as_str),
+            Some("args")
+        );
+        assert_eq!(
+            f.metadata.get("kwargs_param").map(String::as_str),
+            Some("kwargs")
+        );
+
+        // No splat params ⇒ neither key (so the resolver does not over-trigger).
+        let result2 = parse("def g(a, b):\n    pass\n").await;
+        let g = find(&result2, "g");
+        assert!(!g.metadata.contains_key("args_param"));
+        assert!(!g.metadata.contains_key("kwargs_param"));
+
+        // Custom names captured verbatim.
+        let result3 = parse("def h(**opts):\n    pass\n").await;
+        let h = find(&result3, "h");
+        assert_eq!(
+            h.metadata.get("kwargs_param").map(String::as_str),
+            Some("opts")
+        );
+
+        // ANNOTATED splat (modern typed code, e.g. requests `**kwargs: Unpack[T]`): the
+        // splat is wrapped in a `typed_parameter` — must still be captured.
+        let result4 =
+            parse("def k(self, url: str, *args: int, **kwargs: Unpack[T]):\n    pass\n").await;
+        let k = find(&result4, "k");
+        assert_eq!(
+            k.metadata.get("args_param").map(String::as_str),
+            Some("args")
+        );
+        assert_eq!(
+            k.metadata.get("kwargs_param").map(String::as_str),
+            Some("kwargs")
+        );
     }
 
     #[tokio::test]
