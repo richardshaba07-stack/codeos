@@ -36,12 +36,16 @@ lies. The tool abstains rather than inventing.
 
 - **Anti-fabrication, measured.** On real repositories, `learn` abstains on **~96%**
   of commits — it surfaces only genuine decisions (verbatim, with a cited source) and
-  **refuses to invent the rest. Zero fabrications.**
+  **refuses to invent the rest. Zero fabrications.** (Validated on `gin` (1,996 commits),
+  `adr-tools`, and this repo — see [`benchmark/`](benchmark/).)
 - **The recorded "why" changes agent behavior.** In a **blind, pre-registered**
   benchmark (n=36), an AI agent violated a non-derivable policy **18/18 times without**
-  CodeOS's recorded intent — and **0/18 with it**.
-- **Robust at scale.** Indexed **80 public repositories, ~3.5M entities, 13
-  languages, with 0 panics.**
+  CodeOS's recorded intent — and **0/18 with it**. The full protocol, exact prompts,
+  raw responses and the blind judge's verdicts are in **[`benchmark/`](benchmark/)** —
+  verifiable, not on faith. Honest scope: a single model family (Claude) and synthetic
+  substrates; cross-model generalization is future work.
+- **Robust at scale.** Indexed **80 public repositories** (~3.5M entities) across the
+  **9 supported languages, with 0 panics.**
 - **9 languages**, 7 validated against compiler oracles (clang, ripper, swiftc,
   Roslyn, the Python `ast`, …).
 - **364 tests**, green across the whole workspace.
