@@ -2,7 +2,7 @@
    Strategia: cache dell'app shell (stale-while-revalidate) per le risorse
    dello stesso dominio; tutto il resto (YouTube, Google Fonts) passa
    direttamente alla rete. Cambia CACHE per forzare un aggiornamento. */
-const CACHE = 'ilc-v2';
+const CACHE = 'ilc-v3';
 const ASSETS = [
   './',
   './index.html',
