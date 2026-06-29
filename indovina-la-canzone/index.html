@@ -277,6 +277,8 @@
   .reveal .lab{color:var(--muted);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.16em;}
   .reveal .title{font-family:var(--serif);font-size:24px;font-weight:500;margin-top:6px;line-height:1.15;}
   .reveal .artist{color:var(--muted);font-size:15px;margin-top:4px;}
+  .reveal-year{margin-top:12px;font-size:15px;color:var(--gold);}
+  .reveal-year b{font-family:var(--serif);font-size:24px;color:var(--text);}
   .judgeHead{text-align:center;margin:4px 0 14px;}
   .judgeHead b{font-family:var(--serif);font-weight:500;font-size:20px;display:block;}
   .judgeHead span{font-size:13px;color:var(--muted);margin-top:4px;display:block;}
@@ -410,6 +412,10 @@
         <button class="switch" id="tg-double" type="button" role="switch" aria-checked="false"><span></span></button>
       </div>
       <div class="toggle-row">
+        <div><div class="trow-t">Indovina l'anno 🗓️</div><div class="trow-s">A fine brano si rivela l'anno di uscita: il giudice premia chi si è avvicinato di più</div></div>
+        <button class="switch" id="tg-year" type="button" role="switch" aria-checked="false"><span></span></button>
+      </div>
+      <div class="toggle-row">
         <div><div class="trow-t">Squadre 👥</div><div class="trow-s">Tocca la lettera accanto a ogni giocatore per assegnare la squadra. In gioco si fa punto a squadre e dai un nome ai gruppi</div></div>
         <button class="switch" id="tg-teams" type="button" role="switch" aria-checked="false"><span></span></button>
       </div>
@@ -446,6 +452,15 @@
         <input type="text" id="new-cat-name" placeholder="Nome playlist" style="min-width:0;">
         <button class="btn btn-solid btn-sm" id="add-cat" style="flex:0 0 auto;width:auto;padding:13px 24px;">Crea</button>
       </div>
+    </div>
+    <div class="card">
+      <label>Riempi al volo da Deezer 🎲</label>
+      <button class="btn btn-ghost btn-sm" id="auto-top">🎲 Top del momento</button>
+      <div class="row mt">
+        <input type="text" id="auto-artist-name" placeholder="Nome artista (es. Vasco)" style="min-width:0;">
+        <button class="btn btn-solid btn-sm" id="auto-artist" style="flex:0 0 auto;width:auto;padding:13px 18px;">🎤 Top</button>
+      </div>
+      <div class="snote" id="auto-note" style="display:none;margin-top:10px;"></div>
     </div>
 
     <div id="cat-container"></div>
@@ -485,6 +500,7 @@
       <div class="lab">Il brano era</div>
       <div class="title" id="reveal-title">—</div>
       <div class="artist" id="reveal-artist"></div>
+      <div class="reveal-year" id="reveal-year" style="display:none;"></div>
     </div>
 
     <div id="judge-area">
@@ -564,7 +580,7 @@ const state = {
   catId: 0, songId: 0,
   currentCat: null, currentIndex: 0,
   _setupNames: ['',''], _focusSel: null,
-  settings: { timeScoring:true, sounds:true, volume:0.9, theme:'fuoco', hints:true, hintTokens:3, jolly:true, jollyCount:1, doublePoints:false, teamsEnabled:false },
+  settings: { timeScoring:true, sounds:true, volume:0.9, theme:'fuoco', hints:true, hintTokens:3, jolly:true, jollyCount:1, doublePoints:false, teamsEnabled:false, yearMode:false },
   pointsInPlay: 1, _roundStart:0, _scoreTimer:null, _frozenEl:0, _cdTimer:null, _hintLevel:0,
   _setupTeams:[0,1], teamNames:{}, teams:[]
 };
@@ -670,6 +686,7 @@ bindToggle('#tg-sound','sounds');
 bindToggle('#tg-hints','hints');
 bindToggle('#tg-jolly','jolly');
 bindToggle('#tg-double','doublePoints');
+bindToggle('#tg-year','yearMode');
 bindToggle('#tg-teams','teamsEnabled');
 $('#tg-teams').addEventListener('click', ()=>renderPlayerInputs());
 $('#team-names').addEventListener('input', e=>{ if(e.target.dataset.teamname!==undefined) state.teamNames[+e.target.dataset.teamname]=e.target.value; });
@@ -946,7 +963,7 @@ function addResult(cid,idx){
   const cat=getCat(cid); if(!cat || !cat._results) return;
   const r=cat._results[idx]; if(!r) return;
   if(cat.songs.some(s=>s.preview===r.preview)) return;   // già aggiunta: non duplicare
-  cat.songs.push({id:++state.songId,title:r.title,artist:r.artist,preview:r.preview,cover:r.cover});
+  cat.songs.push({id:++state.songId,title:r.title,artist:r.artist,preview:r.preview,cover:r.cover,did:r.did});
   renderCategories();                                     // i risultati restano aperti: li chiudi tu
   flashToast('“'+r.title+'” aggiunta');
 }
@@ -954,7 +971,7 @@ function addResult(cid,idx){
 /* ---------------- RICERCA DEEZER (gratis, anteprime 30s, niente pubblicità) ----------------
    Usa JSONP per evitare i blocchi CORS del browser. Nessuna chiave, nessun login. */
 let jsonpSeq=0;
-function deezerSearch(query){
+function deezerJSONP(url){
   return new Promise((resolve,reject)=>{
     const cb='dz_cb_'+(++jsonpSeq);
     const script=document.createElement('script');
@@ -966,10 +983,13 @@ function deezerSearch(query){
     }
     window[cb]=function(data){ cleanup(); resolve(data); };
     script.onerror=function(){ cleanup(); reject(new Error('network')); };
-    script.src='https://api.deezer.com/search?q='+encodeURIComponent(query)+
-      '&limit=12&output=jsonp&callback='+cb;
+    const sep = url.indexOf('?')>=0 ? '&' : '?';
+    script.src = url + sep + 'output=jsonp&callback='+cb;
     document.head.appendChild(script);
   });
+}
+function deezerSearch(query){
+  return deezerJSONP('https://api.deezer.com/search?q='+encodeURIComponent(query)+'&limit=12');
 }
 
 function doSearch(cid){
@@ -986,6 +1006,7 @@ function doSearch(cid){
     cat._results = items
       .filter(it=>it && it.preview)
       .map(it=>({
+        did: it.id,
         title: it.title_short || it.title || 'Senza titolo',
         artist: (it.artist && it.artist.name) || '',
         preview: it.preview,
@@ -1000,6 +1021,42 @@ function doSearch(cid){
     renderCategories();
   });
 }
+
+/* ---------------- PLAYLIST AUTOMATICHE (Deezer) ---------------- */
+function autoNote(msg){ const n=$('#auto-note'); if(!n) return; n.style.display='block'; n.textContent=msg; }
+function fillFromTracks(name, tracks){
+  const songs=(tracks||[]).filter(t=>t&&t.preview).map(t=>({
+    id:++state.songId, did:t.id,
+    title: t.title_short||t.title||'Senza titolo',
+    artist: (t.artist&&t.artist.name)||'',
+    preview: t.preview,
+    cover: (t.album&&(t.album.cover_medium||t.album.cover))||''
+  }));
+  if(!songs.length){ autoNote('Nessun brano trovato.'); return; }
+  state.categories.push({id:++state.catId, name, editing:false, songs, _q:'',_results:null,_searching:false,_err:''});
+  renderCategories();
+  autoNote(songs.length+' brani aggiunti in «'+name+'».');
+  flashToast('Playlist «'+name+'» creata ('+songs.length+' brani)');
+}
+$('#auto-top').addEventListener('click', ()=>{
+  autoNote('Carico la Top del momento…');
+  deezerJSONP('https://api.deezer.com/chart/0/tracks?limit=15')
+    .then(d=>fillFromTracks('Top del momento', d&&d.data))
+    .catch(()=>autoNote('Caricamento non riuscito. Controlla la connessione.'));
+});
+$('#auto-artist').addEventListener('click', ()=>{
+  const q=$('#auto-artist-name').value.trim();
+  if(!q){ autoNote('Scrivi il nome di un artista qui sopra.'); return; }
+  autoNote('Cerco «'+q+'»…');
+  deezerJSONP('https://api.deezer.com/search/artist?q='+encodeURIComponent(q)+'&limit=1')
+    .then(d=>{
+      const art=d&&d.data&&d.data[0];
+      if(!art){ autoNote('Artista non trovato. Prova un altro nome.'); return; }
+      return deezerJSONP('https://api.deezer.com/artist/'+art.id+'/top?limit=15')
+        .then(t=>{ fillFromTracks(art.name, t&&t.data); $('#auto-artist-name').value=''; });
+    })
+    .catch(()=>autoNote('Caricamento non riuscito. Controlla la connessione.'));
+});
 
 $('#cat-back').addEventListener('click', ()=>show('screen-setup'));
 $('#cat-end').addEventListener('click', endGame);
@@ -1044,6 +1101,7 @@ function playCurrentSong(){
   disc.classList.remove('spin','blur-light'); armNeedle(false);
   state._hintLevel=0; $('#hintbox').style.display='none';
   setupAids();
+  if(state.settings.yearMode) fetchYear(song);
   renderJudgeGrid();
   renderRank('#play-rank');
   // prepara e "sblocca" l'audio entro il gesto (necessario su iPhone), muto per non fare blip
@@ -1131,8 +1189,27 @@ function renderJudgeGrid(){
     b.addEventListener('click', ()=>awardAndReveal(i));
     grid.appendChild(b);
   });
-  const sub=$('#judge-sub'); if(sub) sub.textContent = state.settings.teamsEnabled ? 'Il giudice tocca la squadra che ha indovinato' : 'Il giudice tocca il nome del giocatore';
+  const sub=$('#judge-sub'); if(sub) sub.textContent = state.settings.yearMode ? 'Chi si è avvicinato di più all\'anno?' : (state.settings.teamsEnabled ? 'Il giudice tocca la squadra che ha indovinato' : 'Il giudice tocca il nome del giocatore');
   updatePoints();
+}
+/* INDOVINA L'ANNO: recupera e mostra l'anno di uscita (dati Deezer) */
+function fetchYear(song){
+  if(!song || !song.did || song.year!==undefined) return;
+  song.year='';  // in corso
+  deezerJSONP('https://api.deezer.com/track/'+song.did).then(d=>{
+    const rd=(d&&(d.release_date||(d.album&&d.album.release_date)))||'';
+    song.year=(rd && rd.length>=4) ? rd.slice(0,4) : null;
+    const cur=state.currentCat && state.currentCat.songs[state.currentIndex];
+    if(cur===song && $('#reveal').style.display!=='none') showYear(song);
+  }).catch(()=>{ song.year=null; });
+}
+function showYear(song){
+  const el=$('#reveal-year'); if(!el) return;
+  if(!state.settings.yearMode){ el.style.display='none'; return; }
+  el.style.display='block';
+  if(song.year) el.innerHTML='Uscito nel <b>'+escapeHtml(song.year)+'</b>';
+  else if(song.year===null) el.textContent='Anno non disponibile';
+  else el.textContent='Cerco l\'anno…';
 }
 function awardAndReveal(i){
   stopScore();
@@ -1166,6 +1243,7 @@ function revealAnswer(msg){
   $('#reveal-artist').textContent=song.artist||'';
   const cov=$('#reveal-cover');
   if(song.cover){ cov.src=song.cover; cov.style.display=''; } else { cov.style.display='none'; }
+  showYear(song);
   $('#guessedBox').textContent=msg;
   setPhase('revealed');
   renderRank('#play-rank');
