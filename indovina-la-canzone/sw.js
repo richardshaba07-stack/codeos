@@ -1,8 +1,10 @@
 /* Service worker per "Indovina la Canzone"
-   Strategia: cache dell'app shell (stale-while-revalidate) per le risorse
-   dello stesso dominio; tutto il resto (anteprime Deezer, Google Fonts) passa
-   direttamente alla rete. Cambia CACHE per forzare un aggiornamento. */
-const CACHE = 'ilc-v6';
+   - Documento HTML / navigazione: NETWORK-FIRST -> quando sei online vedi
+     SEMPRE l'ultima versione (niente più aggiornamenti "in ritardo"); offline
+     usa la copia salvata.
+   - Altri file dello stesso dominio (icone, manifest): stale-while-revalidate.
+   - Anteprime Deezer e Google Fonts: passano direttamente alla rete. */
+const CACHE = 'ilc-v7';
 const ASSETS = [
   './',
   './index.html',
@@ -35,10 +37,28 @@ self.addEventListener('fetch', event => {
   if (req.method !== 'GET') return;
 
   const url = new URL(req.url);
-  // Lascia passare alla rete tutto ciò che non è del nostro dominio
-  // (i video YouTube e i font NON vanno messi in cache).
-  if (url.origin !== self.location.origin) return;
+  if (url.origin !== self.location.origin) return;  // Deezer/Fonts: niente cache
 
+  const isDoc = req.mode === 'navigate'
+    || req.destination === 'document'
+    || url.pathname.endsWith('/')
+    || url.pathname.endsWith('index.html');
+
+  if (isDoc) {
+    // NETWORK-FIRST: prima la rete (versione fresca), poi la cache come riserva
+    event.respondWith(
+      fetch(req)
+        .then(res => {
+          const copy = res.clone();
+          caches.open(CACHE).then(c => c.put(req, copy));
+          return res;
+        })
+        .catch(() => caches.match(req).then(r => r || caches.match('./index.html')))
+    );
+    return;
+  }
+
+  // ALTRO (icone, manifest): stale-while-revalidate
   event.respondWith(
     caches.match(req).then(cached => {
       const network = fetch(req)
