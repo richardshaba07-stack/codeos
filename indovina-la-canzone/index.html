@@ -45,7 +45,10 @@
     font-family:var(--sans);
     color:var(--text);
     min-height:100dvh;
-    background:var(--bg);
+    background:
+      radial-gradient(150% 100% at 50% -25%, rgba(255,255,255,.06), rgba(255,255,255,0) 48%),
+      var(--bg);
+    background-attachment:fixed;
     -webkit-font-smoothing:antialiased;
     padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
   }
@@ -62,11 +65,12 @@
   .ic{width:20px;height:20px;display:inline-block;vertical-align:middle;flex:0 0 auto;}
 
   .card{
-    background:var(--surface);
+    background:linear-gradient(180deg, #1d1a16, #15120f);
     border:1px solid var(--line);
     border-radius:var(--r);
     padding:18px;
     margin-bottom:14px;
+    box-shadow:0 1px 0 rgba(255,255,255,.04) inset, 0 10px 24px rgba(0,0,0,.20);
   }
 
   label{display:block;font-size:11px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:0 0 10px;}
@@ -227,14 +231,25 @@
   /* interruttori (toggle) */
   .toggle-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:11px 0;}
   .toggle-row+.toggle-row{border-top:1px solid var(--line);}
-  .trow-t{font-size:15px;font-weight:500;}
-  .trow-s{font-size:12.5px;color:var(--muted);margin-top:2px;line-height:1.35;}
-  .switch{flex:0 0 auto;width:50px;height:30px;border-radius:999px;border:1px solid var(--line-strong);
-    background:var(--surface-2);position:relative;cursor:pointer;padding:0;transition:background .15s ease,border-color .15s ease;}
-  .switch span{position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:var(--muted);
-    transition:transform .18s ease,background .15s ease;}
-  .switch.on{background:rgba(255,83,51,.25);border-color:var(--accent);}
-  .switch.on span{transform:translateX(20px);background:var(--accent);}
+  .trow-t{display:flex;align-items:center;gap:9px;font-size:15px;font-weight:500;}
+  .trow-t .ti{flex:0 0 auto;width:19px;height:19px;color:var(--accent);display:inline-flex;}
+  .ti .ic{width:19px;height:19px;display:block;}
+  .trow-s{font-size:12.5px;color:var(--muted);margin-top:3px;line-height:1.4;padding-left:28px;}
+  /* interruttore a mini-disco: gira + scia di note quando attivo, fermo se spento */
+  .discsw{position:relative;width:82px;height:38px;flex:0 0 auto;border:none;background:transparent;cursor:pointer;padding:0;}
+  .discsw .mini-disc{position:absolute;right:0;top:1px;width:36px;height:36px;border-radius:50%;
+    background:repeating-radial-gradient(circle at 50% 50%, rgba(255,255,255,.06) 0 1.5px, rgba(0,0,0,.45) 1.5px 3px), #15130f;
+    border:1px solid var(--line-strong);box-shadow:0 2px 7px rgba(0,0,0,.45);}
+  .discsw .mini-disc::after{content:"";position:absolute;top:50%;left:50%;width:11px;height:11px;margin:-5.5px 0 0 -5.5px;
+    border-radius:50%;background:var(--muted);box-shadow:0 0 0 2px #15130f;transition:background .2s ease;}
+  .discsw.on .mini-disc::after{background:var(--accent);}
+  .discsw.on .mini-disc{animation:spin 2.4s linear infinite;}
+  .discsw .notes{position:absolute;left:0;top:0;bottom:0;right:40px;overflow:hidden;pointer-events:none;}
+  .discsw .notes i{position:absolute;right:2px;top:50%;width:13px;height:13px;color:var(--accent);opacity:0;}
+  .discsw .notes i svg{width:13px;height:13px;display:block;}
+  .discsw.on .notes i{animation:noteflow 1.5s linear var(--nd,0s) infinite;}
+  @keyframes noteflow{0%{opacity:0;transform:translate(0,-50%) rotate(0) scale(.5);}18%{opacity:.95;}
+    100%{opacity:0;transform:translate(-44px,-150%) rotate(-22deg) scale(1);}}
   .swatches{display:flex;gap:12px;}
   .swatch{width:34px;height:34px;border-radius:50%;background:var(--sw);border:2px solid transparent;cursor:pointer;padding:0;
     box-shadow:0 0 0 1px var(--line);transition:transform .1s ease;}
@@ -392,35 +407,35 @@
     <div class="card">
       <label>Regole</label>
       <div class="toggle-row">
-        <div><div class="trow-t">Punteggio a tempo</div><div class="trow-s">I punti calano coi secondi: chi indovina prima vince di più</div></div>
-        <button class="switch on" id="tg-time" type="button" role="switch" aria-checked="true"><span></span></button>
+        <div><div class="trow-t"><span class="ti" data-ic="clock"></span>Punteggio a tempo</div><div class="trow-s">I punti calano coi secondi: chi indovina prima vince di più</div></div>
+        <button class="discsw on" id="tg-time" type="button" role="switch" aria-checked="true"></button>
       </div>
       <div class="toggle-row">
-        <div><div class="trow-t">Suoni ed effetti</div><div class="trow-s">Countdown, campanello, buzzer, applausi e vibrazione</div></div>
-        <button class="switch on" id="tg-sound" type="button" role="switch" aria-checked="true"><span></span></button>
+        <div><div class="trow-t"><span class="ti" data-ic="sound"></span>Suoni ed effetti</div><div class="trow-s">Countdown, campanello, buzzer, applausi e vibrazione</div></div>
+        <button class="discsw on" id="tg-sound" type="button" role="switch" aria-checked="true"></button>
       </div>
       <div class="toggle-row">
-        <div><div class="trow-t">Indizi 💡 (gettoni)</div><div class="trow-s">Ogni giocatore ha 3 gettoni: un indizio costa 1 gettone (non punti)</div></div>
-        <button class="switch on" id="tg-hints" type="button" role="switch" aria-checked="true"><span></span></button>
+        <div><div class="trow-t"><span class="ti" data-ic="bulb"></span>Indizi (gettoni)</div><div class="trow-s">Ogni giocatore ha 3 gettoni: un indizio costa 1 gettone (non punti)</div></div>
+        <button class="discsw on" id="tg-hints" type="button" role="switch" aria-checked="true"></button>
       </div>
       <div class="toggle-row">
-        <div><div class="trow-t">Jolly 🃏</div><div class="trow-s">Ogni giocatore ha 1 jolly per saltare un brano troppo difficile</div></div>
-        <button class="switch on" id="tg-jolly" type="button" role="switch" aria-checked="true"><span></span></button>
+        <div><div class="trow-t"><span class="ti" data-ic="joker"></span>Jolly</div><div class="trow-s">Ogni giocatore ha 1 jolly per saltare un brano troppo difficile</div></div>
+        <button class="discsw on" id="tg-jolly" type="button" role="switch" aria-checked="true"></button>
       </div>
       <div class="toggle-row">
-        <div><div class="trow-t">Doppio punto ➕</div><div class="trow-s">Il giudice assegna: solo titolo, solo artista, o tutt'e due (doppio)</div></div>
-        <button class="switch" id="tg-double" type="button" role="switch" aria-checked="false"><span></span></button>
+        <div><div class="trow-t"><span class="ti" data-ic="plus"></span>Doppio punto</div><div class="trow-s">Il giudice assegna: solo titolo, solo artista, o tutt'e due (doppio)</div></div>
+        <button class="discsw" id="tg-double" type="button" role="switch" aria-checked="false"></button>
       </div>
       <div class="toggle-row">
-        <div><div class="trow-t">Indovina l'anno 🗓️</div><div class="trow-s">A fine brano si rivela l'anno di uscita: il giudice premia chi si è avvicinato di più</div></div>
-        <button class="switch" id="tg-year" type="button" role="switch" aria-checked="false"><span></span></button>
+        <div><div class="trow-t"><span class="ti" data-ic="calendar"></span>Indovina l'anno</div><div class="trow-s">A fine brano si rivela l'anno di uscita: il giudice premia chi si è avvicinato di più</div></div>
+        <button class="discsw" id="tg-year" type="button" role="switch" aria-checked="false"></button>
       </div>
       <div class="toggle-row">
-        <div><div class="trow-t">Squadre 👥</div><div class="trow-s">Tocca la lettera accanto a ogni giocatore per assegnare la squadra. In gioco si fa punto a squadre e dai un nome ai gruppi</div></div>
-        <button class="switch" id="tg-teams" type="button" role="switch" aria-checked="false"><span></span></button>
+        <div><div class="trow-t"><span class="ti" data-ic="users"></span>Squadre</div><div class="trow-s">Tocca la lettera accanto a ogni giocatore per assegnare la squadra. In gioco si fa punto a squadre e dai un nome ai gruppi</div></div>
+        <button class="discsw" id="tg-teams" type="button" role="switch" aria-checked="false"></button>
       </div>
       <div class="toggle-row" style="display:block;">
-        <div class="trow-t" style="margin-bottom:9px;">Tema colore 🌗</div>
+        <div class="trow-t" style="margin-bottom:11px;"><span class="ti" data-ic="theme"></span>Tema colore</div>
         <div class="swatches" id="swatches">
           <button class="swatch is-on" data-theme="fuoco" style="--sw:#FF5333" title="Fuoco"></button>
           <button class="swatch" data-theme="oceano" style="--sw:#2DD4BF" title="Oceano"></button>
@@ -429,7 +444,7 @@
         </div>
       </div>
       <div class="toggle-row" style="display:block;">
-        <div class="trow-t" style="margin-bottom:9px;">Volume 🔊</div>
+        <div class="trow-t" style="margin-bottom:11px;"><span class="ti" data-ic="sound"></span>Volume</div>
         <input type="range" id="rng-vol" class="vol" min="0" max="100" value="90">
       </div>
     </div>
@@ -454,18 +469,18 @@
       </div>
     </div>
     <div class="card">
-      <label>Riempi al volo da Deezer 🎲</label>
-      <button class="btn btn-ghost btn-sm" id="auto-top">🎲 Top del momento</button>
+      <label>Riempi al volo da Deezer</label>
+      <button class="btn btn-ghost btn-sm" id="auto-top"><span data-ic="dice"></span> Top del momento</button>
       <div class="row mt">
         <input type="text" id="auto-artist-name" placeholder="Nome artista (es. Vasco)" style="min-width:0;">
-        <button class="btn btn-solid btn-sm" id="auto-artist" style="flex:0 0 auto;width:auto;padding:13px 18px;">🎤 Top</button>
+        <button class="btn btn-solid btn-sm" id="auto-artist" style="flex:0 0 auto;width:auto;padding:13px 18px;"><span data-ic="mic"></span> Top</button>
       </div>
       <div class="snote" id="auto-note" style="display:none;margin-top:10px;"></div>
     </div>
 
     <div id="cat-container"></div>
 
-    <button class="btn btn-line btn-sm mt" id="btn-mix" style="display:none;">🔀 Mescola tutte le playlist</button>
+    <button class="btn btn-line btn-sm mt" id="btn-mix" style="display:none;"><span data-ic="shuffle"></span> Mescola tutte le playlist</button>
 
     <div class="divider"></div>
     <h2 class="title">Classifica</h2>
@@ -508,8 +523,8 @@
       <div class="score-grid" id="judge-grid"></div>
       <div class="hintbox" id="hintbox" style="display:none;"></div>
       <div class="row mt" id="aids-row">
-        <button class="btn btn-ghost btn-sm" id="btn-hint">💡 Indizio</button>
-        <button class="btn btn-ghost btn-sm" id="btn-jolly">🃏 Jolly</button>
+        <button class="btn btn-ghost btn-sm" id="btn-hint"><span data-ic="bulb"></span> Indizio</button>
+        <button class="btn btn-ghost btn-sm" id="btn-jolly"><span data-ic="joker"></span> Jolly</button>
       </div>
       <button class="btn btn-ghost mt" id="btn-pause"></button>
       <button class="btn btn-line mt" id="btn-nobody">Nessuno ha indovinato</button>
@@ -571,8 +586,22 @@ const ICON={
   pause:'<svg class="ic" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6.5" y="5" width="4" height="14" rx="1.2"/><rect x="13.5" y="5" width="4" height="14" rx="1.2"/></svg>',
   edit:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
   trash:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>',
-  check:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5L20 6"/></svg>'
+  check:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5L20 6"/></svg>',
+  clock:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>',
+  sound:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9v6h3l5 4V5L7 9z" fill="currentColor" stroke="none"/><path d="M16 9a4 4 0 0 1 0 6M18.6 6.4a7.5 7.5 0 0 1 0 11.2"/></svg>',
+  bulb:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.8.8 1 1.6 1 2.5h6c0-.9.2-1.7 1-2.5A6 6 0 0 0 12 3z"/></svg>',
+  joker:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="3" width="14" height="18" rx="2.5"/><path d="M12 7.6l1.2 2.5 2.7.3-2 1.9.5 2.7L12 13.6 9.6 15l.5-2.7-2-1.9 2.7-.3z" fill="currentColor" stroke="none"/></svg>',
+  plus:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
+  calendar:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="5" width="17" height="16" rx="2.5"/><path d="M3.5 9.5h17M8 3v4M16 3v4"/></svg>',
+  users:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.2"/><path d="M3.6 19c0-3 2.6-5 5.4-5s5.4 2 5.4 5"/><path d="M16 5.2a3 3 0 0 1 0 5.6M17 14.2c2.3.5 4 2.4 4 4.8"/></svg>',
+  theme:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17a8.5 8.5 0 0 0 0-17z" fill="currentColor" stroke="none"/></svg>',
+  dice:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3.5"/><circle cx="9" cy="9" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="9" r="1.3" fill="currentColor" stroke="none"/><circle cx="9" cy="15" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="15" r="1.3" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none"/></svg>',
+  mic:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"/></svg>',
+  shuffle:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 4l3 3-3 3"/><path d="M19 7h-3.2c-2 0-3.2 1.6-4.4 3.3M4 17h2.8c2 0 3.2-1.6 4.4-3.3"/><path d="M16 14l3 3-3 3"/><path d="M19 17h-3.2c-1 0-1.9-.4-2.6-1.1M4 7h2.8c1 0 1.9.4 2.6 1.1"/></svg>',
+  search:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/></svg>',
+  note:'<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9 17.3a2.5 2.5 0 1 1-2.5-2.5c.6 0 1.1.2 1.5.4V5l9-2v9.3a2.5 2.5 0 1 1-2.5-2.5c.6 0 1.1.2 1.5.4V6.2L9 7.7z"/></svg>'
 };
+function fillIcons(root){ (root||document).querySelectorAll('[data-ic]').forEach(el=>{ if(ICON[el.dataset.ic]) el.innerHTML=ICON[el.dataset.ic]; }); }
 
 /* ---------------- STATO (solo in memoria) ---------------- */
 const state = {
@@ -713,6 +742,13 @@ const rngVol=$('#rng-vol');
 if(rngVol) rngVol.addEventListener('input', ()=>{ state.settings.volume=rngVol.value/100; try{ audio.volume=state.settings.volume; }catch(e){} });
 applyTheme(state.settings.theme);
 
+/* icone stilizzate + interruttori a mini-disco */
+fillIcons(document);
+(function buildDiscSwitches(){
+  let notes=''; for(let k=0;k<4;k++) notes+='<i style="--nd:'+(k*0.38).toFixed(2)+'s">'+ICON.note+'</i>';
+  document.querySelectorAll('.discsw').forEach(el=>{ el.innerHTML='<span class="notes">'+notes+'</span><span class="mini-disc"></span>'; });
+})();
+
 /* menu a comparsa per scegliere un giocatore */
 function openChooser(title, sub, items, cb){
   const list=$('#modal-list');
@@ -743,7 +779,7 @@ function setupAids(){
 /* INDIZI (pagati coi gettoni, non coi punti) */
 $('#btn-hint').addEventListener('click', ()=>{
   if(state._hintLevel>=3){ flashToast('Indizi finiti per questo brano.'); return; }
-  const elig=S().map((p,i)=>({label:p.name, note:p.tokens+' 🪙', value:i, disabled:p.tokens<=0}));
+  const elig=S().map((p,i)=>({label:p.name, note:p.tokens+' gettoni', value:i, disabled:p.tokens<=0}));
   if(elig.every(e=>e.disabled)){ flashToast('Nessuno ha più gettoni.'); return; }
   openChooser(state.settings.teamsEnabled?'Quale gruppo usa un indizio?':'Chi usa un indizio?', 'Costa 1 gettone (non punti)', elig, i=>{
     S()[i].tokens--; state._hintLevel++;
@@ -767,7 +803,7 @@ function showHint(){
 
 /* JOLLY: salta il brano (nessun punto) */
 $('#btn-jolly').addEventListener('click', ()=>{
-  const elig=S().map((p,i)=>({label:p.name, note:p.jolly+' 🃏', value:i, disabled:p.jolly<=0}));
+  const elig=S().map((p,i)=>({label:p.name, note:p.jolly+' jolly', value:i, disabled:p.jolly<=0}));
   if(elig.every(e=>e.disabled)){ flashToast('Nessuno ha più jolly.'); return; }
   openChooser(state.settings.teamsEnabled?'Quale gruppo usa un jolly?':'Chi usa un jolly?', 'Salta questo brano, nessun punto in palio', elig, i=>{
     S()[i].jolly--; sfx('tick'); haptic([20,30]); stopScore();
@@ -782,7 +818,7 @@ $('#btn-mix').addEventListener('click', ()=>{
   state.categories.forEach(c=>c.songs.forEach(s=>all.push(s)));
   if(!all.length) return;
   for(let i=all.length-1;i>0;i--){ const j=(Math.random()*(i+1))|0; const t=all[i]; all[i]=all[j]; all[j]=t; }
-  startCategory({name:'Mix 🔀', songs:all});
+  startCategory({name:'Mix', songs:all});
 });
 
 $('#start-game').addEventListener('click', ()=>{
@@ -880,7 +916,7 @@ function renderCategories(){
         }).join('');
         resultsHtml='<div class="results">'
           +`<div class="results-head"><span>Tocca + per aggiungere</span>`
-          +`<button class="mini-x" data-close-results="${cat.id}">Chiudi ✕</button></div>`
+          +`<button class="mini-x" data-close-results="${cat.id}">Chiudi</button></div>`
           +items+'</div>';
       } else {
         resultsHtml='<div class="results"><div class="searching">Nessun risultato. Prova con un altro titolo o aggiungi l’artista.</div>'
