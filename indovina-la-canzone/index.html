@@ -192,7 +192,7 @@
   /* riproduzione audio */
   .player{display:flex;flex-direction:column;align-items:center;gap:16px;padding:28px 18px 22px;border-radius:16px;
     background:var(--surface);border:1px solid var(--line);margin-bottom:12px;}
-  .disc{width:140px;height:140px;border-radius:50%;position:relative;overflow:hidden;
+  .disc{width:140px;height:140px;flex:0 0 140px;aspect-ratio:1/1;border-radius:50%;position:relative;overflow:hidden;
     background-color:#171511;border:1px solid var(--line-strong);box-shadow:0 12px 34px rgba(0,0,0,.45);
     display:flex;align-items:center;justify-content:center;}
   .disc-art{position:absolute;inset:0;background-size:cover;background-position:center;z-index:0;
@@ -213,7 +213,7 @@
   .pfill{height:100%;width:0;background:var(--accent);border-radius:999px;}
   .ptime{width:100%;display:flex;justify-content:space-between;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;}
   /* giradischi: contenitore, puntina, countdown */
-  .discwrap{position:relative;width:140px;height:140px;display:flex;align-items:center;justify-content:center;}
+  .discwrap{position:relative;width:140px;height:140px;flex:0 0 140px;aspect-ratio:1/1;display:flex;align-items:center;justify-content:center;}
   .countdown{position:absolute;inset:-12px;display:none;align-items:center;justify-content:center;z-index:6;
     font-family:var(--serif);font-size:76px;font-weight:500;color:#fff;border-radius:50%;
     background:radial-gradient(circle at 50% 50%, rgba(16,15,13,.82), rgba(16,15,13,.45));
@@ -383,6 +383,10 @@
       <div id="players-list"></div>
       <button class="btn btn-ghost btn-sm mt" id="add-player">Aggiungi giocatore</button>
     </div>
+    <div class="card" id="team-names-card" style="display:none;">
+      <label>Nomi delle squadre</label>
+      <div id="team-names"></div>
+    </div>
     <div class="card">
       <label>Regole</label>
       <div class="toggle-row">
@@ -406,11 +410,7 @@
         <button class="switch" id="tg-double" type="button" role="switch" aria-checked="false"><span></span></button>
       </div>
       <div class="toggle-row">
-        <div><div class="trow-t">Doppio o niente 🎰</div><div class="trow-s">Un giocatore rischia: se indovina raddoppia, se sbaglia perde i punti in palio</div></div>
-        <button class="switch" id="tg-risk" type="button" role="switch" aria-checked="false"><span></span></button>
-      </div>
-      <div class="toggle-row">
-        <div><div class="trow-t">Squadre 👥</div><div class="trow-s">Tocca la lettera accanto a ogni giocatore per assegnare la squadra. Punteggio individuale + totale squadra</div></div>
+        <div><div class="trow-t">Squadre 👥</div><div class="trow-s">Tocca la lettera accanto a ogni giocatore per assegnare la squadra. In gioco si fa punto a squadre e dai un nome ai gruppi</div></div>
         <button class="switch" id="tg-teams" type="button" role="switch" aria-checked="false"><span></span></button>
       </div>
       <div class="toggle-row" style="display:block;">
@@ -455,7 +455,6 @@
     <div class="divider"></div>
     <h2 class="title">Classifica</h2>
     <div class="card"><ul class="rank" id="cat-rank"></ul></div>
-    <div class="card" id="cat-team-card" style="display:none;"><label>Classifica squadre</label><ul class="rank" id="cat-team-rank"></ul></div>
     <p class="hint">Scegli una playlist e premi “Gioca” per avviare il round.</p>
   </section>
 
@@ -489,13 +488,12 @@
     </div>
 
     <div id="judge-area">
-      <p class="judgeHead"><b>Chi ha indovinato?</b><span>Il giudice tocca il nome del giocatore</span></p>
+      <p class="judgeHead"><b>Chi ha indovinato?</b><span id="judge-sub">Il giudice tocca il nome del giocatore</span></p>
       <div class="score-grid" id="judge-grid"></div>
       <div class="hintbox" id="hintbox" style="display:none;"></div>
       <div class="row mt" id="aids-row">
         <button class="btn btn-ghost btn-sm" id="btn-hint">💡 Indizio</button>
         <button class="btn btn-ghost btn-sm" id="btn-jolly">🃏 Jolly</button>
-        <button class="btn btn-ghost btn-sm" id="btn-risk">🎰 Rischia</button>
       </div>
       <button class="btn btn-ghost mt" id="btn-pause"></button>
       <button class="btn btn-line mt" id="btn-nobody">Nessuno ha indovinato</button>
@@ -508,7 +506,6 @@
 
     <div class="divider"></div>
     <div class="card"><ul class="rank" id="play-rank"></ul></div>
-    <div class="card" id="play-team-card" style="display:none;"><label>Classifica squadre</label><ul class="rank" id="play-team-rank"></ul></div>
   </section>
 
   <!-- ===== 4. PREMIAZIONE FINALE ===== -->
@@ -526,7 +523,6 @@
     <div id="end-after" style="opacity:0;">
       <h2 class="title" style="text-align:center;margin:22px 0 14px;">Classifica</h2>
       <div class="card"><ul class="rank" id="end-rank"></ul></div>
-      <div class="card" id="end-team-card" style="display:none;"><label>Classifica squadre</label><ul class="rank" id="end-team-rank"></ul></div>
       <button class="btn btn-primary" id="btn-replay">Rigioca con questi giocatori</button>
       <button class="btn btn-line mt" id="btn-newgame">Nuova partita</button>
       <button class="btn btn-ghost btn-sm mt" id="btn-replay-anim">Rivedi premiazione</button>
@@ -568,9 +564,9 @@ const state = {
   catId: 0, songId: 0,
   currentCat: null, currentIndex: 0,
   _setupNames: ['',''], _focusSel: null,
-  settings: { timeScoring:true, sounds:true, volume:0.9, theme:'fuoco', hints:true, hintTokens:3, jolly:true, jollyCount:1, doublePoints:false, doubleOrNothing:false, teamsEnabled:false },
-  pointsInPlay: 1, _roundStart:0, _scoreTimer:null, _frozenEl:0, _cdTimer:null, _hintLevel:0, _risker:null, _riskStake:0,
-  _setupTeams:[0,1]
+  settings: { timeScoring:true, sounds:true, volume:0.9, theme:'fuoco', hints:true, hintTokens:3, jolly:true, jollyCount:1, doublePoints:false, teamsEnabled:false },
+  pointsInPlay: 1, _roundStart:0, _scoreTimer:null, _frozenEl:0, _cdTimer:null, _hintLevel:0,
+  _setupTeams:[0,1], teamNames:{}, teams:[]
 };
 const TEAMS=[{label:'A',color:'#FF5333'},{label:'B',color:'#2DD4BF'},{label:'C',color:'#A78BFA'},{label:'D',color:'#E8B23A'}];
 
@@ -643,6 +639,7 @@ function renderPlayerInputs(){
     $$('#players-list .icon-btn').forEach(b=>{b.disabled=true;b.style.opacity=.3;});
   }
   $('#add-player').disabled = state._setupNames.length>=10;
+  renderTeamNames();
 }
 renderPlayerInputs();
 
@@ -673,9 +670,19 @@ bindToggle('#tg-sound','sounds');
 bindToggle('#tg-hints','hints');
 bindToggle('#tg-jolly','jolly');
 bindToggle('#tg-double','doublePoints');
-bindToggle('#tg-risk','doubleOrNothing');
 bindToggle('#tg-teams','teamsEnabled');
 $('#tg-teams').addEventListener('click', ()=>renderPlayerInputs());
+$('#team-names').addEventListener('input', e=>{ if(e.target.dataset.teamname!==undefined) state.teamNames[+e.target.dataset.teamname]=e.target.value; });
+function renderTeamNames(){
+  const card=$('#team-names-card'), box=$('#team-names');
+  if(!card||!box) return;
+  if(!state.settings.teamsEnabled){ card.style.display='none'; return; }
+  const used=[...new Set(state._setupTeams.slice(0,state._setupNames.length))].sort((a,b)=>a-b);
+  card.style.display='';
+  box.innerHTML=used.map(idx=>`<div class="prow">
+    <button class="teamchip" style="--tc:${TEAMS[idx].color}" disabled>${TEAMS[idx].label}</button>
+    <input type="text" value="${escapeAttr(state.teamNames[idx]||'')}" placeholder="Squadra ${TEAMS[idx].label}" data-teamname="${idx}"></div>`).join('');
+}
 
 /* temi + volume */
 const swEl=$('#swatches');
@@ -710,29 +717,19 @@ $('#modal').addEventListener('click', e=>{ if(e.target.id==='modal') closeChoose
 
 /* aiuti in gioco: mostra/nascondi in base alle regole */
 function setupAids(){
-  const any = state.settings.hints || state.settings.jolly || state.settings.doubleOrNothing;
+  const any = state.settings.hints || state.settings.jolly;
   $('#aids-row').style.display = any ? 'flex':'none';
   $('#btn-hint').style.display = state.settings.hints ? 'flex':'none';
   $('#btn-jolly').style.display = state.settings.jolly ? 'flex':'none';
-  $('#btn-risk').style.display = state.settings.doubleOrNothing ? 'flex':'none';
 }
-
-/* DOPPIO O NIENTE: un giocatore rischia */
-$('#btn-risk').addEventListener('click', ()=>{
-  const elig=state.players.map((p,i)=>({label:p.name, note:(i===state._risker?'sta rischiando':''), value:i}));
-  openChooser('Chi rischia? 🎰', 'Se indovina raddoppia, se sbaglia perde i punti in palio', elig, i=>{
-    state._risker=i; state._riskStake = state.settings.timeScoring ? Math.max(1,state.pointsInPlay) : 1;
-    flashToast(state.players[i].name+' rischia: doppio o niente!'); sfx('tick'); haptic(30);
-  });
-});
 
 /* INDIZI (pagati coi gettoni, non coi punti) */
 $('#btn-hint').addEventListener('click', ()=>{
   if(state._hintLevel>=3){ flashToast('Indizi finiti per questo brano.'); return; }
-  const elig=state.players.map((p,i)=>({label:p.name, note:p.tokens+' 🪙', value:i, disabled:p.tokens<=0}));
+  const elig=S().map((p,i)=>({label:p.name, note:p.tokens+' 🪙', value:i, disabled:p.tokens<=0}));
   if(elig.every(e=>e.disabled)){ flashToast('Nessuno ha più gettoni.'); return; }
-  openChooser('Chi usa un indizio?', 'Costa 1 gettone (non punti)', elig, i=>{
-    state.players[i].tokens--; state._hintLevel++;
+  openChooser(state.settings.teamsEnabled?'Quale gruppo usa un indizio?':'Chi usa un indizio?', 'Costa 1 gettone (non punti)', elig, i=>{
+    S()[i].tokens--; state._hintLevel++;
     showHint(); sfx('tick'); haptic(20);
   });
 });
@@ -753,11 +750,11 @@ function showHint(){
 
 /* JOLLY: salta il brano (nessun punto) */
 $('#btn-jolly').addEventListener('click', ()=>{
-  const elig=state.players.map((p,i)=>({label:p.name, note:p.jolly+' 🃏', value:i, disabled:p.jolly<=0}));
+  const elig=S().map((p,i)=>({label:p.name, note:p.jolly+' 🃏', value:i, disabled:p.jolly<=0}));
   if(elig.every(e=>e.disabled)){ flashToast('Nessuno ha più jolly.'); return; }
-  openChooser('Chi usa un jolly?', 'Salta questo brano, nessun punto in palio', elig, i=>{
-    state.players[i].jolly--; sfx('tick'); haptic([20,30]); stopScore();
-    flashToast(state.players[i].name+' ha usato un jolly — si salta.');
+  openChooser(state.settings.teamsEnabled?'Quale gruppo usa un jolly?':'Chi usa un jolly?', 'Salta questo brano, nessun punto in palio', elig, i=>{
+    S()[i].jolly--; sfx('tick'); haptic([20,30]); stopScore();
+    flashToast(S()[i].name+' ha usato un jolly — si salta.');
     nextSong();
   });
 });
@@ -779,10 +776,20 @@ $('#start-game').addEventListener('click', ()=>{
   if(new Set(names.map(n=>n.toLowerCase())).size!==names.length){
     err.textContent='Ci sono nomi duplicati: rendili unici.'; err.classList.add('show'); return;
   }
+  if(state.settings.teamsEnabled){
+    const used=[...new Set(raw.map(p=>p.team))];
+    if(used.length<2){ err.textContent='In modalità squadre servono almeno 2 squadre diverse: tocca le lettere A/B accanto ai giocatori.'; err.classList.add('show'); return; }
+  }
   err.classList.remove('show');
   state.players = raw.map(p=>({name:p.name, score:0, team:p.team,
     tokens: state.settings.hints ? state.settings.hintTokens : 0,
     jolly:  state.settings.jolly ? state.settings.jollyCount : 0}));
+  if(state.settings.teamsEnabled){
+    const used=[...new Set(raw.map(p=>p.team))].sort((a,b)=>a-b);
+    state.teams = used.map(idx=>({ team:idx, name:teamName(idx), color:TEAMS[idx].color, score:0,
+      tokens: state.settings.hints ? state.settings.hintTokens : 0,
+      jolly:  state.settings.jolly ? state.settings.jollyCount : 0 }));
+  } else { state.teams=[]; }
   renderCategories();
   renderRank('#cat-rank');
   show('screen-cat');
@@ -1035,7 +1042,6 @@ function playCurrentSong(){
   if(song.cover){ art.style.backgroundImage='url("'+song.cover+'")'; disc.classList.add('has-art','blur'); }
   else { art.style.backgroundImage=''; disc.classList.remove('has-art','blur'); }
   disc.classList.remove('spin','blur-light'); armNeedle(false);
-  state._risker=null;
   state._hintLevel=0; $('#hintbox').style.display='none';
   setupAids();
   renderJudgeGrid();
@@ -1110,23 +1116,30 @@ function setPhase(ph){
   $('#reveal').style.display     = listening ? 'none':'block';
 }
 
+/* entità di gioco: in modalità squadre si gioca per GRUPPO, altrimenti per giocatore */
+function S(){ return state.settings.teamsEnabled ? state.teams : state.players; }
+function teamName(idx){ return (state.teamNames && state.teamNames[idx]) || ('Squadra '+TEAMS[idx].label); }
+
 function renderJudgeGrid(){
   const grid=$('#judge-grid');
   grid.innerHTML='';
-  state.players.forEach((p,i)=>{
+  S().forEach((e,i)=>{
     const b=document.createElement('button');
     b.className='pbtn';
-    b.innerHTML=`<span class="nm">${escapeHtml(p.name)}</span><span class="sc">${p.score}</span><span class="plus">+1</span>`;
+    const dot = e.color ? `<span class="tdot" style="background:${e.color}"></span>` : '';
+    b.innerHTML=`<span class="nm">${dot}${escapeHtml(e.name)}</span><span class="sc">${e.score}</span><span class="plus">+1</span>`;
     b.addEventListener('click', ()=>awardAndReveal(i));
     grid.appendChild(b);
   });
+  const sub=$('#judge-sub'); if(sub) sub.textContent = state.settings.teamsEnabled ? 'Il giudice tocca la squadra che ha indovinato' : 'Il giudice tocca il nome del giocatore';
   updatePoints();
 }
 function awardAndReveal(i){
   stopScore();
+  const e=S()[i];
   const base = state.settings.timeScoring ? Math.max(1,state.pointsInPlay) : 1;
   if(state.settings.doublePoints){
-    openChooser('Cosa ha indovinato '+state.players[i].name+'?', 'Una parte sola, o tutt\'e due (doppio)', [
+    openChooser('Cosa ha indovinato '+e.name+'?', 'Una parte sola, o tutt\'e due (doppio)', [
       {label:'Solo il titolo', note:'+'+base, value:1},
       {label:'Solo l\'artista', note:'+'+base, value:1},
       {label:'Titolo + artista', note:'+'+(base*2), value:2}
@@ -1136,22 +1149,15 @@ function awardAndReveal(i){
   }
 }
 function settleAward(i, pts){
-  let extra='';
-  if(state._risker!=null){
-    if(i===state._risker){ pts*=2; extra=' · DOPPIO 🎰'; }
-    else { const r=state.players[state._risker]; const lost=Math.min(r.score, state._riskStake); r.score-=lost; extra=` · ${r.name} rischiava: −${lost}`; }
-    state._risker=null;
-  }
-  state.players[i].score += pts;
+  const e=S()[i];
+  e.score += pts;
   sfx('ding'); haptic([25,40,25]);
-  revealAnswer(`${state.players[i].name} · +${pts}${extra}`);
+  revealAnswer(`${e.name} · +${pts}`);
 }
 $('#btn-nobody').addEventListener('click', ()=>{
   stopScore();
-  let extra='';
-  if(state._risker!=null){ const r=state.players[state._risker]; const lost=Math.min(r.score,state._riskStake); r.score-=lost; extra=` · ${r.name} rischiava: −${lost}`; state._risker=null; }
   sfx('buzz'); haptic(120);
-  revealAnswer('Nessuno ha indovinato'+extra);
+  revealAnswer('Nessuno ha indovinato');
 });
 function revealAnswer(msg){
   audio.pause(); disc.classList.remove('spin','blur'); armNeedle(false);   // copertina nitida sul disco al reveal
@@ -1187,41 +1193,21 @@ function backToCats(){ show('screen-cat'); renderCategories(); renderRank('#cat-
 /* ---------------- CLASSIFICA ---------------- */
 function renderRank(sel){
   const ul=$(sel); if(!ul) return;
-  const sorted=[...state.players].sort((a,b)=>b.score-a.score);
+  const sorted=[...S()].sort((a,b)=>b.score-a.score);
   const top=sorted.length?sorted[0].score:0;
-  const tm=state.settings.teamsEnabled;
   ul.innerHTML=sorted.map((p,i)=>{
     const lead = p.score===top && top>0 ? 'lead':'';
-    const dot = (tm && p.team!=null) ? `<span class="tdot" style="background:${TEAMS[p.team].color}"></span>`:'';
+    const dot = p.color ? `<span class="tdot" style="background:${p.color}"></span>`:'';
     return `<li class="${lead}"><span class="medal">${i+1}</span>
       <span class="pname">${dot}${escapeHtml(p.name)}</span>
       <span class="pscore">${p.score}</span></li>`;
-  }).join('');
-  const map={'#cat-rank':['#cat-team-rank','#cat-team-card'],'#play-rank':['#play-team-rank','#play-team-card'],'#end-rank':['#end-team-rank','#end-team-card']};
-  if(map[sel]) renderTeamRank(map[sel][0], map[sel][1]);
-}
-function renderTeamRank(sel, cardSel){
-  const ul=$(sel), card=$(cardSel); if(!ul) return;
-  if(!state.settings.teamsEnabled){ if(card) card.style.display='none'; return; }
-  const totals={};
-  state.players.forEach(p=>{ const t=p.team||0; totals[t]=(totals[t]||0)+p.score; });
-  const teams=Object.keys(totals).map(t=>({t:+t, score:totals[t]}));
-  if(teams.length<2){ if(card) card.style.display='none'; return; }
-  if(card) card.style.display='';
-  teams.sort((a,b)=>b.score-a.score);
-  const top=teams[0].score;
-  ul.innerHTML=teams.map(x=>{
-    const lead = x.score===top && top>0 ? 'lead':'';
-    return `<li class="${lead}"><span class="medal" style="background:${TEAMS[x.t].color};border-color:${TEAMS[x.t].color};color:#fff;">${TEAMS[x.t].label}</span>
-      <span class="pname">Squadra ${TEAMS[x.t].label}</span>
-      <span class="pscore">${x.score}</span></li>`;
   }).join('');
 }
 
 /* ---------------- 4. FINE PARTITA + PREMIAZIONE ---------------- */
 function endGame(){
   stopAudio();
-  const sorted=[...state.players].sort((a,b)=>b.score-a.score);
+  const sorted=[...S()].sort((a,b)=>b.score-a.score);
   const top=sorted[0].score;
   const winners=sorted.filter(p=>p.score===top && top>0);
   $('#end-kicker').textContent = top===0 ? 'Partita conclusa'
@@ -1292,7 +1278,7 @@ function runPodiumAnim(){
 
 $('#btn-replay-anim').addEventListener('click', runPodiumAnim);
 $('#btn-replay').addEventListener('click', ()=>{
-  state.players.forEach(p=>{ p.score=0;
+  S().forEach(p=>{ p.score=0;
     p.tokens=state.settings.hints?state.settings.hintTokens:0;
     p.jolly=state.settings.jolly?state.settings.jollyCount:0; });
   renderCategories(); renderRank('#cat-rank'); show('screen-cat');
