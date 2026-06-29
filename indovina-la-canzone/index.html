@@ -212,6 +212,36 @@
   .pbar{width:100%;height:7px;border-radius:999px;background:var(--surface-2);overflow:hidden;}
   .pfill{height:100%;width:0;background:var(--accent);border-radius:999px;}
   .ptime{width:100%;display:flex;justify-content:space-between;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;}
+  /* giradischi: contenitore, puntina, countdown */
+  .discwrap{position:relative;width:140px;height:140px;display:flex;align-items:center;justify-content:center;}
+  .tonearm{position:absolute;top:-6px;right:2px;width:9px;height:74px;border-radius:5px;z-index:4;
+    background:linear-gradient(180deg,#d4cec2,#8a857a);transform-origin:top center;transform:rotate(40deg);
+    transition:transform .5s cubic-bezier(.5,.1,.3,1);box-shadow:0 1px 4px rgba(0,0,0,.5);pointer-events:none;}
+  .tonearm::before{content:"";position:absolute;top:-8px;left:-6px;width:21px;height:21px;border-radius:50%;
+    background:#2a2722;border:1px solid var(--line-strong);}
+  .tonearm::after{content:"";position:absolute;bottom:-6px;left:-3px;width:15px;height:13px;border-radius:3px;background:#46403799;}
+  .tonearm.down{transform:rotate(11deg);}
+  .countdown{position:absolute;inset:-12px;display:none;align-items:center;justify-content:center;z-index:6;
+    font-family:var(--serif);font-size:76px;font-weight:500;color:#fff;border-radius:50%;
+    background:radial-gradient(circle at 50% 50%, rgba(16,15,13,.82), rgba(16,15,13,.45));
+    text-shadow:0 4px 26px rgba(255,83,51,.65);}
+  .countdown.cdshow{display:flex;}
+  .countdown.pop{animation:cdpop .42s ease;}
+  @keyframes cdpop{0%{transform:scale(.5);opacity:.2;}60%{transform:scale(1.16);opacity:1;}100%{transform:scale(1);}}
+  .points-play{text-align:center;font-size:13px;font-weight:600;letter-spacing:.03em;color:var(--accent);
+    background:rgba(255,83,51,.08);border:1px solid rgba(255,83,51,.32);border-radius:999px;
+    padding:8px 16px;margin:0 auto 14px;width:fit-content;}
+  /* interruttori (toggle) */
+  .toggle-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:11px 0;}
+  .toggle-row+.toggle-row{border-top:1px solid var(--line);}
+  .trow-t{font-size:15px;font-weight:500;}
+  .trow-s{font-size:12.5px;color:var(--muted);margin-top:2px;line-height:1.35;}
+  .switch{flex:0 0 auto;width:50px;height:30px;border-radius:999px;border:1px solid var(--line-strong);
+    background:var(--surface-2);position:relative;cursor:pointer;padding:0;transition:background .15s ease,border-color .15s ease;}
+  .switch span{position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:var(--muted);
+    transition:transform .18s ease,background .15s ease;}
+  .switch.on{background:rgba(255,83,51,.25);border-color:var(--accent);}
+  .switch.on span{transform:translateX(20px);background:var(--accent);}
   .nowplaying{display:flex;justify-content:space-between;align-items:baseline;margin:4px 0 14px;}
   .nowplaying .cat{font-family:var(--serif);font-weight:500;font-size:20px;}
   .nowplaying .cnt{color:var(--muted);font-size:13px;letter-spacing:.04em;}
@@ -326,6 +356,17 @@
       <div id="players-list"></div>
       <button class="btn btn-ghost btn-sm mt" id="add-player">Aggiungi giocatore</button>
     </div>
+    <div class="card">
+      <label>Regole</label>
+      <div class="toggle-row">
+        <div><div class="trow-t">Punteggio a tempo</div><div class="trow-s">I punti calano coi secondi: chi indovina prima vince di più</div></div>
+        <button class="switch on" id="tg-time" type="button" role="switch" aria-checked="true"><span></span></button>
+      </div>
+      <div class="toggle-row">
+        <div><div class="trow-t">Suoni ed effetti</div><div class="trow-s">Countdown, campanello, buzzer, applausi e vibrazione</div></div>
+        <button class="switch on" id="tg-sound" type="button" role="switch" aria-checked="true"><span></span></button>
+      </div>
+    </div>
     <button class="btn btn-primary" id="start-game">Inizia partita</button>
     <div class="err" id="setup-err"></div>
     <p class="hint">Nessun account, nessun costo, nessuna pubblicità. Tutto resta su questo dispositivo.</p>
@@ -367,10 +408,15 @@
     </div>
 
     <div class="player">
-      <div class="disc spin" id="disc"><div class="disc-art" id="disc-art"></div><span class="q" id="disc-q">?</span></div>
+      <div class="discwrap">
+        <div class="disc spin" id="disc"><div class="disc-art" id="disc-art"></div><span class="q" id="disc-q">?</span></div>
+        <div class="tonearm" id="tonearm"></div>
+        <div class="countdown" id="countdown"></div>
+      </div>
       <div class="pbar"><div class="pfill" id="pfill"></div></div>
       <div class="ptime"><span id="pcur">0:00</span><span id="pdur">0:30</span></div>
     </div>
+    <div class="points-play" id="points-play" style="display:none;">Punti in palio: 10</div>
     <audio id="audio" playsinline preload="auto"></audio>
 
     <div class="reveal" id="reveal" style="display:none;">
@@ -441,7 +487,9 @@ const state = {
   players: [], categories: [],
   catId: 0, songId: 0,
   currentCat: null, currentIndex: 0,
-  _setupNames: ['',''], _focusSel: null
+  _setupNames: ['',''], _focusSel: null,
+  settings: { timeScoring:true, sounds:true },
+  pointsInPlay: 1, _roundStart:0, _scoreTimer:null, _frozenEl:0, _cdTimer:null
 };
 
 /* ---------------- UTIL ---------------- */
@@ -456,6 +504,29 @@ function show(id){
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 const escapeAttr = escapeHtml;
 const getCat  = id => state.categories.find(c=>c.id===id);
+
+/* ---------------- SUONI (sintetizzati, niente file) + VIBRAZIONE ---------------- */
+let _ac=null;
+function audioCtx(){ if(!_ac){ try{ _ac=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } return _ac; }
+function beep(freq,dur,type,vol,when){
+  const ac=audioCtx(); if(!ac) return;
+  const t=ac.currentTime+(when||0);
+  const o=ac.createOscillator(), g=ac.createGain();
+  o.type=type||'sine'; o.frequency.value=freq;
+  g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(vol||0.2,t+0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  o.connect(g); g.connect(ac.destination); o.start(t); o.stop(t+dur+0.03);
+}
+function sfx(name){
+  if(!state.settings.sounds) return;
+  const ac=audioCtx(); if(ac && ac.state==='suspended'){ try{ ac.resume(); }catch(e){} }
+  if(name==='tick'){ beep(760,0.09,'square',0.16); }
+  else if(name==='go'){ beep(1400,0.28,'square',0.22); }
+  else if(name==='ding'){ beep(880,0.12,'sine',0.28); beep(1320,0.30,'sine',0.24,0.10); }
+  else if(name==='buzz'){ beep(150,0.42,'sawtooth',0.22); beep(120,0.42,'sawtooth',0.18,0.02); }
+  else if(name==='win'){ [523,659,784,1047,1319].forEach((f,i)=>beep(f,0.55,'triangle',0.2,i*0.11)); }
+}
+function haptic(p){ try{ if(navigator.vibrate) navigator.vibrate(p); }catch(e){} }
 
 /* ---------------- 1. SETUP GIOCATORI ---------------- */
 const playersList = $('#players-list');
@@ -488,6 +559,18 @@ playersList.addEventListener('click', e=>{
 $('#add-player').addEventListener('click', ()=>{
   if(state._setupNames.length<10){ state._setupNames.push(''); renderPlayerInputs(); }
 });
+
+function bindToggle(sel,key){
+  const el=$(sel); if(!el) return;
+  el.addEventListener('click', ()=>{
+    state.settings[key]=!state.settings[key];
+    el.classList.toggle('on', state.settings[key]);
+    el.setAttribute('aria-checked', state.settings[key]?'true':'false');
+    if(key==='sounds' && state.settings.sounds){ const ac=audioCtx(); if(ac&&ac.state==='suspended'){ try{ac.resume();}catch(e){} } sfx('tick'); haptic(15); }
+  });
+}
+bindToggle('#tg-time','timeScoring');
+bindToggle('#tg-sound','sounds');
 
 $('#start-game').addEventListener('click', ()=>{
   const names = state._setupNames.map(n=>n.trim()).filter(Boolean);
@@ -742,23 +825,74 @@ function playCurrentSong(){
   const song=cat.songs[state.currentIndex];
   $('#play-cnt').textContent=`Brano ${state.currentIndex+1} di ${cat.songs.length}`;
   setPhase('listening');
-  paused=false; $('#btn-pause').innerHTML=ICON.pause+' Pausa';
+  paused=false; setPauseBtn();
   $('#pfill').style.width='0%'; $('#pcur').textContent='0:00';
   const art=$('#disc-art');
   if(song.cover){ art.style.backgroundImage='url("'+song.cover+'")'; disc.classList.add('has-art','blur'); }
   else { art.style.backgroundImage=''; disc.classList.remove('has-art','blur'); }
-  disc.classList.add('spin');
+  disc.classList.remove('spin'); armNeedle(false);
   renderJudgeGrid();
   renderRank('#play-rank');
-  audio.src=song.preview;
-  const p=audio.play();
-  if(p && p.catch) p.catch(()=>{ /* l'utente potrà premere Riascolta */ });
+  // prepara e "sblocca" l'audio entro il gesto (necessario su iPhone), muto per non fare blip
+  audio.src=song.preview; audio.muted=true;
+  try{ const p=audio.play(); if(p&&p.then) p.then(()=>{ audio.pause(); audio.currentTime=0; }).catch(()=>{}); }catch(e){}
+  // countdown 3·2·1 poi il brano parte davvero
+  runCountdown(()=>{
+    audio.currentTime=0; audio.muted=false;
+    const p=audio.play(); if(p&&p.catch) p.catch(()=>{});
+    disc.classList.add('spin'); armNeedle(true);
+    startScore();
+  });
 }
 
+function runCountdown(go){
+  const ov=$('#countdown'); if(!ov){ go(); return; }
+  let n=3;
+  ov.className='cdshow pop'; ov.textContent=n; sfx('tick'); haptic(20);
+  clearInterval(state._cdTimer);
+  state._cdTimer=setInterval(()=>{
+    n--;
+    if(n>0){ ov.textContent=n; ov.classList.remove('pop'); void ov.offsetWidth; ov.classList.add('pop'); sfx('tick'); haptic(20); }
+    else{
+      clearInterval(state._cdTimer); state._cdTimer=null;
+      ov.textContent='▶'; ov.classList.remove('pop'); void ov.offsetWidth; ov.classList.add('pop'); sfx('go'); haptic(40);
+      setTimeout(()=>{ ov.className=''; go(); }, 340);
+    }
+  },780);
+}
+
+/* ---- punteggio a tempo ---- */
+function startScore(){
+  state.pointsInPlay = state.settings.timeScoring ? 10 : 1;
+  state._roundStart = performance.now();
+  updatePoints(); startScoreInterval();
+}
+function startScoreInterval(){
+  clearInterval(state._scoreTimer); state._scoreTimer=null;
+  if(!state.settings.timeScoring) return;
+  state._scoreTimer=setInterval(()=>{
+    const el=(performance.now()-state._roundStart)/1000;
+    const pts=Math.max(1, Math.ceil(10*(1 - el/30)));
+    if(pts!==state.pointsInPlay){ state.pointsInPlay=pts; updatePoints(); }
+    if(el>=30){ clearInterval(state._scoreTimer); state._scoreTimer=null; }
+  },200);
+}
+function freezeScore(){ if(state._scoreTimer){ clearInterval(state._scoreTimer); state._scoreTimer=null; } state._frozenEl=performance.now()-state._roundStart; }
+function resumeScore(){ if(!state.settings.timeScoring) return; state._roundStart=performance.now()-(state._frozenEl||0); startScoreInterval(); }
+function stopScore(){ if(state._scoreTimer){ clearInterval(state._scoreTimer); state._scoreTimer=null; } }
+function updatePoints(){
+  const v = state.settings.timeScoring ? state.pointsInPlay : 1;
+  const badge=$('#points-play');
+  if(badge){ badge.style.display = state.settings.timeScoring ? 'block':'none'; badge.textContent='Punti in palio: '+v; }
+  $$('#judge-grid .pbtn .plus').forEach(p=>{ p.textContent='+'+v; });
+}
+function armNeedle(on){ const t=$('#tonearm'); if(t) t.classList.toggle('down', !!on); }
+function setPauseBtn(){ $('#btn-pause').innerHTML = paused ? ICON.play+' Riprendi' : ICON.pause+' Pausa'; }
+
 $('#btn-pause').addEventListener('click', ()=>{
-  if(audio.ended){ audio.currentTime=0; audio.play(); disc.classList.add('spin'); paused=false; $('#btn-pause').innerHTML=ICON.pause+' Pausa'; return; }
-  if(paused){ audio.play(); paused=false; disc.classList.add('spin'); $('#btn-pause').innerHTML=ICON.pause+' Pausa'; }
-  else      { audio.pause(); paused=true; disc.classList.remove('spin'); $('#btn-pause').innerHTML=ICON.play+' Riprendi'; }
+  if(audio.ended){ audio.currentTime=0; audio.muted=false; audio.play(); disc.classList.add('spin'); armNeedle(true); paused=false; setPauseBtn(); return; }
+  if(paused){ audio.play(); paused=false; disc.classList.add('spin'); armNeedle(true); setPauseBtn(); resumeScore(); }
+  else      { audio.pause(); paused=true; disc.classList.remove('spin'); armNeedle(false); setPauseBtn(); freezeScore(); }
 });
 
 function setPhase(ph){
@@ -778,16 +912,22 @@ function renderJudgeGrid(){
     b.addEventListener('click', ()=>awardAndReveal(i));
     grid.appendChild(b);
   });
+  updatePoints();
 }
 function awardAndReveal(i){
-  state.players[i].score++;
-  revealAnswer(`${state.players[i].name} · +1`);
+  stopScore();
+  const pts = state.settings.timeScoring ? Math.max(1,state.pointsInPlay) : 1;
+  state.players[i].score += pts;
+  sfx('ding'); haptic([25,40,25]);
+  revealAnswer(`${state.players[i].name} · +${pts}`);
 }
 $('#btn-nobody').addEventListener('click', ()=>{
+  stopScore();
+  sfx('buzz'); haptic(120);
   revealAnswer('Nessuno ha indovinato');
 });
 function revealAnswer(msg){
-  audio.pause(); disc.classList.remove('spin','blur');   // copertina nitida sul disco al reveal
+  audio.pause(); disc.classList.remove('spin','blur'); armNeedle(false);   // copertina nitida sul disco al reveal
   const song=state.currentCat.songs[state.currentIndex];
   $('#reveal-title').textContent=song.title;
   $('#reveal-artist').textContent=song.artist||'';
@@ -811,7 +951,7 @@ function nextSong(){
     flashToast('Playlist finita — scegline un’altra o termina la partita.');
   }
 }
-function stopAudio(){ try{ audio.pause(); audio.removeAttribute('src'); audio.load(); }catch(e){} disc.classList.remove('spin','has-art','blur'); }
+function stopAudio(){ try{ audio.pause(); audio.removeAttribute('src'); audio.load(); }catch(e){} disc.classList.remove('spin','has-art','blur'); armNeedle(false); stopScore(); clearInterval(state._cdTimer); state._cdTimer=null; const ov=$('#countdown'); if(ov) ov.className=''; }
 
 $('#play-back').addEventListener('click', ()=>{ stopAudio(); backToCats(); });
 $('#play-end').addEventListener('click', endGame);
@@ -842,6 +982,7 @@ function endGame(){
   renderRank('#end-rank');
   show('screen-end');
   runPodiumAnim();
+  if(top>0){ setTimeout(()=>{ sfx('win'); haptic([40,50,40,50,90]); }, 1600); }
 }
 
 function initials(name){
