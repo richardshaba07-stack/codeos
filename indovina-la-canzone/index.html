@@ -198,13 +198,14 @@
   .disc-art{position:absolute;inset:0;background-size:cover;background-position:center;z-index:0;
     opacity:0;transition:opacity .45s ease, filter .45s ease;}
   .disc.has-art .disc-art{opacity:1;}
-  .disc.blur .disc-art{filter:blur(13px) brightness(.72) saturate(1.15);}
+  .disc.blur .disc-art{filter:blur(12px) brightness(.92) saturate(1.25);}
   .disc.has-art .q{display:none;}
   .disc::before{content:"";position:absolute;inset:0;border-radius:50%;z-index:1;
     background:radial-gradient(circle at 50% 50%, rgba(0,0,0,0) 0 26%, rgba(16,15,13,.0) 27%),
     repeating-radial-gradient(circle at 50% 50%, rgba(255,255,255,.05) 0 2px, rgba(0,0,0,.18) 2px 4px);}
-  .disc::after{content:"";position:absolute;width:30px;height:30px;border-radius:50%;z-index:2;
-    background:var(--surface-2);border:1px solid var(--line-strong);box-shadow:inset 0 0 0 6px var(--accent);}
+  .disc::after{content:"";position:absolute;width:34px;height:34px;border-radius:50%;z-index:2;
+    background:radial-gradient(circle at 50% 50%, #3a352e 0 14%, #0d0c0a 16% 100%);
+    border:1px solid rgba(255,255,255,.14);box-shadow:0 0 0 2px rgba(0,0,0,.5);}
   .disc.spin{animation:spin 3.2s linear infinite;}
   @keyframes spin{to{transform:rotate(360deg);}}
   .disc .q{position:relative;z-index:3;font-family:var(--serif);font-size:46px;color:var(--accent);}
@@ -395,6 +396,14 @@
         <div><div class="trow-t">Jolly 🃏</div><div class="trow-s">Ogni giocatore ha 1 jolly per saltare un brano troppo difficile</div></div>
         <button class="switch on" id="tg-jolly" type="button" role="switch" aria-checked="true"><span></span></button>
       </div>
+      <div class="toggle-row">
+        <div><div class="trow-t">Doppio punto ➕</div><div class="trow-s">Il giudice assegna: solo titolo, solo artista, o tutt'e due (doppio)</div></div>
+        <button class="switch" id="tg-double" type="button" role="switch" aria-checked="false"><span></span></button>
+      </div>
+      <div class="toggle-row">
+        <div><div class="trow-t">Doppio o niente 🎰</div><div class="trow-s">Un giocatore rischia: se indovina raddoppia, se sbaglia perde i punti in palio</div></div>
+        <button class="switch" id="tg-risk" type="button" role="switch" aria-checked="false"><span></span></button>
+      </div>
       <div class="toggle-row" style="display:block;">
         <div class="trow-t" style="margin-bottom:9px;">Tema colore 🌗</div>
         <div class="swatches" id="swatches">
@@ -476,6 +485,7 @@
       <div class="row mt" id="aids-row">
         <button class="btn btn-ghost btn-sm" id="btn-hint">💡 Indizio</button>
         <button class="btn btn-ghost btn-sm" id="btn-jolly">🃏 Jolly</button>
+        <button class="btn btn-ghost btn-sm" id="btn-risk">🎰 Rischia</button>
       </div>
       <button class="btn btn-ghost mt" id="btn-pause"></button>
       <button class="btn btn-line mt" id="btn-nobody">Nessuno ha indovinato</button>
@@ -546,8 +556,8 @@ const state = {
   catId: 0, songId: 0,
   currentCat: null, currentIndex: 0,
   _setupNames: ['',''], _focusSel: null,
-  settings: { timeScoring:true, sounds:true, volume:0.9, theme:'fuoco', hints:true, hintTokens:3, jolly:true, jollyCount:1 },
-  pointsInPlay: 1, _roundStart:0, _scoreTimer:null, _frozenEl:0, _cdTimer:null, _hintLevel:0
+  settings: { timeScoring:true, sounds:true, volume:0.9, theme:'fuoco', hints:true, hintTokens:3, jolly:true, jollyCount:1, doublePoints:false, doubleOrNothing:false },
+  pointsInPlay: 1, _roundStart:0, _scoreTimer:null, _frozenEl:0, _cdTimer:null, _hintLevel:0, _risker:null, _riskStake:0
 };
 
 /* ---------------- TEMI COLORE ---------------- */
@@ -644,6 +654,8 @@ bindToggle('#tg-time','timeScoring');
 bindToggle('#tg-sound','sounds');
 bindToggle('#tg-hints','hints');
 bindToggle('#tg-jolly','jolly');
+bindToggle('#tg-double','doublePoints');
+bindToggle('#tg-risk','doubleOrNothing');
 
 /* temi + volume */
 const swEl=$('#swatches');
@@ -678,11 +690,21 @@ $('#modal').addEventListener('click', e=>{ if(e.target.id==='modal') closeChoose
 
 /* aiuti in gioco: mostra/nascondi in base alle regole */
 function setupAids(){
-  const any = state.settings.hints || state.settings.jolly;
+  const any = state.settings.hints || state.settings.jolly || state.settings.doubleOrNothing;
   $('#aids-row').style.display = any ? 'flex':'none';
   $('#btn-hint').style.display = state.settings.hints ? 'flex':'none';
   $('#btn-jolly').style.display = state.settings.jolly ? 'flex':'none';
+  $('#btn-risk').style.display = state.settings.doubleOrNothing ? 'flex':'none';
 }
+
+/* DOPPIO O NIENTE: un giocatore rischia */
+$('#btn-risk').addEventListener('click', ()=>{
+  const elig=state.players.map((p,i)=>({label:p.name, note:(i===state._risker?'sta rischiando':''), value:i}));
+  openChooser('Chi rischia? 🎰', 'Se indovina raddoppia, se sbaglia perde i punti in palio', elig, i=>{
+    state._risker=i; state._riskStake = state.settings.timeScoring ? Math.max(1,state.pointsInPlay) : 1;
+    flashToast(state.players[i].name+' rischia: doppio o niente!'); sfx('tick'); haptic(30);
+  });
+});
 
 /* INDIZI (pagati coi gettoni, non coi punti) */
 $('#btn-hint').addEventListener('click', ()=>{
@@ -989,9 +1011,10 @@ function playCurrentSong(){
   paused=false; setPauseBtn();
   $('#pfill').style.width='0%'; $('#pcur').textContent='0:00';
   const art=$('#disc-art');
-  if(song.cover){ art.style.backgroundImage='url("'+song.cover+'")'; disc.classList.add('has-art'); }
-  else { art.style.backgroundImage=''; disc.classList.remove('has-art'); }
-  disc.classList.remove('spin','blur','blur-light'); armNeedle(false);
+  if(song.cover){ art.style.backgroundImage='url("'+song.cover+'")'; disc.classList.add('has-art','blur'); }
+  else { art.style.backgroundImage=''; disc.classList.remove('has-art','blur'); }
+  disc.classList.remove('spin','blur-light'); armNeedle(false);
+  state._risker=null;
   state._hintLevel=0; $('#hintbox').style.display='none';
   setupAids();
   renderJudgeGrid();
@@ -1080,15 +1103,34 @@ function renderJudgeGrid(){
 }
 function awardAndReveal(i){
   stopScore();
-  const pts = state.settings.timeScoring ? Math.max(1,state.pointsInPlay) : 1;
+  const base = state.settings.timeScoring ? Math.max(1,state.pointsInPlay) : 1;
+  if(state.settings.doublePoints){
+    openChooser('Cosa ha indovinato '+state.players[i].name+'?', 'Una parte sola, o tutt\'e due (doppio)', [
+      {label:'Solo il titolo', note:'+'+base, value:1},
+      {label:'Solo l\'artista', note:'+'+base, value:1},
+      {label:'Titolo + artista', note:'+'+(base*2), value:2}
+    ], mult=>settleAward(i, base*mult));
+  } else {
+    settleAward(i, base);
+  }
+}
+function settleAward(i, pts){
+  let extra='';
+  if(state._risker!=null){
+    if(i===state._risker){ pts*=2; extra=' · DOPPIO 🎰'; }
+    else { const r=state.players[state._risker]; const lost=Math.min(r.score, state._riskStake); r.score-=lost; extra=` · ${r.name} rischiava: −${lost}`; }
+    state._risker=null;
+  }
   state.players[i].score += pts;
   sfx('ding'); haptic([25,40,25]);
-  revealAnswer(`${state.players[i].name} · +${pts}`);
+  revealAnswer(`${state.players[i].name} · +${pts}${extra}`);
 }
 $('#btn-nobody').addEventListener('click', ()=>{
   stopScore();
+  let extra='';
+  if(state._risker!=null){ const r=state.players[state._risker]; const lost=Math.min(r.score,state._riskStake); r.score-=lost; extra=` · ${r.name} rischiava: −${lost}`; state._risker=null; }
   sfx('buzz'); haptic(120);
-  revealAnswer('Nessuno ha indovinato');
+  revealAnswer('Nessuno ha indovinato'+extra);
 });
 function revealAnswer(msg){
   audio.pause(); disc.classList.remove('spin','blur'); armNeedle(false);   // copertina nitida sul disco al reveal
