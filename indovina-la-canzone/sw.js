@@ -2,7 +2,7 @@
    Strategia: cache dell'app shell (stale-while-revalidate) per le risorse
    dello stesso dominio; tutto il resto (anteprime Deezer, Google Fonts) passa
    direttamente alla rete. Cambia CACHE per forzare un aggiornamento. */
-const CACHE = 'ilc-v4';
+const CACHE = 'ilc-v5';
 const ASSETS = [
   './',
   './index.html',
