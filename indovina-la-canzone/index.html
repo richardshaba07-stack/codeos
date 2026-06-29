@@ -214,13 +214,6 @@
   .ptime{width:100%;display:flex;justify-content:space-between;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;}
   /* giradischi: contenitore, puntina, countdown */
   .discwrap{position:relative;width:140px;height:140px;display:flex;align-items:center;justify-content:center;}
-  .tonearm{position:absolute;top:-6px;right:2px;width:9px;height:74px;border-radius:5px;z-index:4;
-    background:linear-gradient(180deg,#d4cec2,#8a857a);transform-origin:top center;transform:rotate(40deg);
-    transition:transform .5s cubic-bezier(.5,.1,.3,1);box-shadow:0 1px 4px rgba(0,0,0,.5);pointer-events:none;}
-  .tonearm::before{content:"";position:absolute;top:-8px;left:-6px;width:21px;height:21px;border-radius:50%;
-    background:#2a2722;border:1px solid var(--line-strong);}
-  .tonearm::after{content:"";position:absolute;bottom:-6px;left:-3px;width:15px;height:13px;border-radius:3px;background:#46403799;}
-  .tonearm.down{transform:rotate(11deg);}
   .countdown{position:absolute;inset:-12px;display:none;align-items:center;justify-content:center;z-index:6;
     font-family:var(--serif);font-size:76px;font-weight:500;color:#fff;border-radius:50%;
     background:radial-gradient(circle at 50% 50%, rgba(16,15,13,.82), rgba(16,15,13,.45));
@@ -242,6 +235,35 @@
     transition:transform .18s ease,background .15s ease;}
   .switch.on{background:rgba(255,83,51,.25);border-color:var(--accent);}
   .switch.on span{transform:translateX(20px);background:var(--accent);}
+  .swatches{display:flex;gap:12px;}
+  .swatch{width:34px;height:34px;border-radius:50%;background:var(--sw);border:2px solid transparent;cursor:pointer;padding:0;
+    box-shadow:0 0 0 1px var(--line);transition:transform .1s ease;}
+  .swatch:active{transform:scale(.9);}
+  .swatch.is-on{border-color:var(--text);box-shadow:0 0 0 2px var(--bg),0 0 0 4px var(--sw);}
+  .vol{-webkit-appearance:none;appearance:none;width:100%;height:6px;border-radius:999px;background:var(--surface-2);outline:none;}
+  .vol::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid var(--bg);}
+  .vol::-moz-range-thumb{width:22px;height:22px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid var(--bg);}
+  /* aiuti in gioco */
+  .hintbox{text-align:center;font-size:14px;line-height:1.5;color:var(--gold);background:rgba(232,199,107,.08);
+    border:1px solid rgba(232,199,107,.3);border-radius:12px;padding:11px 13px;margin-top:12px;}
+  .hintbox b{font-family:var(--serif);font-weight:500;font-size:17px;color:var(--text);}
+  #aids-row .btn{position:relative;}
+  .disc.blur-light .disc-art{filter:blur(5px) brightness(.82) saturate(1.15);}
+  /* menu a comparsa */
+  .modal{position:fixed;inset:0;z-index:200;display:none;align-items:flex-end;justify-content:center;
+    background:rgba(0,0,0,.55);padding:0 14px calc(20px + env(safe-area-inset-bottom));}
+  .modal.show{display:flex;animation:fade .2s ease;}
+  .modal-card{background:var(--surface);border:1px solid var(--line-strong);border-radius:18px;padding:18px;
+    width:100%;max-width:460px;box-shadow:0 18px 50px rgba(0,0,0,.6);}
+  .modal-title{font-family:var(--serif);font-size:21px;font-weight:500;}
+  .modal-sub{color:var(--muted);font-size:13px;margin:4px 0 14px;}
+  .modal-list{display:grid;gap:9px;}
+  .mopt{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;border-radius:12px;
+    border:1px solid var(--line);background:var(--surface-2);color:var(--text);font-family:var(--sans);font-size:16px;
+    font-weight:500;cursor:pointer;text-align:left;width:100%;}
+  .mopt:active{transform:scale(.985);border-color:var(--accent);}
+  .mopt[disabled]{opacity:.4;}
+  .mopt .tok{font-size:13px;color:var(--gold);font-weight:600;}
   .nowplaying{display:flex;justify-content:space-between;align-items:baseline;margin:4px 0 14px;}
   .nowplaying .cat{font-family:var(--serif);font-weight:500;font-size:20px;}
   .nowplaying .cnt{color:var(--muted);font-size:13px;letter-spacing:.04em;}
@@ -366,6 +388,27 @@
         <div><div class="trow-t">Suoni ed effetti</div><div class="trow-s">Countdown, campanello, buzzer, applausi e vibrazione</div></div>
         <button class="switch on" id="tg-sound" type="button" role="switch" aria-checked="true"><span></span></button>
       </div>
+      <div class="toggle-row">
+        <div><div class="trow-t">Indizi 💡 (gettoni)</div><div class="trow-s">Ogni giocatore ha 3 gettoni: un indizio costa 1 gettone (non punti)</div></div>
+        <button class="switch on" id="tg-hints" type="button" role="switch" aria-checked="true"><span></span></button>
+      </div>
+      <div class="toggle-row">
+        <div><div class="trow-t">Jolly 🃏</div><div class="trow-s">Ogni giocatore ha 1 jolly per saltare un brano troppo difficile</div></div>
+        <button class="switch on" id="tg-jolly" type="button" role="switch" aria-checked="true"><span></span></button>
+      </div>
+      <div class="toggle-row" style="display:block;">
+        <div class="trow-t" style="margin-bottom:9px;">Tema colore 🌗</div>
+        <div class="swatches" id="swatches">
+          <button class="swatch is-on" data-theme="fuoco" style="--sw:#FF5333" title="Fuoco"></button>
+          <button class="swatch" data-theme="oceano" style="--sw:#2DD4BF" title="Oceano"></button>
+          <button class="swatch" data-theme="viola" style="--sw:#A78BFA" title="Viola"></button>
+          <button class="swatch" data-theme="oro" style="--sw:#E8B23A" title="Oro"></button>
+        </div>
+      </div>
+      <div class="toggle-row" style="display:block;">
+        <div class="trow-t" style="margin-bottom:9px;">Volume 🔊</div>
+        <input type="range" id="rng-vol" class="vol" min="0" max="100" value="90">
+      </div>
     </div>
     <button class="btn btn-primary" id="start-game">Inizia partita</button>
     <div class="err" id="setup-err"></div>
@@ -390,6 +433,8 @@
 
     <div id="cat-container"></div>
 
+    <button class="btn btn-line btn-sm mt" id="btn-mix" style="display:none;">🔀 Mescola tutte le playlist</button>
+
     <div class="divider"></div>
     <h2 class="title">Classifica</h2>
     <div class="card"><ul class="rank" id="cat-rank"></ul></div>
@@ -410,7 +455,6 @@
     <div class="player">
       <div class="discwrap">
         <div class="disc spin" id="disc"><div class="disc-art" id="disc-art"></div><span class="q" id="disc-q">?</span></div>
-        <div class="tonearm" id="tonearm"></div>
         <div class="countdown" id="countdown"></div>
       </div>
       <div class="pbar"><div class="pfill" id="pfill"></div></div>
@@ -429,6 +473,11 @@
     <div id="judge-area">
       <p class="judgeHead"><b>Chi ha indovinato?</b><span>Il giudice tocca il nome del giocatore</span></p>
       <div class="score-grid" id="judge-grid"></div>
+      <div class="hintbox" id="hintbox" style="display:none;"></div>
+      <div class="row mt" id="aids-row">
+        <button class="btn btn-ghost btn-sm" id="btn-hint">💡 Indizio</button>
+        <button class="btn btn-ghost btn-sm" id="btn-jolly">🃏 Jolly</button>
+      </div>
       <button class="btn btn-ghost mt" id="btn-pause"></button>
       <button class="btn btn-line mt" id="btn-nobody">Nessuno ha indovinato</button>
     </div>
@@ -465,6 +514,16 @@
 
 </div>
 
+<!-- menu a comparsa: scegli il giocatore (per indizi e jolly) -->
+<div id="modal" class="modal">
+  <div class="modal-card">
+    <div class="modal-title" id="modal-title"></div>
+    <div class="modal-sub" id="modal-sub"></div>
+    <div class="modal-list" id="modal-list"></div>
+    <button class="btn btn-line btn-sm mt" id="modal-cancel">Annulla</button>
+  </div>
+</div>
+
 <script>
 /* ---------------- PWA: service worker (offline + installabile) ---------------- */
 if('serviceWorker' in navigator && location.protocol==='https:'){
@@ -488,9 +547,22 @@ const state = {
   catId: 0, songId: 0,
   currentCat: null, currentIndex: 0,
   _setupNames: ['',''], _focusSel: null,
-  settings: { timeScoring:true, sounds:true },
-  pointsInPlay: 1, _roundStart:0, _scoreTimer:null, _frozenEl:0, _cdTimer:null
+  settings: { timeScoring:true, sounds:true, volume:0.9, theme:'fuoco', hints:true, hintTokens:3, jolly:true, jollyCount:1 },
+  pointsInPlay: 1, _roundStart:0, _scoreTimer:null, _frozenEl:0, _cdTimer:null, _hintLevel:0
 };
+
+/* ---------------- TEMI COLORE ---------------- */
+const THEMES={
+  fuoco:{'--accent':'#FF5333','--accent-press':'#E8401F','--gold':'#E8C76B'},
+  oceano:{'--accent':'#2DD4BF','--accent-press':'#14B8A6','--gold':'#7DD3FC'},
+  viola:{'--accent':'#A78BFA','--accent-press':'#8B5CF6','--gold':'#F0ABFC'},
+  oro:{'--accent':'#E8B23A','--accent-press':'#CE9A20','--gold':'#FFE08A'}
+};
+function applyTheme(name){
+  const t=THEMES[name]||THEMES.fuoco; state.settings.theme=name;
+  for(const k in t) document.documentElement.style.setProperty(k,t[k]);
+  const tc=document.querySelector('meta[name="theme-color"]');
+}
 
 /* ---------------- UTIL ---------------- */
 const $  = s => document.querySelector(s);
@@ -571,6 +643,93 @@ function bindToggle(sel,key){
 }
 bindToggle('#tg-time','timeScoring');
 bindToggle('#tg-sound','sounds');
+bindToggle('#tg-hints','hints');
+bindToggle('#tg-jolly','jolly');
+
+/* temi + volume */
+const swEl=$('#swatches');
+if(swEl) swEl.addEventListener('click', e=>{
+  const b=e.target.closest('.swatch'); if(!b) return;
+  applyTheme(b.dataset.theme);
+  $$('#swatches .swatch').forEach(s=>s.classList.toggle('is-on', s===b));
+  if(state.settings.sounds){ const ac=audioCtx(); if(ac&&ac.state==='suspended'){try{ac.resume();}catch(_){}} sfx('tick'); }
+});
+const rngVol=$('#rng-vol');
+if(rngVol) rngVol.addEventListener('input', ()=>{ state.settings.volume=rngVol.value/100; try{ audio.volume=state.settings.volume; }catch(e){} });
+applyTheme(state.settings.theme);
+
+/* menu a comparsa per scegliere un giocatore */
+function openChooser(title, sub, items, cb){
+  const list=$('#modal-list');
+  $('#modal-title').textContent=title;
+  $('#modal-sub').textContent=sub||'';
+  list.innerHTML='';
+  items.forEach(it=>{
+    const b=document.createElement('button');
+    b.className='mopt'; if(it.disabled) b.disabled=true;
+    b.innerHTML=`<span>${escapeHtml(it.label)}</span><span class="tok">${escapeHtml(it.note||'')}</span>`;
+    if(!it.disabled) b.addEventListener('click', ()=>{ closeChooser(); cb(it.value); });
+    list.appendChild(b);
+  });
+  $('#modal').classList.add('show');
+}
+function closeChooser(){ $('#modal').classList.remove('show'); }
+$('#modal-cancel').addEventListener('click', closeChooser);
+$('#modal').addEventListener('click', e=>{ if(e.target.id==='modal') closeChooser(); });
+
+/* aiuti in gioco: mostra/nascondi in base alle regole */
+function setupAids(){
+  const any = state.settings.hints || state.settings.jolly;
+  $('#aids-row').style.display = any ? 'flex':'none';
+  $('#btn-hint').style.display = state.settings.hints ? 'flex':'none';
+  $('#btn-jolly').style.display = state.settings.jolly ? 'flex':'none';
+}
+
+/* INDIZI (pagati coi gettoni, non coi punti) */
+$('#btn-hint').addEventListener('click', ()=>{
+  if(state._hintLevel>=3){ flashToast('Indizi finiti per questo brano.'); return; }
+  const elig=state.players.map((p,i)=>({label:p.name, note:p.tokens+' 🪙', value:i, disabled:p.tokens<=0}));
+  if(elig.every(e=>e.disabled)){ flashToast('Nessuno ha più gettoni.'); return; }
+  openChooser('Chi usa un indizio?', 'Costa 1 gettone (non punti)', elig, i=>{
+    state.players[i].tokens--; state._hintLevel++;
+    showHint(); sfx('tick'); haptic(20);
+  });
+});
+function showHint(){
+  const song=state.currentCat.songs[state.currentIndex];
+  const box=$('#hintbox'); box.style.display='block';
+  if(state._hintLevel===1){
+    disc.classList.add('blur-light');
+    box.innerHTML='Indizio 1 · <b>Copertina meno sfocata</b>';
+  } else if(state._hintLevel===2){
+    const words=(song.title||'').trim().split(/\s+/).filter(Boolean).length;
+    const init=(song.title||'?').trim().charAt(0).toUpperCase();
+    box.innerHTML=`Indizio 2 · il titolo inizia per <b>${escapeHtml(init)}</b> · <b>${words}</b> parole`;
+  } else {
+    const ai=(song.artist||'?').trim().charAt(0).toUpperCase();
+    box.innerHTML=`Indizio 3 · l'artista inizia per <b>${escapeHtml(ai)}</b>`;
+  }
+}
+
+/* JOLLY: salta il brano (nessun punto) */
+$('#btn-jolly').addEventListener('click', ()=>{
+  const elig=state.players.map((p,i)=>({label:p.name, note:p.jolly+' 🃏', value:i, disabled:p.jolly<=0}));
+  if(elig.every(e=>e.disabled)){ flashToast('Nessuno ha più jolly.'); return; }
+  openChooser('Chi usa un jolly?', 'Salta questo brano, nessun punto in palio', elig, i=>{
+    state.players[i].jolly--; sfx('tick'); haptic([20,30]); stopScore();
+    flashToast(state.players[i].name+' ha usato un jolly — si salta.');
+    nextSong();
+  });
+});
+
+/* MIX: mescola tutte le playlist */
+$('#btn-mix').addEventListener('click', ()=>{
+  const all=[];
+  state.categories.forEach(c=>c.songs.forEach(s=>all.push(s)));
+  if(!all.length) return;
+  for(let i=all.length-1;i>0;i--){ const j=(Math.random()*(i+1))|0; const t=all[i]; all[i]=all[j]; all[j]=t; }
+  startCategory({name:'Mix 🔀', songs:all});
+});
 
 $('#start-game').addEventListener('click', ()=>{
   const names = state._setupNames.map(n=>n.trim()).filter(Boolean);
@@ -580,7 +739,9 @@ $('#start-game').addEventListener('click', ()=>{
     err.textContent='Ci sono nomi duplicati: rendili unici.'; err.classList.add('show'); return;
   }
   err.classList.remove('show');
-  state.players = names.map(n=>({name:n,score:0}));
+  state.players = names.map(n=>({name:n,score:0,
+    tokens: state.settings.hints ? state.settings.hintTokens : 0,
+    jolly:  state.settings.jolly ? state.settings.jollyCount : 0}));
   renderCategories();
   renderRank('#cat-rank');
   show('screen-cat');
@@ -601,6 +762,8 @@ function addCategory(){
 const catContainer=$('#cat-container');
 function renderCategories(){
   catContainer.innerHTML='';
+  const mixBtn=$('#btn-mix');
+  if(mixBtn){ const playable=state.categories.filter(c=>c.songs.length).length; mixBtn.style.display = playable>=2 ? 'flex':'none'; }
   if(state.categories.length===0){
     catContainer.innerHTML='<div class="card empty">Nessuna playlist. Creane una qui sopra per iniziare.</div>';
     return;
@@ -830,11 +993,14 @@ function playCurrentSong(){
   const art=$('#disc-art');
   if(song.cover){ art.style.backgroundImage='url("'+song.cover+'")'; disc.classList.add('has-art','blur'); }
   else { art.style.backgroundImage=''; disc.classList.remove('has-art','blur'); }
-  disc.classList.remove('spin'); armNeedle(false);
+  disc.classList.remove('spin','blur-light'); armNeedle(false);
+  state._hintLevel=0; $('#hintbox').style.display='none';
+  setupAids();
   renderJudgeGrid();
   renderRank('#play-rank');
   // prepara e "sblocca" l'audio entro il gesto (necessario su iPhone), muto per non fare blip
   audio.src=song.preview; audio.muted=true;
+  try{ audio.volume=state.settings.volume; }catch(e){}
   try{ const p=audio.play(); if(p&&p.then) p.then(()=>{ audio.pause(); audio.currentTime=0; }).catch(()=>{}); }catch(e){}
   // countdown 3·2·1 poi il brano parte davvero
   runCountdown(()=>{
@@ -1044,7 +1210,9 @@ function runPodiumAnim(){
 
 $('#btn-replay-anim').addEventListener('click', runPodiumAnim);
 $('#btn-replay').addEventListener('click', ()=>{
-  state.players.forEach(p=>p.score=0);
+  state.players.forEach(p=>{ p.score=0;
+    p.tokens=state.settings.hints?state.settings.hintTokens:0;
+    p.jolly=state.settings.jolly?state.settings.jollyCount:0; });
   renderCategories(); renderRank('#cat-rank'); show('screen-cat');
 });
 $('#btn-newgame').addEventListener('click', ()=>{
