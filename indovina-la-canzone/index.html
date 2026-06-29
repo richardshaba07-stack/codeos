@@ -2,6 +2,8 @@
 <html lang="it">
 <head>
 <meta charset="UTF-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="googlebot" content="noindex, nofollow">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no">
 <meta name="theme-color" content="#100F0D">
 <meta name="mobile-web-app-capable" content="yes">
@@ -99,19 +101,10 @@
   .brand{display:flex;align-items:center;gap:11px;}
   .mark{width:34px;height:34px;border-radius:9px;background:var(--surface-2);border:1px solid var(--line);
     display:flex;align-items:center;justify-content:center;}
-  .hero{position:relative;width:100%;aspect-ratio:16/9;border-radius:18px;overflow:hidden;
-    border:1px solid var(--line);margin-bottom:22px;background:#000;}
-  .hero-vid{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;}
-  .hero-scrim{position:absolute;inset:0;
-    background:linear-gradient(180deg, rgba(16,15,13,.05) 0%, rgba(16,15,13,.12) 38%, rgba(16,15,13,.55) 72%, rgba(16,15,13,.92) 100%);}
-  .hero-text{position:absolute;left:20px;right:20px;bottom:18px;}
-  .hero-text .kicker{color:#dcd7cb;}
-  .hero-text .display{margin:7px 0 0;font-size:40px;}
   /* intro a schermo intero */
   #intro{position:fixed;inset:0;z-index:1000;background:#000;display:flex;align-items:flex-end;justify-content:center;
     opacity:1;transition:opacity .6s ease;cursor:pointer;}
   #intro.hide{opacity:0;pointer-events:none;}
-  #intro-vid{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
   .intro-scrim{position:absolute;inset:0;
     background:linear-gradient(180deg, rgba(16,15,13,.25) 0%, rgba(16,15,13,.08) 42%, rgba(16,15,13,.62) 78%, rgba(16,15,13,.94) 100%);}
   .intro-content{position:relative;z-index:2;text-align:center;padding:0 24px calc(46px + env(safe-area-inset-bottom));max-width:520px;width:100%;}
@@ -153,21 +146,24 @@
     border:1px solid var(--accent);background:var(--surface-2);color:var(--text);outline:none;}
   .song{display:flex;align-items:center;gap:11px;padding:10px;border-radius:12px;
     background:var(--surface-2);margin-bottom:8px;}
-  .song .thumb{flex:0 0 auto;width:50px;height:33px;border-radius:7px;object-fit:cover;background:#000;}
+  .song .thumb{flex:0 0 auto;width:46px;height:46px;border-radius:8px;object-fit:cover;background:#000;}
   .song .sinfo{flex:1;min-width:0;}
   .song .t{font-size:15px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .snote{font-size:12px;margin-top:2px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .snote.bad{color:var(--bad);}
-  .badge{display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;font-size:10px;font-weight:600;
-    letter-spacing:.07em;text-transform:uppercase;color:var(--muted);padding:5px 9px;border-radius:8px;
-    background:var(--bg);border:1px solid var(--line);}
-  .badge .dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex:0 0 auto;}
-  .badge.ok{color:#9fe3c0;} .badge.ok .dot{background:var(--ok);}
-  .badge.bad{color:#f0a99c;} .badge.bad .dot{background:var(--bad);}
-  .badge.pending .dot{animation:pulse 1.1s ease-in-out infinite;}
-  .badge.unknown .dot{background:var(--gold);}
-  @keyframes pulse{0%,100%{opacity:.25;}50%{opacity:1;}}
   .addsong{display:grid;gap:9px;margin-top:14px;padding-top:16px;border-top:1px solid var(--line);}
+  .searchbox{display:flex;gap:8px;}
+  .searchbox input{min-width:0;}
+  .searchbox .btn{flex:0 0 auto;width:auto;padding:13px 20px;}
+  .results{display:grid;gap:8px;margin-top:4px;}
+  .result{display:flex;align-items:center;gap:11px;padding:8px;border-radius:11px;background:var(--bg);border:1px solid var(--line);}
+  .result img{width:44px;height:44px;border-radius:8px;object-fit:cover;background:#000;flex:0 0 auto;}
+  .result .ri{flex:1;min-width:0;}
+  .result .rt{font-size:14px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .result .ra{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .result .radd{flex:0 0 auto;width:38px;height:38px;border-radius:10px;border:1px solid rgba(255,83,51,.5);
+    background:rgba(255,83,51,.10);color:var(--accent);font-size:20px;line-height:1;cursor:pointer;}
+  .result .radd:active{transform:scale(.92);}
+  .searching{color:var(--muted);font-size:13px;text-align:center;padding:10px;}
   .empty{color:var(--muted);font-size:14px;text-align:center;padding:10px;}
   .err{color:var(--bad);background:rgba(229,96,77,.10);border:1px solid rgba(229,96,77,.35);
     padding:11px 13px;border-radius:11px;font-size:13px;margin-top:6px;display:none;}
@@ -185,16 +181,31 @@
   .rank li.lead .medal{background:var(--accent);color:#fff;border-color:var(--accent);}
   .rank li.lead .pscore{color:var(--accent);}
 
-  /* riproduzione */
-  .videoWrap{position:relative;width:100%;aspect-ratio:16/9;border-radius:14px;overflow:hidden;
-    background:#000;border:1px solid var(--line);margin-bottom:10px;}
-  #ytframe{position:absolute;inset:0;width:100%;height:100%;border:0;}
-  .reveal{text-align:center;margin:18px 0;}
-  .reveal .lab{color:var(--muted);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.16em;}
-  .reveal .title{font-family:var(--serif);font-size:26px;font-weight:500;margin-top:6px;line-height:1.1;}
+  /* riproduzione audio */
+  .player{display:flex;flex-direction:column;align-items:center;gap:16px;padding:28px 18px 22px;border-radius:16px;
+    background:var(--surface);border:1px solid var(--line);margin-bottom:12px;}
+  .disc{width:140px;height:140px;border-radius:50%;position:relative;background-size:cover;background-position:center;
+    background-color:#171511;border:1px solid var(--line-strong);box-shadow:0 12px 34px rgba(0,0,0,.45);
+    display:flex;align-items:center;justify-content:center;}
+  .disc::before{content:"";position:absolute;inset:0;border-radius:50%;
+    background:radial-gradient(circle at 50% 50%, rgba(0,0,0,0) 0 26%, rgba(16,15,13,.0) 27%),
+    repeating-radial-gradient(circle at 50% 50%, rgba(255,255,255,.05) 0 2px, rgba(0,0,0,.18) 2px 4px);}
+  .disc::after{content:"";position:absolute;width:30px;height:30px;border-radius:50%;background:var(--surface-2);
+    border:1px solid var(--line-strong);box-shadow:inset 0 0 0 6px var(--accent);}
+  .disc.spin{animation:spin 3.2s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  .disc .q{position:relative;z-index:2;font-family:var(--serif);font-size:46px;color:var(--accent);}
+  .pbar{width:100%;height:7px;border-radius:999px;background:var(--surface-2);overflow:hidden;}
+  .pfill{height:100%;width:0;background:var(--accent);border-radius:999px;}
+  .ptime{width:100%;display:flex;justify-content:space-between;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;}
   .nowplaying{display:flex;justify-content:space-between;align-items:baseline;margin:4px 0 14px;}
   .nowplaying .cat{font-family:var(--serif);font-weight:500;font-size:20px;}
   .nowplaying .cnt{color:var(--muted);font-size:13px;letter-spacing:.04em;}
+  .reveal{text-align:center;margin:18px 0;}
+  .reveal img{width:96px;height:96px;border-radius:12px;object-fit:cover;background:#000;margin-bottom:10px;}
+  .reveal .lab{color:var(--muted);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.16em;}
+  .reveal .title{font-family:var(--serif);font-size:24px;font-weight:500;margin-top:6px;line-height:1.15;}
+  .reveal .artist{color:var(--muted);font-size:15px;margin-top:4px;}
   .judgeHead{text-align:center;margin:4px 0 14px;}
   .judgeHead b{font-family:var(--serif);font-weight:500;font-size:20px;display:block;}
   .judgeHead span{font-size:13px;color:var(--muted);margin-top:4px;display:block;}
@@ -295,7 +306,7 @@
       <span class="kicker">Party game · musica</span>
     </div>
     <h1 class="display">Indovina<br>la Canzone</h1>
-    <p class="sub">Un gioco da passare di mano in mano. Inserite i nomi dei giocatori e create le vostre playlist al volo.</p>
+    <p class="sub">Cerca le canzoni per nome e crea le tue playlist al volo. Si gioca con spezzoni di 30 secondi — niente pubblicità.</p>
     <div class="card">
       <label>Giocatori — da 2 a 10</label>
       <div id="players-list"></div>
@@ -303,7 +314,7 @@
     </div>
     <button class="btn btn-primary" id="start-game">Inizia partita</button>
     <div class="err" id="setup-err"></div>
-    <p class="hint">Nessun account, nessun costo. Tutto resta su questo dispositivo.</p>
+    <p class="hint">Nessun account, nessun costo, nessuna pubblicità. Tutto resta su questo dispositivo.</p>
   </section>
 
   <!-- ===== 2. CATEGORIE & CANZONI / SCELTA ===== -->
@@ -341,15 +352,18 @@
       <span class="cnt" id="play-cnt">Brano 1 di 1</span>
     </div>
 
-    <div class="videoWrap">
-      <iframe id="ytframe" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+    <div class="player">
+      <div class="disc spin" id="disc"><span class="q">?</span></div>
+      <div class="pbar"><div class="pfill" id="pfill"></div></div>
+      <div class="ptime"><span id="pcur">0:00</span><span id="pdur">0:30</span></div>
     </div>
-    <p class="hint" id="play-tip" style="margin-top:0">Se compare l’errore 153 / “Guarda su YouTube”, quel video non è incorporabile: usa il pulsante qui sotto.</p>
-    <button class="btn btn-line btn-sm" id="btn-open-yt" style="margin-bottom:6px;">Apri su YouTube</button>
+    <audio id="audio" playsinline preload="auto"></audio>
 
     <div class="reveal" id="reveal" style="display:none;">
+      <img id="reveal-cover" alt="" src="">
       <div class="lab">Il brano era</div>
       <div class="title" id="reveal-title">—</div>
+      <div class="artist" id="reveal-artist"></div>
     </div>
 
     <div id="judge-area">
@@ -391,9 +405,6 @@
 
 </div>
 
-<!-- player nascosto: serve solo a verificare se un link è incorporabile -->
-<div id="verifier" aria-hidden="true" style="position:fixed;left:-10000px;top:-10000px;width:200px;height:120px;overflow:hidden;opacity:0;pointer-events:none;"></div>
-
 <script>
 /* ---------------- PWA: service worker (offline + installabile) ---------------- */
 if('serviceWorker' in navigator && location.protocol==='https:'){
@@ -416,7 +427,6 @@ const state = {
   players: [], categories: [],
   catId: 0, songId: 0,
   currentCat: null, currentIndex: 0,
-  currentVideoId: null,
   _setupNames: ['',''], _focusSel: null
 };
 
@@ -432,7 +442,6 @@ function show(id){
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 const escapeAttr = escapeHtml;
 const getCat  = id => state.categories.find(c=>c.id===id);
-const getSong = (cid,sid) => { const c=getCat(cid); return c && c.songs.find(s=>s.id===sid); };
 
 /* ---------------- 1. SETUP GIOCATORI ---------------- */
 const playersList = $('#players-list');
@@ -480,14 +489,14 @@ $('#start-game').addEventListener('click', ()=>{
   show('screen-cat');
 });
 
-/* ---------------- 2. CATEGORIE & CANZONI ---------------- */
+/* ---------------- 2. CATEGORIE & RICERCA CANZONI ---------------- */
 $('#add-cat').addEventListener('click', addCategory);
 $('#new-cat-name').addEventListener('keydown', e=>{ if(e.key==='Enter') addCategory(); });
 function addCategory(){
   const inp=$('#new-cat-name');
   const name=inp.value.trim();
   if(!name) return;
-  state.categories.push({id:++state.catId,name,editing:false,songs:[]});
+  state.categories.push({id:++state.catId,name,editing:false,songs:[],_q:'',_results:null,_searching:false,_err:''});
   inp.value='';
   renderCategories();
 }
@@ -514,30 +523,44 @@ function renderCategories(){
          </span>`;
 
     const songsHtml = n
-      ? cat.songs.map(s=> s.editing
-          ? `<div class="song"><input type="text" class="edit-input" value="${escapeAttr(s.title)}" data-song-input="${cat.id}:${s.id}">
-              <button class="mini" data-save-song="${cat.id}:${s.id}" title="Salva">${ICON.check}</button></div>`
-          : `<div class="song">
-              <img class="thumb" src="https://i.ytimg.com/vi/${s.videoId}/default.jpg" alt="" loading="lazy">
-              <div class="sinfo">
-                <div class="t">${escapeHtml(s.title)}</div>
-                ${(s.status==='bad'||s.status==='unknown') && s.statusMsg ? `<div class="snote ${s.status}">${escapeHtml(s.statusMsg)}</div>` : ''}
-              </div>
-              ${badgeHtml(s)}
-              <button class="mini" data-edit-song="${cat.id}:${s.id}" title="Modifica titolo">${ICON.edit}</button>
-              <button class="mini" data-del-song="${cat.id}:${s.id}" title="Rimuovi">${ICON.trash}</button>
-            </div>`
+      ? cat.songs.map(s=>
+          `<div class="song">
+            <img class="thumb" src="${escapeAttr(s.cover||'')}" alt="" loading="lazy">
+            <div class="sinfo">
+              <div class="t">${escapeHtml(s.title)}</div>
+              <div class="snote">${escapeHtml(s.artist||'')}</div>
+            </div>
+            <button class="mini" data-del-song="${cat.id}:${s.id}" title="Rimuovi">${ICON.trash}</button>
+          </div>`
         ).join('')
-      : '<div class="empty">Ancora nessun brano in questa playlist.</div>';
+      : '<div class="empty">Ancora nessun brano. Cerca una canzone qui sotto.</div>';
+
+    // risultati di ricerca
+    let resultsHtml='';
+    if(cat._searching){
+      resultsHtml='<div class="searching">Cerco…</div>';
+    } else if(cat._err){
+      resultsHtml=`<div class="err show">${escapeHtml(cat._err)}</div>`;
+    } else if(cat._results){
+      resultsHtml = cat._results.length
+        ? '<div class="results">'+cat._results.map((r,i)=>
+            `<div class="result">
+              <img src="${escapeAttr(r.cover||'')}" alt="" loading="lazy">
+              <div class="ri"><div class="rt">${escapeHtml(r.title)}</div><div class="ra">${escapeHtml(r.artist)}</div></div>
+              <button class="radd" data-add-result="${cat.id}:${i}" title="Aggiungi">+</button>
+            </div>`).join('')+'</div>'
+        : '<div class="searching">Nessun risultato. Prova con un altro titolo o aggiungi l’artista.</div>';
+    }
 
     card.innerHTML=`
       <div class="cat-head">${head}</div>
       ${songsHtml}
       <div class="addsong">
-        <input type="text" placeholder="Titolo del brano (la risposta giusta)" data-title="${cat.id}">
-        <input type="text" placeholder="Incolla il link YouTube" data-url="${cat.id}">
-        <div class="err" data-err="${cat.id}"></div>
-        <button class="btn btn-ghost btn-sm" data-add-song="${cat.id}">Aggiungi brano</button>
+        <div class="searchbox">
+          <input type="text" placeholder="Cerca: titolo e/o artista" data-search="${cat.id}" value="${escapeAttr(cat._q||'')}">
+          <button class="btn btn-ghost btn-sm" data-do-search="${cat.id}">Cerca</button>
+        </div>
+        ${resultsHtml}
       </div>
       <button class="btn btn-primary mt" data-play="${cat.id}" ${n?'':'disabled'}>${ICON.play} Gioca playlist</button>
       <button class="btn btn-sm mt" style="background:transparent;color:var(--muted);" data-del-cat="${cat.id}">Elimina playlist</button>
@@ -552,11 +575,20 @@ function renderCategories(){
   }
 }
 
+catContainer.addEventListener('input', e=>{
+  if(e.target.dataset.search!==undefined){
+    const c=getCat(+e.target.dataset.search); if(c) c._q=e.target.value;
+  }
+});
+
 catContainer.addEventListener('click', e=>{
   const t=e.target.closest('button');
   if(!t) return;
   const d=t.dataset;
-  if(d.addSong!==undefined){ addSong(+d.addSong); }
+  if(d.doSearch!==undefined){ doSearch(+d.doSearch); }
+  else if(d.addResult!==undefined){
+    const [cid,idx]=d.addResult.split(':').map(Number); addResult(cid,idx);
+  }
   else if(d.delSong!==undefined){
     const [cid,sid]=d.delSong.split(':').map(Number);
     const c=getCat(cid); if(c){ c.songs=c.songs.filter(s=>s.id!==sid); renderCategories(); }
@@ -571,20 +603,13 @@ catContainer.addEventListener('click', e=>{
     const c=getCat(+d.editCat); if(c){ c.editing=true; state._focusSel=`[data-cat-input="${c.id}"]`; renderCategories(); }
   }
   else if(d.saveCat!==undefined){ saveCat(+d.saveCat); }
-  else if(d.editSong!==undefined){
-    const [cid,sid]=d.editSong.split(':').map(Number);
-    const s=getSong(cid,sid); if(s){ s.editing=true; state._focusSel=`[data-song-input="${cid}:${sid}"]`; renderCategories(); }
-  }
-  else if(d.saveSong!==undefined){
-    const [cid,sid]=d.saveSong.split(':').map(Number); saveSong(cid,sid);
-  }
 });
 
 catContainer.addEventListener('keydown', e=>{
   if(e.key!=='Enter') return;
   const t=e.target;
-  if(t.dataset.catInput!==undefined){ e.preventDefault(); saveCat(+t.dataset.catInput); }
-  else if(t.dataset.songInput!==undefined){ const [cid,sid]=t.dataset.songInput.split(':').map(Number); e.preventDefault(); saveSong(cid,sid); }
+  if(t.dataset.search!==undefined){ e.preventDefault(); doSearch(+t.dataset.search); }
+  else if(t.dataset.catInput!==undefined){ e.preventDefault(); saveCat(+t.dataset.catInput); }
 });
 
 function saveCat(id){
@@ -594,145 +619,87 @@ function saveCat(id){
   if(v) c.name=v;
   c.editing=false; renderCategories();
 }
-function saveSong(cid,sid){
-  const s=getSong(cid,sid); if(!s) return;
-  const inp=catContainer.querySelector(`[data-song-input="${cid}:${sid}"]`);
-  const v=inp?inp.value.trim():'';
-  if(v) s.title=v;
-  s.editing=false; renderCategories();
+
+function addResult(cid,idx){
+  const cat=getCat(cid); if(!cat || !cat._results) return;
+  const r=cat._results[idx]; if(!r) return;
+  cat.songs.push({id:++state.songId,title:r.title,artist:r.artist,preview:r.preview,cover:r.cover});
+  cat._results=null; cat._q=''; cat._err='';
+  renderCategories();
 }
 
-function addSong(cid){
+/* ---------------- RICERCA DEEZER (gratis, anteprime 30s, niente pubblicità) ----------------
+   Usa JSONP per evitare i blocchi CORS del browser. Nessuna chiave, nessun login. */
+let jsonpSeq=0;
+function deezerSearch(query){
+  return new Promise((resolve,reject)=>{
+    const cb='dz_cb_'+(++jsonpSeq);
+    const script=document.createElement('script');
+    let timer=setTimeout(()=>{ cleanup(); reject(new Error('timeout')); }, 12000);
+    function cleanup(){
+      try{ delete window[cb]; }catch(e){ window[cb]=undefined; }
+      if(script.parentNode) script.parentNode.removeChild(script);
+      clearTimeout(timer);
+    }
+    window[cb]=function(data){ cleanup(); resolve(data); };
+    script.onerror=function(){ cleanup(); reject(new Error('network')); };
+    script.src='https://api.deezer.com/search?q='+encodeURIComponent(query)+
+      '&limit=12&output=jsonp&callback='+cb;
+    document.head.appendChild(script);
+  });
+}
+
+function doSearch(cid){
   const cat=getCat(cid); if(!cat) return;
-  const titleEl=catContainer.querySelector(`[data-title="${cid}"]`);
-  const urlEl=catContainer.querySelector(`[data-url="${cid}"]`);
-  const errEl=catContainer.querySelector(`[data-err="${cid}"]`);
-  const title=titleEl.value.trim();
-  const url=urlEl.value.trim();
-  errEl.classList.remove('show');
-  if(!title){ errEl.textContent='Inserisci il titolo del brano.'; errEl.classList.add('show'); return; }
-  const vid=extractVideoId(url);
-  if(!vid){ errEl.textContent='Link YouTube non valido. Usa un link tipo youtube.com/watch?v=… oppure youtu.be/…'; errEl.classList.add('show'); return; }
-  const song={id:++state.songId,title,videoId:vid,editing:false,status:'pending',statusMsg:'In coda per la verifica…'};
-  cat.songs.push(song);
+  const inp=catContainer.querySelector(`[data-search="${cid}"]`);
+  const q=(inp?inp.value:cat._q||'').trim();
+  cat._q=q;
+  if(!q){ cat._err='Scrivi il nome di una canzone.'; cat._results=null; renderCategories(); return; }
+  cat._searching=true; cat._err=''; cat._results=null;
   renderCategories();
-  enqueueVerify(song);
-}
-
-function extractVideoId(url){
-  if(!url) return null;
-  url=url.trim();
-  const patterns=[
-    /[?&]v=([A-Za-z0-9_-]{11})/,
-    /youtu\.be\/([A-Za-z0-9_-]{11})/,
-    /youtube\.com\/embed\/([A-Za-z0-9_-]{11})/,
-    /youtube\.com\/shorts\/([A-Za-z0-9_-]{11})/,
-    /youtube\.com\/live\/([A-Za-z0-9_-]{11})/,
-    /youtube\.com\/v\/([A-Za-z0-9_-]{11})/
-  ];
-  for(const p of patterns){ const m=url.match(p); if(m) return m[1]; }
-  if(/^[A-Za-z0-9_-]{11}$/.test(url)) return url;
-  return null;
-}
-
-/* ---------------- VERIFICA LINK (incorporabile o no?) ---------------- */
-let ytApiReady=false, verifyQueue=[], verifying=false, verifyPlayer=null, verifyTimer=null;
-const onFile = (location.protocol==='file:');
-let verifyUnavailable = onFile;
-
-if(!onFile){
-  const tag=document.createElement('script');
-  tag.src='https://www.youtube.com/iframe_api';
-  document.head.appendChild(tag);
-  setTimeout(()=>{ if(!ytApiReady){ verifyUnavailable=true; flushPendingUnknown(); } }, 8000);
-}
-window.onYouTubeIframeAPIReady=function(){ ytApiReady=true; processVerifyQueue(); };
-
-function locOrigin(){ return (location.protocol==='http:'||location.protocol==='https:')?location.origin:null; }
-function songStillExists(song){ return state.categories.some(c=>c.songs.includes(song)); }
-
-function enqueueVerify(song){
-  if(verifyUnavailable){
-    song.status='unknown';
-    song.statusMsg = onFile ? 'Apri da localhost per la verifica automatica' : 'Verifica non disponibile';
-    renderCategories(); return;
-  }
-  song.status='pending'; song.statusMsg='Verifica in corso…';
-  verifyQueue.push(song);
-  processVerifyQueue();
-}
-function flushPendingUnknown(){
-  verifyQueue=[];
-  state.categories.forEach(c=>c.songs.forEach(s=>{
-    if(s.status==='pending'){ s.status='unknown'; s.statusMsg='Verifica non disponibile'; }
-  }));
-  renderCategories();
-}
-function processVerifyQueue(){
-  if(verifying || !ytApiReady || verifyQueue.length===0) return;
-  const song=verifyQueue.shift();
-  if(!songStillExists(song)){ processVerifyQueue(); return; }
-  verifying=true;
-  $('#verifier').innerHTML='<div id="verifier-target"></div>';
-  let settled=false;
-  const finish=(status,msg)=>{
-    if(settled) return; settled=true;
-    clearTimeout(verifyTimer);
-    song.status=status; song.statusMsg=msg;
-    try{ if(verifyPlayer && verifyPlayer.destroy) verifyPlayer.destroy(); }catch(e){}
-    verifyPlayer=null; verifying=false;
+  deezerSearch(q).then(data=>{
+    cat._searching=false;
+    const items=(data && data.data) ? data.data : [];
+    cat._results = items
+      .filter(it=>it && it.preview)
+      .map(it=>({
+        title: it.title_short || it.title || 'Senza titolo',
+        artist: (it.artist && it.artist.name) || '',
+        preview: it.preview,
+        cover: (it.album && (it.album.cover_medium||it.album.cover)) || ''
+      }));
+    cat._err = cat._results.length ? '' : '';
     renderCategories();
-    processVerifyQueue();
-  };
-  verifyTimer=setTimeout(()=>finish('unknown','Non verificato (connessione lenta)'), 9000);
-  const pv={autoplay:0,mute:1,controls:0,playsinline:1};
-  const o=locOrigin(); if(o) pv.origin=o;
-  try{
-    verifyPlayer=new YT.Player('verifier-target',{
-      videoId:song.videoId, width:'200', height:'120', playerVars:pv,
-      events:{
-        'onReady':e=>{ try{ e.target.mute(); e.target.playVideo(); }catch(_){} },
-        'onStateChange':e=>{ if(e.data===1||e.data===3||e.data===5) finish('ok','Pronta'); },
-        'onError':e=>{
-          const c=e.data; let m='Non riproducibile qui';
-          if(c===2) m='Link/ID non valido';
-          else if(c===100) m='Video non trovato o privato';
-          else if(c===101||c===150) m='Incorporamento disattivato dal proprietario';
-          else if(c===5) m='Errore del player';
-          finish('bad',m);
-        }
-      }
-    });
-  }catch(e){ finish('unknown','Non verificato'); }
-}
-function badgeHtml(s){
-  const st=s.status||'pending';
-  const label={pending:'Verifica',ok:'Pronta',bad:'Non valida',unknown:'Da controllare'}[st]||'Verifica';
-  return `<span class="badge ${st}"><i class="dot"></i>${label}</span>`;
+  }).catch(err=>{
+    cat._searching=false;
+    cat._results=null;
+    cat._err = 'Ricerca non riuscita. Controlla la connessione e riprova.';
+    renderCategories();
+  });
 }
 
 $('#cat-back').addEventListener('click', ()=>show('screen-setup'));
 $('#cat-end').addEventListener('click', endGame);
 
-/* ---------------- 3. RIPRODUZIONE ---------------- */
-const frame = $('#ytframe');
+/* ---------------- 3. RIPRODUZIONE AUDIO ---------------- */
+const audio = $('#audio');
+const disc = $('#disc');
 let paused=false;
 
-function ytCmd(func){
-  if(frame.contentWindow){
-    frame.contentWindow.postMessage(JSON.stringify({event:'command',func:func,args:[]}),'*');
-  }
+function fmtTime(sec){
+  sec=Math.max(0,Math.floor(sec||0));
+  const m=Math.floor(sec/60), s=sec%60;
+  return m+':'+(s<10?'0':'')+s;
 }
-function loadVideo(videoId){
-  state.currentVideoId = videoId;
-  const origin = (location.protocol==='http:'||location.protocol==='https:')
-    ? '&origin='+encodeURIComponent(location.origin) : '';
-  frame.src = `https://www.youtube.com/embed/${videoId}?autoplay=1&rel=0&playsinline=1&enablejsapi=1${origin}`;
-}
-function stopVideo(){ frame.src='about:blank'; }
-
-$('#btn-open-yt').addEventListener('click', ()=>{
-  if(state.currentVideoId) window.open('https://www.youtube.com/watch?v='+state.currentVideoId,'_blank');
+audio.addEventListener('timeupdate', ()=>{
+  const dur=audio.duration && isFinite(audio.duration) ? audio.duration : 30;
+  $('#pfill').style.width=Math.min(100,(audio.currentTime/dur)*100)+'%';
+  $('#pcur').textContent=fmtTime(audio.currentTime);
+  $('#pdur').textContent=fmtTime(dur);
+});
+audio.addEventListener('ended', ()=>{
+  disc.classList.remove('spin');
+  paused=true; $('#btn-pause').innerHTML=ICON.play+' Riascolta';
 });
 
 function startCategory(cat){
@@ -747,14 +714,19 @@ function playCurrentSong(){
   $('#play-cnt').textContent=`Brano ${state.currentIndex+1} di ${cat.songs.length}`;
   setPhase('listening');
   paused=false; $('#btn-pause').innerHTML=ICON.pause+' Pausa';
+  $('#pfill').style.width='0%'; $('#pcur').textContent='0:00';
+  disc.classList.add('spin');
   renderJudgeGrid();
   renderRank('#play-rank');
-  loadVideo(song.videoId);
+  audio.src=song.preview;
+  const p=audio.play();
+  if(p && p.catch) p.catch(()=>{ /* l'utente potrà premere Riascolta */ });
 }
 
 $('#btn-pause').addEventListener('click', ()=>{
-  if(paused){ ytCmd('playVideo'); paused=false; $('#btn-pause').innerHTML=ICON.pause+' Pausa'; }
-  else      { ytCmd('pauseVideo'); paused=true;  $('#btn-pause').innerHTML=ICON.play+' Riprendi'; }
+  if(audio.ended){ audio.currentTime=0; audio.play(); disc.classList.add('spin'); paused=false; $('#btn-pause').innerHTML=ICON.pause+' Pausa'; return; }
+  if(paused){ audio.play(); paused=false; disc.classList.add('spin'); $('#btn-pause').innerHTML=ICON.pause+' Pausa'; }
+  else      { audio.pause(); paused=true; disc.classList.remove('spin'); $('#btn-pause').innerHTML=ICON.play+' Riprendi'; }
 });
 
 function setPhase(ph){
@@ -777,16 +749,18 @@ function renderJudgeGrid(){
 }
 function awardAndReveal(i){
   state.players[i].score++;
-  ytCmd('pauseVideo');
   revealAnswer(`${state.players[i].name} · +1`);
 }
 $('#btn-nobody').addEventListener('click', ()=>{
-  ytCmd('pauseVideo');
   revealAnswer('Nessuno ha indovinato');
 });
 function revealAnswer(msg){
+  audio.pause(); disc.classList.remove('spin');
   const song=state.currentCat.songs[state.currentIndex];
   $('#reveal-title').textContent=song.title;
+  $('#reveal-artist').textContent=song.artist||'';
+  const cov=$('#reveal-cover');
+  if(song.cover){ cov.src=song.cover; cov.style.display=''; } else { cov.style.display='none'; }
   $('#guessedBox').textContent=msg;
   setPhase('revealed');
   renderRank('#play-rank');
@@ -800,13 +774,14 @@ function nextSong(){
     state.currentIndex++;
     playCurrentSong();
   } else {
-    stopVideo();
+    stopAudio();
     backToCats();
     flashToast('Playlist finita — scegline un’altra o termina la partita.');
   }
 }
+function stopAudio(){ try{ audio.pause(); audio.removeAttribute('src'); audio.load(); }catch(e){} disc.classList.remove('spin'); }
 
-$('#play-back').addEventListener('click', ()=>{ stopVideo(); backToCats(); });
+$('#play-back').addEventListener('click', ()=>{ stopAudio(); backToCats(); });
 $('#play-end').addEventListener('click', endGame);
 function backToCats(){ show('screen-cat'); renderCategories(); renderRank('#cat-rank'); }
 
@@ -825,7 +800,7 @@ function renderRank(sel){
 
 /* ---------------- 4. FINE PARTITA + PREMIAZIONE ---------------- */
 function endGame(){
-  stopVideo();
+  stopAudio();
   const sorted=[...state.players].sort((a,b)=>b.score-a.score);
   const top=sorted[0].score;
   const winners=sorted.filter(p=>p.score===top && top>0);
@@ -844,9 +819,9 @@ function initials(name){
 function buildPodium(sorted){
   const t=sorted.slice(0,3);
   const order=[];
-  if(t[1]) order.push({p:t[1],rank:2,cls:'p2',d:'0.9s'});  // sinistra
-  order.push({p:t[0],rank:1,cls:'p1',d:'1.6s'});            // centro (climax)
-  if(t[2]) order.push({p:t[2],rank:3,cls:'p3',d:'0.4s'});  // destra
+  if(t[1]) order.push({p:t[1],rank:2,cls:'p2',d:'0.9s'});
+  order.push({p:t[0],rank:1,cls:'p1',d:'1.6s'});
+  if(t[2]) order.push({p:t[2],rank:3,cls:'p3',d:'0.4s'});
   $('#podium').innerHTML=order.map(o=>`
     <div class="ped ${o.cls}" style="--d:${o.d}">
       <div class="who">
@@ -881,7 +856,7 @@ function launchConfetti(){
 }
 function runPodiumAnim(){
   const stage=$('#stage'), after=$('#end-after');
-  stage.classList.remove('go'); void stage.offsetWidth;   // riavvia le animazioni
+  stage.classList.remove('go'); void stage.offsetWidth;
   after.style.transition='none'; after.style.opacity='0';
   stage.classList.add('go');
   $$('#podium [data-count]').forEach(span=>{
@@ -955,7 +930,6 @@ function motifTick(){
     if(s.y-s.r>motifH){ s.y=-s.r-Math.random()*140; s.x=s.r+Math.random()*(motifW-2*s.r); s.vy=0.5+Math.random(); s.vx=(Math.random()-0.5)*0.8; }
     const sp=Math.hypot(s.vx,s.vy); if(sp>MAX){ s.vx*=MAX/sp; s.vy*=MAX/sp; }
   }
-  // collisioni cerchio-cerchio (separazione + risposta elastica)
   for(let i=0;i<S.length;i++){
     const a=S[i];
     for(let j=i+1;j<S.length;j++){
@@ -964,7 +938,7 @@ function motifTick(){
       const d2=dx*dx+dy*dy;
       if(d2>=minD*minD||d2===0) continue;
       const d=Math.sqrt(d2), nx=dx/d, ny=dy/d, ov=(minD-d)/2;
-      a.x-=nx*ov; a.y-=ny*ov; b.x+=nx*ov; b.y+=ny*ov;     // separa (no compenetrazione)
+      a.x-=nx*ov; a.y-=ny*ov; b.x+=nx*ov; b.y+=ny*ov;
       const vn=(a.vx-b.vx)*nx+(a.vy-b.vy)*ny;
       if(vn>0){ const imp=(1+0.78)*vn/2; a.vx-=imp*nx; a.vy-=imp*ny; b.vx+=imp*nx; b.vy+=imp*ny; }
     }
@@ -979,7 +953,7 @@ function startMotifRain(){
 }
 function stopMotifRain(){ if(motifRAF){ cancelAnimationFrame(motifRAF); motifRAF=null; } }
 
-/* ---------------- EQUALIZER intro (arancione · giallo · oro) ---------------- */
+/* ---------------- EQUALIZER intro ---------------- */
 (function buildEq(){
   const w=document.getElementById('eqwrap'); if(!w) return;
   const N=Math.min(46, Math.max(22, Math.round(window.innerWidth/16)));
@@ -1004,10 +978,7 @@ function stopMotifRain(){ if(motifRAF){ cancelAnimationFrame(motifRAF); motifRAF
   function dismiss(){
     if(done) return; done=true;
     intro.classList.add('hide');
-    setTimeout(()=>{
-      intro.style.display='none';
-      const v=$('#intro-vid'); if(v){ try{ v.pause(); }catch(e){} }
-    },650);
+    setTimeout(()=>{ intro.style.display='none'; },650);
   }
   intro.addEventListener('click', dismiss);
   const b=$('#intro-start'); if(b) b.addEventListener('click', e=>{ e.stopPropagation(); dismiss(); });

@@ -3,6 +3,11 @@
 Party game musicale, trasformato in **app installabile (PWA)** per iPhone.
 Niente App Store, niente costi: si pubblica gratis e si aggiunge alla schermata Home.
 
+**Versione senza pubblicità:** le canzoni si cercano per nome e si gioca con gli
+**spezzoni di 30 secondi** dell'API gratuita di **Deezer** (nessuna chiave, nessun
+login, nessuna pubblicità). Solo audio — perfetto per un quiz, perché il video non
+spoilera il titolo.
+
 ## Cosa c'è in questa cartella
 
 | File | A cosa serve |
