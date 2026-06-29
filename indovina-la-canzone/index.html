@@ -203,9 +203,8 @@
   .disc::before{content:"";position:absolute;inset:0;border-radius:50%;z-index:1;
     background:radial-gradient(circle at 50% 50%, rgba(0,0,0,0) 0 26%, rgba(16,15,13,.0) 27%),
     repeating-radial-gradient(circle at 50% 50%, rgba(255,255,255,.05) 0 2px, rgba(0,0,0,.18) 2px 4px);}
-  .disc::after{content:"";position:absolute;width:34px;height:34px;border-radius:50%;z-index:2;
-    background:radial-gradient(circle at 50% 50%, #3a352e 0 14%, #0d0c0a 16% 100%);
-    border:1px solid rgba(255,255,255,.14);box-shadow:0 0 0 2px rgba(0,0,0,.5);}
+  .disc::after{content:"";position:absolute;width:30px;height:30px;border-radius:50%;z-index:2;
+    background:var(--surface-2);border:1px solid var(--line-strong);box-shadow:inset 0 0 0 6px var(--accent);}
   .disc.spin{animation:spin 3.2s linear infinite;}
   @keyframes spin{to{transform:rotate(360deg);}}
   .disc .q{position:relative;z-index:3;font-family:var(--serif);font-size:46px;color:var(--accent);}
@@ -699,15 +698,14 @@ function showHint(){
   const song=state.currentCat.songs[state.currentIndex];
   const box=$('#hintbox'); box.style.display='block';
   if(state._hintLevel===1){
-    disc.classList.add('blur-light');
-    box.innerHTML='Indizio 1 · <b>Copertina meno sfocata</b>';
-  } else if(state._hintLevel===2){
     const words=(song.title||'').trim().split(/\s+/).filter(Boolean).length;
     const init=(song.title||'?').trim().charAt(0).toUpperCase();
-    box.innerHTML=`Indizio 2 · il titolo inizia per <b>${escapeHtml(init)}</b> · <b>${words}</b> parole`;
-  } else {
+    box.innerHTML=`Indizio 1 · il titolo inizia per <b>${escapeHtml(init)}</b> · <b>${words}</b> parole`;
+  } else if(state._hintLevel===2){
     const ai=(song.artist||'?').trim().charAt(0).toUpperCase();
-    box.innerHTML=`Indizio 3 · l'artista inizia per <b>${escapeHtml(ai)}</b>`;
+    box.innerHTML=`Indizio 2 · l'artista inizia per <b>${escapeHtml(ai)}</b>`;
+  } else {
+    box.innerHTML=`Indizio 3 · l'artista è <b>${escapeHtml(song.artist||'—')}</b>`;
   }
 }
 
@@ -763,7 +761,7 @@ const catContainer=$('#cat-container');
 function renderCategories(){
   catContainer.innerHTML='';
   const mixBtn=$('#btn-mix');
-  if(mixBtn){ const playable=state.categories.filter(c=>c.songs.length).length; mixBtn.style.display = playable>=2 ? 'flex':'none'; }
+  if(mixBtn){ const tot=state.categories.reduce((n,c)=>n+c.songs.length,0); mixBtn.style.display = tot>=2 ? 'flex':'none'; }
   if(state.categories.length===0){
     catContainer.innerHTML='<div class="card empty">Nessuna playlist. Creane una qui sopra per iniziare.</div>';
     return;
@@ -991,9 +989,9 @@ function playCurrentSong(){
   paused=false; setPauseBtn();
   $('#pfill').style.width='0%'; $('#pcur').textContent='0:00';
   const art=$('#disc-art');
-  if(song.cover){ art.style.backgroundImage='url("'+song.cover+'")'; disc.classList.add('has-art','blur'); }
-  else { art.style.backgroundImage=''; disc.classList.remove('has-art','blur'); }
-  disc.classList.remove('spin','blur-light'); armNeedle(false);
+  if(song.cover){ art.style.backgroundImage='url("'+song.cover+'")'; disc.classList.add('has-art'); }
+  else { art.style.backgroundImage=''; disc.classList.remove('has-art'); }
+  disc.classList.remove('spin','blur','blur-light'); armNeedle(false);
   state._hintLevel=0; $('#hintbox').style.display='none';
   setupAids();
   renderJudgeGrid();
