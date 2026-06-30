@@ -48,7 +48,6 @@
     background:
       radial-gradient(150% 100% at 50% -25%, rgba(255,255,255,.06), rgba(255,255,255,0) 48%),
       var(--bg);
-    background-attachment:fixed;
     -webkit-font-smoothing:antialiased;
     padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
   }
@@ -57,11 +56,11 @@
   .screen.active{display:block;}
   @keyframes fade{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:none;}}
   /* entrata a cascata delle card del setup */
-  @keyframes cardin{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:none;}}
-  #screen-setup.active .card{animation:cardin .55s cubic-bezier(.2,.7,.2,1) both;}
+  @keyframes cardin{from{opacity:0;}to{opacity:1;}}
+  #screen-setup.active .card{animation:cardin .5s ease both;}
   #screen-setup.active .card:nth-of-type(2){animation-delay:.07s;}
   #screen-setup.active .card:nth-of-type(3){animation-delay:.14s;}
-  #screen-setup.active .btn-primary{animation:cardin .55s cubic-bezier(.2,.7,.2,1) .2s both;}
+  #screen-setup.active .btn-primary{animation:cardin .5s ease .2s both;}
   /* mini-equalizer del logo sempre vivo */
   .mark svg rect{transform-box:fill-box;transform-origin:center;animation:eqp .85s ease-in-out infinite alternate;}
   .mark svg rect:nth-child(2){animation-delay:.16s;}
