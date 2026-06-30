@@ -4,7 +4,7 @@
      usa la copia salvata.
    - Altri file dello stesso dominio (icone, manifest): stale-while-revalidate.
    - Anteprime Deezer e Google Fonts: passano direttamente alla rete. */
-const CACHE = 'ilc-v19';
+const CACHE = 'ilc-v20';
 const ASSETS = [
   './',
   './index.html',

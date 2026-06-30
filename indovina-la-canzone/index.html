@@ -275,6 +275,9 @@
   .hintbox{text-align:center;font-size:14px;line-height:1.5;color:var(--gold);background:rgba(232,199,107,.08);
     border:1px solid rgba(232,199,107,.3);border-radius:12px;padding:11px 13px;margin-top:12px;}
   .hintbox b{font-family:var(--serif);font-weight:500;font-size:17px;color:var(--text);}
+  .peekbox{text-align:center;font-size:13px;color:var(--muted);background:var(--surface-2);
+    border:1px dashed var(--line-strong);border-radius:11px;padding:11px 13px;margin-top:10px;line-height:1.4;}
+  .peekbox b{font-family:var(--serif);font-weight:500;font-size:17px;color:var(--text);}
   #aids-row .btn{position:relative;}
   .disc.blur-light .disc-art{filter:blur(5px) brightness(.82) saturate(1.15);}
   /* menu a comparsa */
@@ -539,6 +542,8 @@
         <button class="btn btn-ghost btn-sm" id="btn-hint"><span data-ic="bulb"></span> Indizio</button>
         <button class="btn btn-ghost btn-sm" id="btn-jolly"><span data-ic="joker"></span> Jolly</button>
       </div>
+      <button class="btn btn-line btn-sm mt" id="btn-peek"><span data-ic="eye"></span> Mostra titolo (giudice)</button>
+      <div class="peekbox" id="peekbox" style="display:none;"></div>
       <button class="btn btn-ghost mt" id="btn-pause"></button>
       <button class="btn btn-line mt" id="btn-nobody">Nessuno ha indovinato</button>
     </div>
@@ -612,7 +617,9 @@ const ICON={
   mic:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"/></svg>',
   shuffle:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 4l3 3-3 3"/><path d="M19 7h-3.2c-2 0-3.2 1.6-4.4 3.3M4 17h2.8c2 0 3.2-1.6 4.4-3.3"/><path d="M16 14l3 3-3 3"/><path d="M19 17h-3.2c-1 0-1.9-.4-2.6-1.1M4 7h2.8c1 0 1.9.4 2.6 1.1"/></svg>',
   search:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/></svg>',
-  note:'<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9 17.3a2.5 2.5 0 1 1-2.5-2.5c.6 0 1.1.2 1.5.4V5l9-2v9.3a2.5 2.5 0 1 1-2.5-2.5c.6 0 1.1.2 1.5.4V6.2L9 7.7z"/></svg>'
+  note:'<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9 17.3a2.5 2.5 0 1 1-2.5-2.5c.6 0 1.1.2 1.5.4V5l9-2v9.3a2.5 2.5 0 1 1-2.5-2.5c.6 0 1.1.2 1.5.4V6.2L9 7.7z"/></svg>',
+  eye:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>',
+  eyeoff:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3l18 18M10.6 6.2A9.6 9.6 0 0 1 12 6c6.5 0 10 7 10 7a16 16 0 0 1-3 3.6M6.5 7.7A16 16 0 0 0 2 13s3.5 7 10 7a9.5 9.5 0 0 0 4-.9"/><path d="M9.5 10.5a3 3 0 0 0 4 4"/></svg>'
 };
 function fillIcons(root){ (root||document).querySelectorAll('[data-ic]').forEach(el=>{ if(ICON[el.dataset.ic]) el.innerHTML=ICON[el.dataset.ic]; }); }
 
@@ -1114,6 +1121,27 @@ $('#cat-end').addEventListener('click', endGame);
 const audio = $('#audio');
 const disc = $('#disc');
 let paused=false;
+let peeking=false;
+
+/* MOSTRA TITOLO (solo giudice): peek durante la riproduzione */
+function resetPeek(){
+  peeking=false;
+  const box=$('#peekbox'); if(box) box.style.display='none';
+  const b=$('#btn-peek'); if(b) b.innerHTML=ICON.eye+' Mostra titolo (giudice)';
+}
+$('#btn-peek').addEventListener('click', ()=>{
+  const song=state.currentCat && state.currentCat.songs[state.currentIndex];
+  if(!song) return;
+  peeking=!peeking;
+  const box=$('#peekbox');
+  if(peeking){
+    box.style.display='block';
+    box.innerHTML='<b>'+escapeHtml(song.title)+'</b>'+(song.artist?'<br>'+escapeHtml(song.artist):'');
+    $('#btn-peek').innerHTML=ICON.eyeoff+' Nascondi titolo';
+  } else {
+    resetPeek();
+  }
+});
 
 function fmtTime(sec){
   sec=Math.max(0,Math.floor(sec||0));
@@ -1149,6 +1177,7 @@ function playCurrentSong(){
   else { art.style.backgroundImage=''; disc.classList.remove('has-art','blur'); }
   disc.classList.remove('spin','blur-light'); armNeedle(false);
   state._hintLevel=0; $('#hintbox').style.display='none';
+  resetPeek();
   setupAids();
   if(state.settings.yearMode) fetchYear(song);
   renderJudgeGrid();
