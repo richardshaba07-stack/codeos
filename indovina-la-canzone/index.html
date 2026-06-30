@@ -487,10 +487,9 @@
     <div class="card">
       <label>Riempi al volo da Deezer</label>
       <button class="btn btn-ghost btn-sm" id="auto-top"><span data-ic="dice"></span> Top del momento</button>
-      <div class="row mt">
-        <input type="text" id="auto-artist-name" placeholder="Nome artista (es. Vasco)" style="min-width:0;">
-        <button class="btn btn-solid btn-sm" id="auto-artist" style="flex:0 0 auto;width:auto;padding:13px 18px;"><span data-ic="mic"></span> Top</button>
-      </div>
+      <input type="text" id="auto-artist-name" class="mt" placeholder="Artista (es. Vasco)" style="min-width:0;">
+      <input type="text" id="auto-album-name" class="mt" placeholder="Album — vuoto = i suoi successi" style="min-width:0;">
+      <button class="btn btn-solid btn-sm mt" id="auto-artist"><span data-ic="mic"></span> Aggiungi brani</button>
       <div class="snote" id="auto-note" style="display:none;margin-top:10px;"></div>
     </div>
 
@@ -1045,7 +1044,7 @@ function deezerJSONP(url){
   });
 }
 function deezerSearch(query){
-  return deezerJSONP('https://api.deezer.com/search?q='+encodeURIComponent(query)+'&limit=12');
+  return deezerJSONP('https://api.deezer.com/search?q='+encodeURIComponent(query)+'&limit=30');
 }
 
 function doSearch(cid){
@@ -1100,18 +1099,36 @@ $('#auto-top').addEventListener('click', ()=>{
     .then(d=>fillFromTracks('Top del momento', d&&d.data))
     .catch(()=>autoNote('Caricamento non riuscito. Controlla la connessione.'));
 });
+function clearAutoInputs(){ $('#auto-artist-name').value=''; $('#auto-album-name').value=''; }
 $('#auto-artist').addEventListener('click', ()=>{
-  const q=$('#auto-artist-name').value.trim();
-  if(!q){ autoNote('Scrivi il nome di un artista qui sopra.'); return; }
-  autoNote('Cerco «'+q+'»…');
-  deezerJSONP('https://api.deezer.com/search/artist?q='+encodeURIComponent(q)+'&limit=1')
-    .then(d=>{
-      const art=d&&d.data&&d.data[0];
-      if(!art){ autoNote('Artista non trovato. Prova un altro nome.'); return; }
-      return deezerJSONP('https://api.deezer.com/artist/'+art.id+'/top?limit=15')
-        .then(t=>{ fillFromTracks(art.name, t&&t.data); $('#auto-artist-name').value=''; });
-    })
-    .catch(()=>autoNote('Caricamento non riuscito. Controlla la connessione.'));
+  const artist=$('#auto-artist-name').value.trim();
+  const album=$('#auto-album-name').value.trim();
+  if(!artist){ autoNote('Scrivi almeno il nome di un artista.'); return; }
+  if(album){
+    // ARTISTA + ALBUM -> tutto l'album
+    autoNote('Cerco l\'album «'+album+'» di '+artist+'…');
+    deezerJSONP('https://api.deezer.com/search/album?q='+encodeURIComponent('artist:"'+artist+'" album:"'+album+'"')+'&limit=1')
+      .then(d=>{
+        const al=d&&d.data&&d.data[0];
+        if(!al){ autoNote('Album non trovato. Controlla artista e titolo dell\'album.'); return; }
+        return deezerJSONP('https://api.deezer.com/album/'+al.id+'/tracks?limit=100').then(t=>{
+          const tracks=((t&&t.data)||[]).map(tr=>{ if(!tr.album) tr.album={}; if(!tr.album.cover_medium) tr.album.cover_medium=al.cover_medium||al.cover; return tr; });
+          fillFromTracks(((al.artist&&al.artist.name)||artist)+' — '+al.title, tracks); clearAutoInputs();
+        });
+      })
+      .catch(()=>autoNote('Caricamento non riuscito. Controlla la connessione.'));
+  } else {
+    // SOLO ARTISTA -> fino a 100 successi
+    autoNote('Cerco i successi di «'+artist+'»…');
+    deezerJSONP('https://api.deezer.com/search/artist?q='+encodeURIComponent(artist)+'&limit=1')
+      .then(d=>{
+        const art=d&&d.data&&d.data[0];
+        if(!art){ autoNote('Artista non trovato. Prova un altro nome.'); return; }
+        return deezerJSONP('https://api.deezer.com/artist/'+art.id+'/top?limit=100')
+          .then(t=>{ fillFromTracks(art.name, (t&&t.data)||[]); clearAutoInputs(); });
+      })
+      .catch(()=>autoNote('Caricamento non riuscito. Controlla la connessione.'));
+  }
 });
 
 $('#cat-back').addEventListener('click', ()=>show('screen-setup'));
